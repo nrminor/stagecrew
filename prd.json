@@ -1,0 +1,471 @@
+{
+  "project": "Stagecrew",
+  "branchName": "ralph/mvp-implementation",
+  "description": "MVP implementation of Stagecrew, a disk usage management tool for shared HPC staging filesystems with removal-by-default policy",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Implement core error types",
+      "description": "As a developer, I need well-defined error types so that errors are handled consistently throughout the codebase.",
+      "acceptanceCriteria": [
+        "Error enum covers: Config, Database, Filesystem, PermissionDenied, PathNotFound, Io",
+        "All variants have meaningful error messages via thiserror",
+        "Result<T> type alias is exported from error module",
+        "Remove temporary #[allow(dead_code)] from error variants as they become used",
+        "just check passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "Foundation for all other modules. Error types already stubbed but need refinement."
+    },
+    {
+      "id": "US-002",
+      "title": "Implement configuration with shared database path",
+      "description": "As a user, I want to configure tracked paths and settings so that stagecrew monitors the directories I care about.",
+      "acceptanceCriteria": [
+        "Config struct includes: tracked_paths, expiration_days (default 90), warning_days (default 14), auto_remove (default false), scan_interval_hours (default 24), database_path (optional, defaults to shared location)",
+        "Config loads from ~/.config/stagecrew/config.toml",
+        "Config saves with toml::to_string_pretty",
+        "If database_path not set, default to first tracked_path parent + .stagecrew/stagecrew.db",
+        "AppPaths provides config_file(), database_file(), log_dir() methods",
+        "just check passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "Database path must be configurable but default to shared location on CephFS."
+    },
+    {
+      "id": "US-003",
+      "title": "Implement database initialization and schema",
+      "description": "As a developer, I need the database schema created so that path tracking data can be persisted.",
+      "acceptanceCriteria": [
+        "Database::open() creates file if not exists and runs schema.sql",
+        "Schema includes tables: directories, files, audit_log, stats",
+        "WAL mode enabled via PRAGMA",
+        "Foreign keys enabled via PRAGMA",
+        "All indexes from schema.sql are created",
+        "Stats table initialized with singleton row (id=1)",
+        "Unit test verifies schema creation with tempfile",
+        "just check passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": "Schema already defined in schema.sql, need to verify it works."
+    },
+    {
+      "id": "US-004",
+      "title": "Implement directory and file CRUD operations",
+      "description": "As a developer, I need database operations for managing tracked paths so that scan results can be stored and queried.",
+      "acceptanceCriteria": [
+        "insert_or_update_directory() upserts directory with size, file_count, oldest_mtime, last_scanned",
+        "insert_or_update_file() upserts file with directory_id, size, mtime",
+        "get_directory_by_path() returns Option<Directory>",
+        "list_directories() returns all directories with optional status filter",
+        "list_files_by_directory() returns files for a given directory_id",
+        "update_directory_status() changes status and updates updated_at",
+        "Directory and File structs defined with appropriate fields",
+        "Unit tests for each operation using tempfile database",
+        "just check passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": "Core data access layer. Keep queries simple and explicit."
+    },
+    {
+      "id": "US-005",
+      "title": "Implement audit logging service",
+      "description": "As a user, I want all actions logged so that there's accountability for approvals and removals.",
+      "acceptanceCriteria": [
+        "AuditService::record() inserts audit entry with timestamp, user, action, target_path, details, directory_id",
+        "AuditService::current_user() returns $USER or $LOGNAME or 'unknown'",
+        "AuditService::list_recent(limit) returns most recent N entries",
+        "AuditService::list_by_path(path) returns entries for a specific path",
+        "AuditAction enum: Approve, Defer, Ignore, Remove, Scan, ConfigChange",
+        "AuditEntry struct with all fields from audit_log table",
+        "Unit tests verify recording and querying",
+        "Remove temporary #[allow] attributes from audit module",
+        "just check passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": "Audit trail is critical for accountability among multiple users."
+    },
+    {
+      "id": "US-006",
+      "title": "Implement filesystem scanner with jwalk",
+      "description": "As a user, I want the filesystem scanned so that stagecrew knows what files exist and their ages.",
+      "acceptanceCriteria": [
+        "Scanner::scan() walks directory tree using jwalk for parallelism",
+        "Collects: path, size, mtime for each file",
+        "Resolves symlinks to get target's mtime (skip broken symlinks with warning)",
+        "Aggregates into DirectoryInfo: path, total_size, file_count, oldest_mtime",
+        "Returns ScanResult with list of DirectoryInfo",
+        "Handles permission errors gracefully (log warning, continue scanning)",
+        "Scan runs in blocking task (tokio::task::spawn_blocking) to not block async runtime",
+        "Unit test with tempfile directory tree",
+        "Remove temporary #[allow] attributes from scanner module",
+        "just check passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": "Performance critical for large trees. jwalk provides parallelism."
+    },
+    {
+      "id": "US-007",
+      "title": "Implement scan-to-database integration",
+      "description": "As a developer, I need scan results persisted to the database so that the TUI and daemon can query current state.",
+      "acceptanceCriteria": [
+        "Function scan_and_persist(db, scanner, paths) orchestrates full scan workflow",
+        "For each configured tracked_path, scan and upsert directories/files",
+        "Update stats table with totals after scan completes",
+        "Record 'scan' action in audit log",
+        "Calculate paths_within_warning and paths_pending based on expiration_days and warning_days",
+        "Integration test: create temp directory tree, scan, verify database contents",
+        "just check passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": "Bridges scanner and database modules."
+    },
+    {
+      "id": "US-008",
+      "title": "Implement expiration calculation and state transitions",
+      "description": "As a user, I want paths to automatically transition to pending when expired so that I'm prompted to approve removal.",
+      "acceptanceCriteria": [
+        "Function calculate_expiration(oldest_mtime, expiration_days) returns days_remaining (can be negative)",
+        "Function transition_expired_paths(db, expiration_days, auto_remove) updates statuses",
+        "If auto_remove=false: expired tracked paths -> pending",
+        "If auto_remove=true: expired tracked paths -> approved",
+        "Deferred paths: check deferred_until, if past then -> tracked (clock restarted)",
+        "Ignored paths are never transitioned",
+        "Unit tests for each transition scenario",
+        "just check passes"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": "Core business logic for the removal-by-default policy."
+    },
+    {
+      "id": "US-009",
+      "title": "Implement removal service",
+      "description": "As a user, I want approved paths removed so that disk space is reclaimed.",
+      "acceptanceCriteria": [
+        "RemovalService::remove_approved(db) processes all approved paths",
+        "For each approved path: attempt removal, update status, log to audit",
+        "On success: status -> removed",
+        "On permission error: status -> blocked, log details",
+        "On other error: status -> blocked, log details",
+        "Never uses sudo or elevated permissions",
+        "Returns summary: removed_count, blocked_count, total_bytes_freed",
+        "Unit test with tempfile (create files, approve, remove, verify gone)",
+        "Remove temporary #[allow] attributes from removal module",
+        "just check passes"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": "Safety critical. Must handle errors gracefully."
+    },
+    {
+      "id": "US-010",
+      "title": "Implement CLI init subcommand",
+      "description": "As a user, I want to initialize stagecrew so that config and database are set up correctly.",
+      "acceptanceCriteria": [
+        "stagecrew init creates default config if none exists",
+        "stagecrew init creates database with schema",
+        "Prints paths to config file and database file",
+        "If config exists, prints message and does not overwrite",
+        "If database exists, prints message (schema is idempotent)",
+        "just check passes"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": "First command users will run."
+    },
+    {
+      "id": "US-011",
+      "title": "Implement CLI scan subcommand",
+      "description": "As a user, I want to manually trigger a scan so that I can update the database on demand.",
+      "acceptanceCriteria": [
+        "stagecrew scan runs scan_and_persist for all configured tracked_paths",
+        "stagecrew scan --path PATH scans only the specified path",
+        "Prints progress: 'Scanning /path...' and 'Scan complete: N directories, M files, X bytes'",
+        "Exits with error if no tracked_paths configured and no --path given",
+        "just check passes"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": "Useful for testing and manual updates."
+    },
+    {
+      "id": "US-012",
+      "title": "Implement CLI status subcommand",
+      "description": "As a user, I want a quick status summary so that my shell hook can warn me about pending cleanups.",
+      "acceptanceCriteria": [
+        "stagecrew status queries stats table for pre-computed values",
+        "Output format: 'stagecrew: N paths within M days of cleanup, P pending approval'",
+        "If nothing urgent: 'stagecrew: All clear. N paths tracked, X bytes total'",
+        "If paths overdue: mention 'K paths overdue'",
+        "Fast execution (single database query)",
+        "just check passes"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": "Must be fast for shell hook. Uses pre-computed stats."
+    },
+    {
+      "id": "US-013",
+      "title": "Implement TUI framework and main loop",
+      "description": "As a developer, I need the TUI framework set up so that views can be rendered and input handled.",
+      "acceptanceCriteria": [
+        "Terminal setup: enable raw mode, enter alternate screen, enable mouse capture",
+        "Terminal teardown: restore on exit (including panic)",
+        "Main loop: poll for events, handle input, render frame",
+        "App state tracks: should_quit, current_view, selected_index, sort_mode",
+        "Quit on 'q' or Ctrl+C",
+        "Frame rate limited to avoid busy loop (e.g., 30fps or event-driven)",
+        "Remove temporary #[allow] attributes from tui module",
+        "just check passes"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": "Foundation for all TUI views. Use crossterm for terminal control."
+    },
+    {
+      "id": "US-014",
+      "title": "Implement TUI directory list view",
+      "description": "As a user, I want to see all tracked directories so that I can understand disk usage and expiration status.",
+      "acceptanceCriteria": [
+        "Header shows: total paths, total size, pending count, paths within warning period",
+        "Table columns: Path, Size, Expires (days), Status",
+        "Rows sorted by expiration (most urgent first) by default",
+        "Selected row highlighted",
+        "vim navigation: j/k or arrows to move, g/G for top/bottom",
+        "Color coding: red=overdue/pending, yellow=within warning, green=safe, gray=ignored",
+        "Human-readable sizes (e.g., '1.2 TB', '523 GB')",
+        "just check passes"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": "Primary view. Should look polished."
+    },
+    {
+      "id": "US-015",
+      "title": "Implement TUI sorting",
+      "description": "As a user, I want to sort the directory list so that I can view by size or name.",
+      "acceptanceCriteria": [
+        "Press 's' to cycle sort modes: Expiration -> Size -> Name -> Expiration",
+        "Current sort mode displayed in header or footer",
+        "Expiration: ascending (most urgent first)",
+        "Size: descending (largest first)",
+        "Name: alphabetical ascending",
+        "Sort persists while navigating",
+        "just check passes"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": "Simple state toggle with re-sort on change."
+    },
+    {
+      "id": "US-016",
+      "title": "Implement TUI directory detail view",
+      "description": "As a user, I want to drill into a directory so that I can see which files are taking up space.",
+      "acceptanceCriteria": [
+        "Press Enter or 'l' on directory to enter detail view",
+        "Shows files within selected directory",
+        "Table columns: Filename, Size, Modified (date)",
+        "Sorted by size descending by default",
+        "Press Esc, 'h', or 'q' to return to directory list",
+        "vim navigation works within file list",
+        "Breadcrumb or title shows which directory is being viewed",
+        "just check passes"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": "Drill-down for investigating large directories."
+    },
+    {
+      "id": "US-017",
+      "title": "Implement TUI approve action",
+      "description": "As a user, I want to approve a path for removal so that it will be deleted on next daemon run.",
+      "acceptanceCriteria": [
+        "Press 'x' on selected directory to approve",
+        "Confirmation prompt: 'Approve removal of /path? (y/n)'",
+        "On 'y': update status to approved, record audit entry",
+        "On 'n' or Esc: cancel, no change",
+        "Visual feedback: row updates to show 'approved' status",
+        "Works from directory list view",
+        "just check passes"
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": "Critical action. Must have confirmation."
+    },
+    {
+      "id": "US-018",
+      "title": "Implement TUI defer action",
+      "description": "As a user, I want to defer a path so that its expiration clock resets.",
+      "acceptanceCriteria": [
+        "Press 'd' on selected directory to defer",
+        "Prompt for days: 'Defer for how many days? [90]'",
+        "Default to config.expiration_days if user presses Enter",
+        "Accept numeric input, validate > 0",
+        "Update status to deferred, set deferred_until timestamp",
+        "Record audit entry with deferral period in details",
+        "Visual feedback: row updates to show new expiration",
+        "just check passes"
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": "Deferral resets the clock. Prompt allows custom period."
+    },
+    {
+      "id": "US-019",
+      "title": "Implement TUI ignore action",
+      "description": "As a user, I want to ignore a path permanently so that it's never auto-removed.",
+      "acceptanceCriteria": [
+        "Press 'i' on selected directory to ignore",
+        "Confirmation prompt: 'Permanently ignore /path? (y/n)'",
+        "On 'y': update status to ignored, record audit entry",
+        "On 'n' or Esc: cancel, no change",
+        "Ignored paths shown in gray, sorted to bottom (or filtered out optionally)",
+        "just check passes"
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": "Permanent exemption. Should be deliberate."
+    },
+    {
+      "id": "US-020",
+      "title": "Implement TUI pending approvals view",
+      "description": "As a user, I want to see only pending paths so that I can quickly review what needs approval.",
+      "acceptanceCriteria": [
+        "Press 'p' to switch to pending approvals view",
+        "Shows only directories with status=pending",
+        "Same table format as directory list",
+        "Can approve (x), defer (d), or ignore (i) from this view",
+        "Press 'q' or Esc to return to main directory list",
+        "Empty state message if no pending paths",
+        "just check passes"
+      ],
+      "priority": 20,
+      "passes": false,
+      "notes": "Focused view for approval workflow."
+    },
+    {
+      "id": "US-021",
+      "title": "Implement TUI audit log view",
+      "description": "As a user, I want to see the audit history so that I can review past actions.",
+      "acceptanceCriteria": [
+        "Press 'a' to switch to audit log view",
+        "Shows recent audit entries (most recent first)",
+        "Columns: Timestamp, User, Action, Path",
+        "Scrollable with j/k",
+        "Press 'q' or Esc to return to main directory list",
+        "Timestamp formatted as human-readable (e.g., '2024-01-15 14:32')",
+        "just check passes"
+      ],
+      "priority": 21,
+      "passes": false,
+      "notes": "Read-only view of audit trail."
+    },
+    {
+      "id": "US-022",
+      "title": "Implement TUI help view",
+      "description": "As a user, I want to see keybinding help so that I can learn how to use the TUI.",
+      "acceptanceCriteria": [
+        "Press '?' to show help view",
+        "Lists all keybindings with descriptions",
+        "Organized by category: Navigation, Actions, Views",
+        "Press any key to dismiss",
+        "just check passes"
+      ],
+      "priority": 22,
+      "passes": false,
+      "notes": "Simple reference. Can be a popup or full view."
+    },
+    {
+      "id": "US-023",
+      "title": "Implement TUI footer with keybinding hints",
+      "description": "As a user, I want to see available actions so that I don't have to memorize keybindings.",
+      "acceptanceCriteria": [
+        "Footer bar shows context-sensitive keybinding hints",
+        "Directory list: '[j/k] Navigate [Enter] Details [d] Defer [i] Ignore [x] Approve [?] Help'",
+        "Adapts to current view (different hints for detail view, audit view, etc.)",
+        "Styled distinctly from main content (e.g., inverse colors)",
+        "just check passes"
+      ],
+      "priority": 23,
+      "passes": false,
+      "notes": "Improves discoverability."
+    },
+    {
+      "id": "US-024",
+      "title": "Implement daemon main loop",
+      "description": "As a user, I want the daemon to run continuously so that scans and removals happen automatically.",
+      "acceptanceCriteria": [
+        "stagecrew daemon runs foreground process with main loop",
+        "Loop: scan -> transition expired -> remove approved -> sleep",
+        "Sleep interval from config.scan_interval_hours",
+        "Logs activity via tracing (info level for scans, warn for errors)",
+        "Graceful shutdown on SIGINT/SIGTERM",
+        "Prints startup message with scan interval",
+        "Remove temporary #[allow] attributes from daemon module",
+        "just check passes"
+      ],
+      "priority": 24,
+      "passes": false,
+      "notes": "Simple foreground daemon. Users run in tmux/screen."
+    },
+    {
+      "id": "US-025",
+      "title": "Implement stats update after scan",
+      "description": "As a user, I want stats updated after each scan so that the status command shows current information.",
+      "acceptanceCriteria": [
+        "After scan completes, update stats table with: total_tracked_paths, total_size_bytes, paths_within_warning, paths_pending_approval, paths_overdue, last_scan_completed",
+        "paths_within_warning: count where days_remaining <= warning_days and days_remaining > 0",
+        "paths_pending_approval: count where status = 'pending'",
+        "paths_overdue: count where days_remaining <= 0 and status = 'tracked'",
+        "Stats query is single UPDATE statement for efficiency",
+        "just check passes"
+      ],
+      "priority": 25,
+      "passes": false,
+      "notes": "Enables fast status command for shell hook."
+    },
+    {
+      "id": "US-026",
+      "title": "Add integration test for full workflow",
+      "description": "As a developer, I want an integration test so that the full workflow is verified.",
+      "acceptanceCriteria": [
+        "Test creates temp directory with files of varying ages",
+        "Test initializes config and database",
+        "Test runs scan and verifies directories/files in database",
+        "Test verifies expiration calculation",
+        "Test approves a path and verifies status change",
+        "Test runs removal and verifies files deleted",
+        "Test verifies audit log entries",
+        "Test uses tempfile for isolation",
+        "just check passes"
+      ],
+      "priority": 26,
+      "passes": false,
+      "notes": "End-to-end verification of core workflow."
+    },
+    {
+      "id": "US-027",
+      "title": "Polish and cleanup",
+      "description": "As a developer, I want all temporary allows removed and code polished so that the codebase is production-ready.",
+      "acceptanceCriteria": [
+        "All TODO(cleanup) comments addressed or converted to GitHub issues",
+        "No remaining #![allow(dead_code)] or #![allow(unused)] at module level",
+        "All public items have doc comments",
+        "cargo doc builds without warnings",
+        "No clippy warnings with current lint configuration",
+        "just check passes"
+      ],
+      "priority": 27,
+      "passes": false,
+      "notes": "Final cleanup before MVP is complete."
+    }
+  ]
+}

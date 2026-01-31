@@ -1,0 +1,58 @@
+# prek pre-commit configuration
+# NOTE: jj bypasses git hooks. Use `just check` instead for jj workflows.
+# This config is provided for git compatibility and CI.
+#
+# Install: prek install
+# Run manually: prek run --all-files
+
+minimum_prek_version: '0.3.0'
+fail_fast: true
+
+repos:
+  # Built-in fast hooks (Rust-native, offline)
+  - repo: builtin
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+
+  # Local Rust tooling hooks
+  - repo: local
+    hooks:
+      # Format check - runs first
+      - id: cargo-fmt
+        name: cargo fmt --check
+        language: system
+        entry: cargo fmt --all -- --check
+        files: '\.rs$'
+        pass_filenames: false
+        priority: 0
+
+      # Clippy lints - stringent, deny warnings
+      - id: cargo-clippy
+        name: cargo clippy (deny warnings)
+        language: system
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        files: '\.rs$'
+        pass_filenames: false
+        priority: 10
+
+      # Type check (faster than full test)
+      - id: cargo-check
+        name: cargo check
+        language: system
+        entry: cargo check --all-targets --all-features
+        files: '\.rs$'
+        pass_filenames: false
+        priority: 15
+
+      # Tests with nextest - runs last
+      - id: cargo-nextest
+        name: cargo nextest run
+        language: system
+        entry: cargo nextest run --all-features --no-tests=pass
+        pass_filenames: false
+        always_run: true
+        priority: 20
