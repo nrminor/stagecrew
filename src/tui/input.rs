@@ -19,7 +19,7 @@ impl InputHandler {
         match app.view {
             View::DirectoryList => Self::handle_directory_list(app, config, db, key),
             View::DirectoryDetail => Self::handle_directory_detail(app, key),
-            View::PendingApprovals => Self::handle_pending_approvals(app, key),
+            View::PendingApprovals => Self::handle_pending_approvals(app, config, db, key),
             View::AuditLog => Self::handle_audit_log(app, key),
             View::Help => Self::handle_help(app, key),
         }
@@ -321,16 +321,93 @@ impl InputHandler {
         }
     }
 
-    fn handle_pending_approvals(app: &mut App, key: KeyEvent) {
+    fn handle_pending_approvals(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+        // If there's a pending deferral input, handle numeric input/Enter/Esc
+        if app.pending_deferral.is_some() {
+            Self::handle_deferral_input(app, config, db, key);
+            return;
+        }
+
+        // If there's a pending approval confirmation, handle y/n/Esc
+        if app.pending_approval.is_some() {
+            Self::handle_confirmation(app, db, key);
+            return;
+        }
+
+        // If there's a pending ignore confirmation, handle y/n/Esc
+        if app.pending_ignore.is_some() {
+            Self::handle_ignore_confirmation(app, db, key);
+            return;
+        }
+
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => app.view = View::DirectoryList,
+            // Return to directory list
+            KeyCode::Char('q') | KeyCode::Esc => {
+                app.view = View::DirectoryList;
+                app.selected_index = 0; // Reset selection
+            }
+
+            // Navigation (vim-style)
             KeyCode::Char('j') | KeyCode::Down => {
                 app.selected_index = app.selected_index.saturating_add(1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 app.selected_index = app.selected_index.saturating_sub(1);
             }
-            // TODO(tui): Implement 'x' (approve) and 'd' (defer) actions
+            KeyCode::Char('g') => app.selected_index = 0, // Go to top
+            KeyCode::Char('G') => app.select_last(app.list_len.get()), // Go to bottom
+
+            // Sort modes
+            KeyCode::Char('s') => {
+                app.sort_mode = match app.sort_mode {
+                    SortMode::Expiration => SortMode::Size,
+                    SortMode::Size => SortMode::Name,
+                    SortMode::Name => SortMode::Expiration,
+                };
+            }
+
+            // Approve removal (same as directory list)
+            KeyCode::Char('x') => {
+                // Get the currently selected directory ID from the app state
+                // (set by the render function based on selected_index)
+                if let Some(dir_id) = app.current_directory_id()
+                    && let Ok(directories) = db.list_directories(Some("pending"))
+                    && let Some(dir) = directories.iter().find(|d| d.id == dir_id)
+                {
+                    // Set pending approval with directory ID and path
+                    app.pending_approval = Some((dir.id, dir.path.clone()));
+                }
+            }
+
+            // Defer expiration (same as directory list)
+            KeyCode::Char('d') => {
+                // Get the currently selected directory ID from the app state
+                if let Some(dir_id) = app.current_directory_id()
+                    && let Ok(directories) = db.list_directories(Some("pending"))
+                    && let Some(dir) = directories.iter().find(|d| d.id == dir_id)
+                {
+                    // Set pending deferral with directory ID, path, empty input buffer, and default days
+                    app.pending_deferral = Some(PendingDeferral {
+                        directory_id: dir.id,
+                        path: dir.path.clone(),
+                        input: String::new(),
+                        default_days: config.expiration_days,
+                    });
+                }
+            }
+
+            // Ignore path permanently (same as directory list)
+            KeyCode::Char('i') => {
+                // Get the currently selected directory ID from the app state
+                if let Some(dir_id) = app.current_directory_id()
+                    && let Ok(directories) = db.list_directories(Some("pending"))
+                    && let Some(dir) = directories.iter().find(|d| d.id == dir_id)
+                {
+                    // Set pending ignore with directory ID and path
+                    app.pending_ignore = Some((dir.id, dir.path.clone()));
+                }
+            }
+
             _ => {}
         }
     }
@@ -1720,6 +1797,297 @@ mod tests {
         assert_eq!(
             deferral.input, "12",
             "Input should remain '12' (non-digit ignored)"
+        );
+    }
+
+    // Tests for pending approvals view (US-020)
+
+    #[test]
+    fn pending_approvals_view_supports_navigation() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.view = View::PendingApprovals;
+        app.list_len.set(10);
+
+        // Test j/k navigation
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('j')),
+        );
+        assert_eq!(app.selected_index, 1, "j should increment index");
+
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('k')),
+        );
+        assert_eq!(app.selected_index, 0, "k should decrement index");
+
+        // Test g/G navigation
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('G')),
+        );
+        assert_eq!(app.selected_index, 9, "G should go to bottom");
+
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('g')),
+        );
+        assert_eq!(app.selected_index, 0, "g should go to top");
+    }
+
+    #[test]
+    fn pending_approvals_view_exits_on_q_and_esc() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.view = View::PendingApprovals;
+
+        // Test q key
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('q')),
+        );
+        assert_eq!(
+            app.view,
+            View::DirectoryList,
+            "q should return to directory list"
+        );
+        assert_eq!(app.selected_index, 0, "Selection should reset");
+
+        // Reset for Esc test
+        app.view = View::PendingApprovals;
+        app.selected_index = 5;
+
+        InputHandler::handle(&mut app, &test_config(), &db, make_key_event(KeyCode::Esc));
+        assert_eq!(
+            app.view,
+            View::DirectoryList,
+            "Esc should return to directory list"
+        );
+        assert_eq!(app.selected_index, 0, "Selection should reset");
+    }
+
+    #[test]
+    fn pending_approvals_view_supports_sort_cycling() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.view = View::PendingApprovals;
+        assert_eq!(app.sort_mode, SortMode::Expiration);
+
+        // Press 's' to cycle sort modes
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('s')),
+        );
+        assert_eq!(
+            app.sort_mode,
+            SortMode::Size,
+            "Sort mode should cycle to Size"
+        );
+
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('s')),
+        );
+        assert_eq!(
+            app.sort_mode,
+            SortMode::Name,
+            "Sort mode should cycle to Name"
+        );
+
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('s')),
+        );
+        assert_eq!(
+            app.sort_mode,
+            SortMode::Expiration,
+            "Sort mode should cycle back to Expiration"
+        );
+    }
+
+    #[test]
+    fn pending_approvals_view_x_key_initiates_approval() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory with status='pending'
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/pending", 1024, 2, Some(now), now)
+            .expect("Failed to insert directory");
+        // Update status to pending
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+        db.update_directory_status(test_dir.id, "pending")
+            .expect("Failed to update status");
+
+        let mut app = App::new();
+        app.view = View::PendingApprovals;
+        app.current_directory_id.set(Some(test_dir.id));
+
+        // Press 'x' to initiate approval
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('x')),
+        );
+
+        // Should have pending approval set
+        assert!(
+            app.pending_approval.is_some(),
+            "Pending approval should be set"
+        );
+        let (dir_id, path) = app.pending_approval.as_ref().unwrap();
+        assert_eq!(*dir_id, test_dir.id, "Directory ID should match");
+        assert_eq!(path, "/test/pending", "Path should match");
+    }
+
+    #[test]
+    fn pending_approvals_view_d_key_initiates_deferral() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory with status='pending'
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/defer_pending", 2048, 3, Some(now), now)
+            .expect("Failed to insert directory");
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+        db.update_directory_status(test_dir.id, "pending")
+            .expect("Failed to update status");
+
+        let mut app = App::new();
+        app.view = View::PendingApprovals;
+        app.current_directory_id.set(Some(test_dir.id));
+
+        // Press 'd' to initiate deferral
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('d')),
+        );
+
+        // Should have pending deferral set
+        assert!(
+            app.pending_deferral.is_some(),
+            "Pending deferral should be set"
+        );
+        let deferral = app.pending_deferral.as_ref().unwrap();
+        assert_eq!(
+            deferral.directory_id, test_dir.id,
+            "Directory ID should match"
+        );
+        assert_eq!(deferral.path, "/test/defer_pending", "Path should match");
+        assert_eq!(deferral.input, "", "Input buffer should be empty initially");
+    }
+
+    #[test]
+    fn pending_approvals_view_i_key_initiates_ignore() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory with status='pending'
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/ignore_pending", 512, 1, Some(now), now)
+            .expect("Failed to insert directory");
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+        db.update_directory_status(test_dir.id, "pending")
+            .expect("Failed to update status");
+
+        let mut app = App::new();
+        app.view = View::PendingApprovals;
+        app.current_directory_id.set(Some(test_dir.id));
+
+        // Press 'i' to initiate ignore
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('i')),
+        );
+
+        // Should have pending ignore set
+        assert!(app.pending_ignore.is_some(), "Pending ignore should be set");
+        let (dir_id, path) = app.pending_ignore.as_ref().unwrap();
+        assert_eq!(*dir_id, test_dir.id, "Directory ID should match");
+        assert_eq!(path, "/test/ignore_pending", "Path should match");
+    }
+
+    #[test]
+    fn pending_approvals_view_actions_only_work_on_pending_directories() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory with status='tracked' (not pending)
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/tracked", 1024, 2, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+        // Status is 'tracked' by default
+
+        let mut app = App::new();
+        app.view = View::PendingApprovals;
+        app.current_directory_id.set(Some(test_dir.id));
+
+        // Press 'x' - should not set pending approval (directory is not pending)
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('x')),
+        );
+        assert!(
+            app.pending_approval.is_none(),
+            "Pending approval should not be set for non-pending directory"
+        );
+
+        // Press 'd' - should not set pending deferral
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('d')),
+        );
+        assert!(
+            app.pending_deferral.is_none(),
+            "Pending deferral should not be set for non-pending directory"
+        );
+
+        // Press 'i' - should not set pending ignore
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('i')),
+        );
+        assert!(
+            app.pending_ignore.is_none(),
+            "Pending ignore should not be set for non-pending directory"
         );
     }
 }

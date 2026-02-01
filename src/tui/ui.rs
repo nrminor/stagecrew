@@ -29,7 +29,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     match app.view() {
         View::DirectoryList => render_directory_list(app, config, db, frame, chunks[0]),
         View::DirectoryDetail => render_directory_detail(app, config, db, frame, chunks[0]),
-        View::PendingApprovals => render_pending_approvals(app, frame, chunks[0]),
+        View::PendingApprovals => render_pending_approvals(app, config, db, frame, chunks[0]),
         View::AuditLog => render_audit_log(app, frame, chunks[0]),
         View::Help => render_help(app, frame, chunks[0]),
     }
@@ -485,17 +485,162 @@ fn render_directory_detail(
 
 /// Render the pending approvals view.
 ///
-/// This is a placeholder implementation that will be expanded in US-020.
-fn render_pending_approvals(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let block = Block::default()
-        .title("Pending Approvals")
-        .borders(Borders::ALL)
+/// Displays only directories with status='pending', using the same table format
+/// as the main directory list. Users can approve (x), defer (d), or ignore (i) from this view.
+// Allow: This function is similar to render_directory_list but filters for pending directories.
+// The duplication is acceptable for now as both views have distinct purposes and may diverge
+// in future iterations. Extracting common logic would add indirection without clear benefit.
+#[allow(clippy::too_many_lines)]
+fn render_pending_approvals(
+    app: &App,
+    config: &Config,
+    db: &Database,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+) {
+    // Split into header area and table area
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(0),    // Table
+        ])
+        .split(area);
+
+    // Fetch only pending directories from database
+    let Ok(directories) = db.list_directories(Some("pending")) else {
+        // Error handling: show error message
+        let error_text = Paragraph::new("Error loading directories from database")
+            .block(Block::default().borders(Borders::ALL).title("Error"))
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(error_text, area);
+        return;
+    };
+
+    // Render header showing pending count
+    render_pending_header(directories.len(), frame, chunks[0]);
+
+    // Handle empty state
+    if directories.is_empty() {
+        let empty_text = Paragraph::new(
+            "No pending directories.\n\nPress 'q' or Esc to return to directory list.",
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Pending Approvals"),
+        )
+        .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty_text, chunks[1]);
+        return;
+    }
+
+    // Prepare directory rows with calculated expiration
+    let mut dir_rows: Vec<_> = directories
+        .into_iter()
+        .map(|dir| {
+            let days_remaining = dir
+                .oldest_mtime
+                .map(|mtime| calculate_expiration(mtime, config.expiration_days));
+            (dir, days_remaining)
+        })
+        .collect();
+
+    // Sort based on current sort mode
+    sort_directory_rows(&mut dir_rows, app.sort_mode());
+
+    // Update list length for navigation
+    app.list_len.set(dir_rows.len());
+
+    // Clamp selected index to valid range
+    let selected_idx = app.selected_index().min(dir_rows.len() - 1);
+
+    // Set current directory ID for potential actions
+    if let Some((dir, _)) = dir_rows.get(selected_idx) {
+        app.current_directory_id.set(Some(dir.id));
+    }
+
+    // Build table rows
+    let rows: Vec<Row> = dir_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, (dir, days_remaining))| {
+            let path_cell = Cell::from(dir.path.as_str());
+            // Allow: size_bytes is guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
+            #[allow(clippy::cast_sign_loss)]
+            let size_cell = Cell::from(format_bytes(dir.size_bytes as u64));
+
+            let expires_str = days_remaining.map_or_else(
+                || "N/A".to_string(),
+                |days| {
+                    if days >= 0 {
+                        format!("{days} days")
+                    } else {
+                        format!("{} days ago", -days)
+                    }
+                },
+            );
+            let expires_cell = Cell::from(expires_str);
+
+            let status_cell = Cell::from(dir.status.as_str());
+
+            // Determine row color based on status and expiration
+            let row_style = determine_row_style(&dir.status, *days_remaining, config.warning_days);
+
+            // Highlight selected row
+            let style = if idx == selected_idx {
+                row_style.add_modifier(Modifier::REVERSED)
+            } else {
+                row_style
+            };
+
+            Row::new(vec![path_cell, size_cell, expires_cell, status_cell]).style(style)
+        })
+        .collect();
+
+    // Build table
+    let widths = [
+        Constraint::Percentage(50), // Path
+        Constraint::Percentage(15), // Size
+        Constraint::Percentage(20), // Expires
+        Constraint::Percentage(15), // Status
+    ];
+
+    let sort_indicator = match app.sort_mode() {
+        SortMode::Expiration => " (by expiration)",
+        SortMode::Size => " (by size)",
+        SortMode::Name => " (by name)",
+    };
+
+    let table = Table::new(rows, widths)
+        .block(
+            Block::default()
+                .title(format!("Pending Approvals{sort_indicator}"))
+                .borders(Borders::ALL),
+        )
+        .header(
+            Row::new(vec![
+                Cell::from("Path"),
+                Cell::from("Size"),
+                Cell::from("Expires"),
+                Cell::from("Status"),
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD))
+            .bottom_margin(1),
+        );
+
+    frame.render_widget(table, chunks[1]);
+}
+
+/// Render the header for pending approvals view showing pending count.
+fn render_pending_header(pending_count: usize, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let header_text = format!("Pending directories awaiting approval: {pending_count}");
+
+    let header = Paragraph::new(header_text)
+        .block(Block::default().borders(Borders::ALL).title("Overview"))
         .style(Style::default());
 
-    let text = Paragraph::new("Pending approvals view (US-020)\n\nPress 'q' or Esc to go back")
-        .block(block);
-
-    frame.render_widget(text, area);
+    frame.render_widget(header, area);
 }
 
 /// Render the audit log view.
@@ -552,7 +697,10 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
             "[j/k] Navigate [g/G] Top/Bottom [s] Sort [Enter] Details [d] Defer [i] Ignore [x] Approve [p] Pending [a] Audit [?] Help [q] Quit"
         }
         View::DirectoryDetail => "[j/k] Navigate [g/G] Top/Bottom [h/Esc] Back [q] Quit",
-        View::PendingApprovals | View::AuditLog => "[j/k] Navigate [Esc] Back [q] Quit",
+        View::PendingApprovals => {
+            "[j/k] Navigate [g/G] Top/Bottom [x] Approve [d] Defer [i] Ignore [s] Sort [Esc] Back [q] Quit"
+        }
+        View::AuditLog => "[j/k] Navigate [Esc] Back [q] Quit",
         View::Help => "[Any key] Close",
     };
 
