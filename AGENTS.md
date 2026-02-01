@@ -49,11 +49,13 @@ just check          # Required before every commit
 just prepare-commit # Runs checks, then shows jj status
 ```
 
-### Commit Workflow
+### Commit Workflow - _the reverse of git_
 
-1. Make your changes
-2. Run `just check` — all checks must pass
-3. Run `jj commit` with an appropriate message
+1. Declare intent for the current commit with `jj describe`. Remember in `jj`, all changes in tracked are already in a commit--there is no index. All revisions in the current working copy will be in this commit.
+2. Make your changes.
+3. Run `just check` — all checks must pass
+4. Verify that your commit description is still accurate and update it if need be.
+5. If the commit is finished and all checks pass, move to a new clean commit for the next session with `jj new`
 
 ### Commit Message Format
 
