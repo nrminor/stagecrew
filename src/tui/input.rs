@@ -3,15 +3,19 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, SortMode, View};
+use crate::audit::{AuditAction, AuditService};
+use crate::db::Database;
 
 /// Handles keyboard input with vim-style bindings.
 pub(crate) struct InputHandler;
 
 impl InputHandler {
     /// Process a key event and update app state.
-    pub fn handle(app: &mut App, key: KeyEvent) {
+    ///
+    /// Takes a database reference for actions that modify state (approve, defer, ignore).
+    pub fn handle(app: &mut App, db: &Database, key: KeyEvent) {
         match app.view {
-            View::DirectoryList => Self::handle_directory_list(app, key),
+            View::DirectoryList => Self::handle_directory_list(app, db, key),
             View::DirectoryDetail => Self::handle_directory_detail(app, key),
             View::PendingApprovals => Self::handle_pending_approvals(app, key),
             View::AuditLog => Self::handle_audit_log(app, key),
@@ -19,7 +23,13 @@ impl InputHandler {
         }
     }
 
-    fn handle_directory_list(app: &mut App, key: KeyEvent) {
+    fn handle_directory_list(app: &mut App, db: &Database, key: KeyEvent) {
+        // If there's a pending approval confirmation, handle y/n/Esc
+        if app.pending_approval.is_some() {
+            Self::handle_confirmation(app, db, key);
+            return;
+        }
+
         match key.code {
             // Quit
             KeyCode::Char('q') => app.should_quit = true,
@@ -59,11 +69,61 @@ impl InputHandler {
             KeyCode::Char('a') => app.view = View::AuditLog,
             KeyCode::Char('?') => app.view = View::Help,
 
+            // Approve removal (US-017)
+            KeyCode::Char('x') => {
+                // Get the currently selected directory ID from the app state
+                // (set by the render function based on selected_index)
+                if let Some(dir_id) = app.current_directory_id()
+                    && let Ok(directories) = db.list_directories(None)
+                    && let Some(dir) = directories.iter().find(|d| d.id == dir_id)
+                {
+                    // Set pending approval with directory ID and path
+                    app.pending_approval = Some((dir.id, dir.path.clone()));
+                }
+            }
+
             // TODO(tui): Implement these actions in future stories
             // 'd' - Defer selected (US-018)
             // 'i' - Ignore selected (US-019)
-            // 'x' - Approve removal (US-017)
             _ => {}
+        }
+    }
+
+    /// Handle confirmation prompt (y/n/Esc) for approval action.
+    fn handle_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                // User confirmed - perform the approval
+                if let Some((dir_id, path)) = &app.pending_approval {
+                    // Update directory status to 'approved'
+                    if let Err(e) = db.update_directory_status(*dir_id, "approved") {
+                        // Log error but continue - user will see status unchanged
+                        tracing::warn!("Failed to approve directory {}: {}", path, e);
+                    } else {
+                        // Record audit entry
+                        let audit = AuditService::new(db);
+                        let user = AuditService::current_user();
+                        if let Err(e) = audit.record(
+                            &user,
+                            AuditAction::Approve,
+                            Some(path),
+                            None,
+                            Some(*dir_id),
+                        ) {
+                            tracing::warn!("Failed to record audit entry for approval: {}", e);
+                        }
+                    }
+                }
+                // Clear pending approval
+                app.pending_approval = None;
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                // Cancel confirmation
+                app.pending_approval = None;
+            }
+            _ => {
+                // Ignore other keys during confirmation
+            }
         }
     }
 
@@ -127,6 +187,8 @@ impl InputHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
+    use tempfile::tempdir;
 
     fn make_key_event(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -136,8 +198,16 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
+    fn temp_database() -> (Database, tempfile::TempDir) {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let db = Database::open(&db_path).expect("Failed to create test database");
+        (db, dir)
+    }
+
     #[test]
     fn sort_mode_cycles_on_s_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         assert_eq!(
             app.sort_mode,
@@ -146,7 +216,7 @@ mod tests {
         );
 
         // Press 's' - should cycle to Size
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(
             app.sort_mode,
             SortMode::Size,
@@ -154,7 +224,7 @@ mod tests {
         );
 
         // Press 's' again - should cycle to Name
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(
             app.sort_mode,
             SortMode::Name,
@@ -162,7 +232,7 @@ mod tests {
         );
 
         // Press 's' again - should cycle back to Expiration
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(
             app.sort_mode,
             SortMode::Expiration,
@@ -172,14 +242,15 @@ mod tests {
 
     #[test]
     fn sort_mode_persists_across_navigation() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
 
         // Change to Size sort
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(app.sort_mode, SortMode::Size);
 
         // Navigate down
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
         assert_eq!(
             app.sort_mode,
             SortMode::Size,
@@ -187,7 +258,7 @@ mod tests {
         );
 
         // Navigate up
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('k')));
         assert_eq!(
             app.sort_mode,
             SortMode::Size,
@@ -197,15 +268,16 @@ mod tests {
 
     #[test]
     fn sort_mode_persists_across_view_changes() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
 
         // Change to Name sort
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('s')));
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(app.sort_mode, SortMode::Name);
 
         // Switch to pending approvals view
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('p')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('p')));
         assert_eq!(app.view, View::PendingApprovals);
         assert_eq!(
             app.sort_mode,
@@ -214,7 +286,7 @@ mod tests {
         );
 
         // Return to directory list
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('q')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('q')));
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(
             app.sort_mode,
@@ -225,20 +297,23 @@ mod tests {
 
     #[test]
     fn quit_on_q_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         assert!(!app.should_quit);
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('q')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('q')));
         assert!(app.should_quit, "App should quit on 'q' key");
     }
 
     #[test]
     fn quit_on_ctrl_c() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         assert!(!app.should_quit);
 
         InputHandler::handle(
             &mut app,
+            &db,
             make_key_event_with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
         assert!(app.should_quit, "App should quit on Ctrl+C");
@@ -246,13 +321,14 @@ mod tests {
 
     #[test]
     fn navigation_j_increments_index() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         assert_eq!(app.selected_index, 0);
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
         assert_eq!(app.selected_index, 1, "'j' should increment selected index");
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
         assert_eq!(
             app.selected_index, 2,
             "'j' should increment selected index again"
@@ -261,13 +337,14 @@ mod tests {
 
     #[test]
     fn navigation_k_decrements_index() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.selected_index = 5;
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('k')));
         assert_eq!(app.selected_index, 4, "'k' should decrement selected index");
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('k')));
         assert_eq!(
             app.selected_index, 3,
             "'k' should decrement selected index again"
@@ -276,19 +353,21 @@ mod tests {
 
     #[test]
     fn navigation_g_goes_to_top() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.selected_index = 10;
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('g')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('g')));
         assert_eq!(app.selected_index, 0, "'g' should go to top (index 0)");
     }
 
     #[test]
     fn navigation_capital_g_goes_to_bottom() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.list_len.set(10);
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('G')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('G')));
         assert_eq!(
             app.selected_index, 9,
             "'G' should go to bottom (list_len - 1)"
@@ -297,10 +376,11 @@ mod tests {
 
     #[test]
     fn view_switching_with_p_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         assert_eq!(app.view, View::DirectoryList);
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('p')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('p')));
         assert_eq!(
             app.view,
             View::PendingApprovals,
@@ -310,10 +390,11 @@ mod tests {
 
     #[test]
     fn view_switching_with_a_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         assert_eq!(app.view, View::DirectoryList);
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('a')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('a')));
         assert_eq!(
             app.view,
             View::AuditLog,
@@ -323,19 +404,21 @@ mod tests {
 
     #[test]
     fn view_switching_with_question_mark_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         assert_eq!(app.view, View::DirectoryList);
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('?')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('?')));
         assert_eq!(app.view, View::Help, "'?' should switch to help view");
     }
 
     #[test]
     fn help_view_closes_on_any_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.view = View::Help;
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('x')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('x')));
         assert_eq!(
             app.view,
             View::DirectoryList,
@@ -347,11 +430,12 @@ mod tests {
 
     #[test]
     fn enter_detail_view_on_enter_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.selected_index = 5;
         app.current_directory_id.set(Some(42)); // Would be set by render
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Enter));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Enter));
 
         assert_eq!(app.view, View::DirectoryDetail);
         assert_eq!(
@@ -362,10 +446,11 @@ mod tests {
 
     #[test]
     fn enter_detail_view_on_l_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.current_directory_id.set(Some(42));
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('l')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('l')));
 
         assert_eq!(app.view, View::DirectoryDetail);
         assert_eq!(
@@ -376,11 +461,12 @@ mod tests {
 
     #[test]
     fn exit_detail_view_on_esc() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.view = View::DirectoryDetail;
         app.current_directory_id.set(Some(42));
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Esc));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Esc));
 
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(
@@ -393,11 +479,12 @@ mod tests {
 
     #[test]
     fn exit_detail_view_on_h_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.view = View::DirectoryDetail;
         app.current_directory_id.set(Some(42));
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('h')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('h')));
 
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(app.current_directory_id(), None);
@@ -406,11 +493,12 @@ mod tests {
 
     #[test]
     fn exit_detail_view_on_q_key() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.view = View::DirectoryDetail;
         app.current_directory_id.set(Some(42));
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('q')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('q')));
 
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(app.current_directory_id(), None);
@@ -419,33 +507,36 @@ mod tests {
 
     #[test]
     fn detail_view_navigation_j_k_works() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.view = View::DirectoryDetail;
         app.list_len.set(10);
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
         assert_eq!(app.selected_index, 1, "j should move down");
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('k')));
         assert_eq!(app.selected_index, 0, "k should move up");
     }
 
     #[test]
     fn detail_view_navigation_g_capital_g_works() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.view = View::DirectoryDetail;
         app.selected_index = 5;
         app.list_len.set(10);
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('g')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('g')));
         assert_eq!(app.selected_index, 0, "g should go to top");
 
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('G')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('G')));
         assert_eq!(app.selected_index, 9, "G should go to bottom");
     }
 
     #[test]
     fn full_detail_view_navigation_flow() {
+        let (db, _dir) = temp_database();
         let mut app = App::new();
         app.list_len.set(5);
         app.selected_index = 2;
@@ -454,7 +545,7 @@ mod tests {
         app.current_directory_id.set(Some(42));
 
         // Enter detail view
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Enter));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Enter));
         assert_eq!(app.view, View::DirectoryDetail);
         assert_eq!(app.selected_index, 0, "Selection resets on entry");
         assert_eq!(
@@ -465,11 +556,11 @@ mod tests {
 
         // Navigate in detail view
         app.list_len.set(3); // Simulate file list
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
         assert_eq!(app.selected_index, 1);
 
         // Exit detail view
-        InputHandler::handle(&mut app, make_key_event(KeyCode::Esc));
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Esc));
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(
             app.current_directory_id(),
@@ -477,5 +568,202 @@ mod tests {
             "Directory ID cleared on exit"
         );
         assert_eq!(app.selected_index, 0, "Selection resets on exit");
+    }
+
+    // Tests for approval action (US-017)
+
+    #[test]
+    fn pressing_x_sets_pending_approval_with_valid_directory() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/path", 1024, 1, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        app.current_directory_id.set(Some(test_dir.id));
+
+        // Press 'x' to initiate approval
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('x')));
+
+        // Should have pending approval set
+        assert!(
+            app.pending_approval.is_some(),
+            "Pending approval should be set"
+        );
+        let (dir_id, path) = app.pending_approval.as_ref().unwrap();
+        assert_eq!(*dir_id, test_dir.id, "Directory ID should match");
+        assert_eq!(path, "/test/path", "Path should match");
+    }
+
+    #[test]
+    fn pressing_x_with_no_directory_does_nothing() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.current_directory_id.set(None);
+
+        // Press 'x' with no directory selected
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('x')));
+
+        // Should not set pending approval
+        assert!(
+            app.pending_approval.is_none(),
+            "Pending approval should not be set with no directory"
+        );
+    }
+
+    #[test]
+    fn pressing_y_approves_directory() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/approve", 2048, 5, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        // Simulate pending approval state (would be set by pressing 'x')
+        app.pending_approval = Some((test_dir.id, "/test/approve".to_string()));
+
+        // Press 'y' to confirm
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('y')));
+
+        // Should clear pending approval
+        assert!(
+            app.pending_approval.is_none(),
+            "Pending approval should be cleared after confirmation"
+        );
+
+        // Should update directory status to 'approved'
+        let updated_dir = db
+            .get_directory_by_path("/test/approve")
+            .expect("Failed to get directory")
+            .expect("Directory should exist");
+        assert_eq!(
+            updated_dir.status, "approved",
+            "Directory status should be 'approved'"
+        );
+    }
+
+    #[test]
+    fn pressing_n_cancels_approval() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/cancel", 1024, 2, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        // Simulate pending approval state
+        app.pending_approval = Some((test_dir.id, "/test/cancel".to_string()));
+
+        // Press 'n' to cancel
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('n')));
+
+        // Should clear pending approval
+        assert!(
+            app.pending_approval.is_none(),
+            "Pending approval should be cleared after cancel"
+        );
+
+        // Should NOT update directory status (should remain 'tracked')
+        let unchanged_dir = db
+            .get_directory_by_path("/test/cancel")
+            .expect("Failed to get directory")
+            .expect("Directory should exist");
+        assert_eq!(
+            unchanged_dir.status, "tracked",
+            "Directory status should remain 'tracked'"
+        );
+    }
+
+    #[test]
+    fn pressing_esc_cancels_approval() {
+        let (db, _dir) = temp_database();
+
+        let mut app = App::new();
+        app.pending_approval = Some((42, "/test/path".to_string()));
+
+        // Press Esc to cancel
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Esc));
+
+        // Should clear pending approval
+        assert!(
+            app.pending_approval.is_none(),
+            "Pending approval should be cleared after Esc"
+        );
+    }
+
+    #[test]
+    fn other_keys_ignored_during_confirmation() {
+        let (db, _dir) = temp_database();
+
+        let mut app = App::new();
+        app.pending_approval = Some((42, "/test/path".to_string()));
+
+        // Press random key during confirmation
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
+
+        // Should still have pending approval (ignored)
+        assert!(
+            app.pending_approval.is_some(),
+            "Pending approval should remain during confirmation"
+        );
+    }
+
+    #[test]
+    fn approval_creates_audit_entry() {
+        use crate::audit::AuditService;
+
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/audit", 4096, 10, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        app.pending_approval = Some((test_dir.id, "/test/audit".to_string()));
+
+        // Press 'y' to approve
+        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('y')));
+
+        // Check audit log
+        let audit = AuditService::new(&db);
+        let entries = audit.list_recent(10).expect("Failed to list audit entries");
+
+        assert!(!entries.is_empty(), "Should have at least one audit entry");
+
+        // Find the approve entry
+        let approve_entry = entries
+            .iter()
+            .find(|e| e.action == "approve" && e.target_path == Some("/test/audit".to_string()));
+
+        assert!(
+            approve_entry.is_some(),
+            "Should have an 'approve' audit entry for the path"
+        );
     }
 }

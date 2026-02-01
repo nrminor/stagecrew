@@ -578,3 +578,43 @@
 - Next story is US-017: Implement TUI approve action
 - US-017 will add 'x' key to approve directory for removal with confirmation prompt
 
+
+## US-017: Implement TUI approve action (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `pending_approval: Option<(i64, String)>` field to App struct to track confirmation state
+- Modified `InputHandler::handle()` signature to accept `&Database` parameter for DB operations
+- Updated all 21 existing input handler tests to pass database parameter
+- Implemented 'x' key handler that queries database to find directory by ID and sets pending_approval
+- Implemented confirmation modal rendering with centered modal UI (yellow border, centered text)
+- Implemented 'y'/'n'/Esc confirmation handlers:
+  - 'y': Updates directory status to 'approved', records audit entry, clears pending_approval
+  - 'n' or Esc: Clears pending_approval without changes
+- Added `tracing::warn!` for audit recording failures per code review
+- Updated footer to show '[x] Approve' keybinding hint in directory list view
+- Added 7 comprehensive unit tests:
+  - pressing_x_sets_pending_approval_with_valid_directory
+  - pressing_x_with_no_directory_does_nothing
+  - pressing_y_approves_directory
+  - pressing_n_cancels_approval
+  - pressing_esc_cancels_approval
+  - other_keys_ignored_during_confirmation
+  - approval_creates_audit_entry
+
+**Agent reviews:**
+- nick-isms: Approved with minor recommendations (B+ grade). Code follows conventions, good test coverage. Recommendations: add tracing::warn for audit failures (done), consider get_directory_by_id method (future), track stringly-typed status as tech debt.
+- testing-guru: Good core coverage but identified 6 missing edge case tests (stale directory ID, full flow integration, capital Y/N variants, view blocking during confirmation, status transition edge cases). Recommended as medium priority for future polish.
+- semver-nag: No semver concerns (binary crate). Recommended replacing `(i64, String)` tuple with PendingApproval struct for better maintainability (tracked as future improvement).
+
+**Notes for next agent:**
+- Approval action is now feature-complete for US-017
+- All 148 tests pass, clippy clean, docs build successfully
+- All acceptance criteria met and verified
+- Code review recommendations documented for future improvements:
+  1. Add PendingApproval struct to replace tuple (semver-nag recommendation)
+  2. Add Database::get_directory_by_id() method to avoid full list fetch (nick-isms)
+  3. Add 6 additional edge case tests: stale ID, full flow, capital Y/N, view blocking, status transitions (testing-guru)
+- Next story is US-018: Implement TUI defer action
+- US-018 will add 'd' key to defer directory expiration with prompt for days

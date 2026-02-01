@@ -48,6 +48,10 @@ pub struct App {
     /// The directory ID currently being viewed in detail view (None if not in detail view).
     /// Uses Cell for interior mutability since it's updated during rendering.
     pub(crate) current_directory_id: Cell<Option<i64>>,
+
+    /// Pending approval confirmation state.
+    /// Contains the directory ID and path awaiting user confirmation for approval.
+    pub(crate) pending_approval: Option<(i64, String)>,
 }
 
 impl App {
@@ -74,6 +78,11 @@ impl App {
     /// Get the current directory ID being viewed in detail mode.
     pub fn current_directory_id(&self) -> Option<i64> {
         self.current_directory_id.get()
+    }
+
+    /// Get the pending approval confirmation state.
+    pub fn pending_approval(&self) -> Option<&(i64, String)> {
+        self.pending_approval.as_ref()
     }
 
     /// Select the last item in a list of the given length.
@@ -174,6 +183,7 @@ impl App {
             filter_days: None,
             list_len: Cell::new(0),
             current_directory_id: Cell::new(None),
+            pending_approval: None,
         }
     }
 
@@ -207,7 +217,7 @@ impl App {
             if event::poll(Duration::from_millis(100)).map_err(crate::error::Error::Io)?
                 && let Event::Key(key) = event::read().map_err(crate::error::Error::Io)?
             {
-                InputHandler::handle(self, key);
+                InputHandler::handle(self, db, key);
             }
         }
 
@@ -257,6 +267,10 @@ mod tests {
             app.current_directory_id.get(),
             None,
             "App should start with no directory selected"
+        );
+        assert_eq!(
+            app.pending_approval, None,
+            "App should start with no pending approval"
         );
     }
 
