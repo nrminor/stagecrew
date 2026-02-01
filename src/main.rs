@@ -35,9 +35,9 @@ async fn main() -> Result<()> {
     let paths = AppPaths::new();
     let config = Config::load(&paths).context("Failed to load configuration")?;
 
-    // Open database
+    // Open database (path derived from config)
     let db_path = paths
-        .database_file()
+        .database_file(&config)
         .context("Failed to get database path")?;
     let db = Database::open(&db_path).context("Failed to open database")?;
 
@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
                 "Configuration initialized at: {}",
                 paths.config_file()?.display()
             );
+            println!("Database location: {}", db_path.display());
         }
     }
 

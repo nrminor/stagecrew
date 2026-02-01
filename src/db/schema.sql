@@ -1,8 +1,9 @@
 -- Stagecrew database schema
 -- Uses SQLite with WAL mode for concurrent access
-
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+--
+-- Note: PRAGMA statements (journal_mode, foreign_keys) are set in Rust code
+-- via pragma_update() for reliability. execute_batch() does not guarantee
+-- PRAGMA execution order or persistence.
 
 -- Tracked directories (primary tracking unit)
 CREATE TABLE IF NOT EXISTS directories (

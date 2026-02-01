@@ -18,3 +18,68 @@
 - All error variants are being used (PermissionDenied and PathNotFound in removal/mod.rs)
 - Next story is US-002: Implement configuration with shared database path
 - The config module already has most of the structure but needs `database_path` field and shared location logic
+
+## US-002: Implement configuration with shared database path (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `database_path: Option<PathBuf>` field to `Config` struct
+- Updated `AppPaths::database_file()` to take `&Config` parameter
+- Implemented priority logic: explicit config > derived from tracked_paths > XDG fallback
+- Added `#[non_exhaustive]` to `Config` for future field additions without breaking changes
+- Narrowed `#![allow(dead_code)]` to just `log_dir()` method (was module-level)
+- Updated `ref` keyword to `&` for modern Rust style
+- Documented I/O side effects in `database_file()` docstring
+- Updated `main.rs` to pass config to `database_file()` and print db path in init command
+- Added 8 unit tests covering all scenarios
+
+**Agent reviews:**
+- nick-isms: Flagged side effects in query method (documented), narrowed allow scope, added precedence test
+- testing-guru: Comprehensive feedback on test coverage gaps; addressed critical ones (precedence test)
+- semver-nag: Recommended `#[non_exhaustive]` on Config (added), noted API is appropriate for 0.x
+
+**Notes for next agent:**
+- Config module is now feature-complete for US-002
+- `AppPaths::database_file()` now requires `&Config` parameter - update any callers
+- Next story is US-003: Implement database initialization and schema
+- Schema is already defined in `schema.sql`, need to wire up `Database::open()` to run it
+- The db module exists but needs implementation of schema execution and WAL/FK pragmas
+
+## US-003: Implement database initialization and schema (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Moved PRAGMA statements from schema.sql to Rust code using `pragma_update()` for reliability
+- Added runtime verification that WAL mode is actually enabled (returns error if not)
+- Changed `Database::open()` signature from `&PathBuf` to `&Path` (more idiomatic)
+- Moved `#![allow(dead_code)]` from module-level to item-level on `conn()` method
+- Added comprehensive doc comments with `# Errors` section
+- Added stability note on `conn()` about rusqlite coupling
+- Added 10 unit tests:
+  - `database_creates_file_and_schema` - verifies all 4 tables exist
+  - `database_enables_wal_mode` - verifies WAL pragma is set
+  - `database_enables_foreign_keys` - verifies foreign_keys pragma is set
+  - `database_creates_indexes` - verifies all 7 indexes exist
+  - `database_initializes_stats_singleton` - verifies stats table has id=1 row
+  - `database_schema_is_idempotent` - verifies opening twice preserves data
+  - `database_open_fails_on_invalid_path` - error path test
+  - `foreign_key_constraint_prevents_orphan_files` - FK enforcement test
+  - `directories_rejects_invalid_status` - CHECK constraint test
+  - `stats_enforces_singleton_constraint` - CHECK constraint test
+- Extracted `temp_database()` helper to reduce test boilerplate
+- Improved assertion messages with context
+
+**Agent reviews:**
+- nick-isms: Flagged missing WAL verification (added runtime check), module-level allow (moved to item), test boilerplate (extracted helper)
+- testing-guru: Comprehensive feedback on coverage gaps; added error path test, FK enforcement test, CHECK constraint tests, improved idempotency test
+- semver-nag: Noted `conn()` exposes rusqlite::Connection (documented stability note), API change from &PathBuf to &Path is non-breaking
+
+**Notes for next agent:**
+- Database module is now feature-complete for US-003
+- `Database::open()` now takes `&Path` instead of `&PathBuf` (more flexible, existing code still works)
+- WAL mode is verified at runtime - will error if filesystem doesn't support it
+- `conn()` method has `#[allow(dead_code)]` - will be used by service layer in US-004
+- Next story is US-004: Implement directory and file CRUD operations
+- The Directory and File structs need to be defined, along with CRUD methods on Database

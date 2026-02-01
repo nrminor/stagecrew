@@ -31,8 +31,8 @@
         "just check passes"
       ],
       "priority": 2,
-      "passes": false,
-      "notes": "Database path must be configurable but default to shared location on CephFS."
+      "passes": true,
+      "notes": "Completed: Added database_path field to Config, updated AppPaths::database_file() to take config and implement priority logic (explicit > derived from tracked_paths > XDG fallback). Added #[non_exhaustive] to Config per semver-nag review. Narrowed #[allow(dead_code)] to just log_dir(). Added 8 unit tests covering serialization, deserialization, defaults, and all three database path priority scenarios including precedence test."
     },
     {
       "id": "US-003",
@@ -49,8 +49,8 @@
         "just check passes"
       ],
       "priority": 3,
-      "passes": false,
-      "notes": "Schema already defined in schema.sql, need to verify it works."
+      "passes": true,
+      "notes": "Completed: Moved PRAGMA statements from schema.sql to Rust code using pragma_update() for reliability. Added runtime verification that WAL mode is actually enabled (critical for HPC shared filesystems). Changed open() signature from &PathBuf to &Path (more idiomatic). Added 10 unit tests covering schema creation, WAL mode, foreign keys, indexes, stats singleton, idempotency, error paths, and constraint enforcement. Moved #[allow(dead_code)] to item-level on conn() method."
     },
     {
       "id": "US-004",
