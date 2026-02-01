@@ -968,3 +968,40 @@
 - Next story is US-026: Add integration test for full workflow
 - US-026 will add end-to-end test covering init → scan → transition → approve → remove → audit verification
 
+
+## US-026: Add integration test for full workflow (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Created `src/lib.rs` as library entry point exposing `audit`, `config`, `db`, `error`, `removal`, and `scanner` modules for integration testing
+- Added comprehensive end-to-end integration test in `tests/integration.rs` (217 lines) covering full workflow:
+  - Database initialization with schema
+  - Scanning directory trees with files of varying ages (95, 80, 10 days old)
+  - Verifying directories and files are stored in database with correct metadata
+  - State transitions (expired tracked → pending via `transition_expired_paths`)
+  - Manual approval workflow (pending → approved with audit entry)
+  - Actual filesystem removal (approved → removed, verifying file deletion)
+  - Audit log verification for scan, approve, and remove actions
+  - Stats table updates
+  - Untouched directories remain intact (80-day and 10-day directories)
+- Added `create_file_with_age` helper function to set file modification times for testing
+- Added stability documentation to `lib.rs` warning that API is unstable until 1.0.0
+- Added `#[non_exhaustive]` to `Stats` struct per semver review
+- Added `#[must_use]` attributes to exposed functions: `AppPaths::new()`, `Scanner::new()`, `RemovalService::new()`, `AuditService::current_user()`
+- Added `# Errors` documentation sections to all public functions returning Result
+- Updated `.gitignore` to track `src/lib.rs`
+
+**Agent reviews:**
+- nick-isms: B+ grade. Solid comprehensive test covering all acceptance criteria. Fixed `&PathBuf` → `&Path` in helper function per feedback. Noted magic number 86400 could use constant (acceptable). Test doesn't verify transition audit entry (acceptable gap, transition_expired_paths uses AuditAction::Scan). Good use of tempfile, meaningful assertions, proper #[allow] justification. Integration test test length (217 lines) acceptable for comprehensive workflow validation.
+- testing-guru: Coverage is sufficient for US-026. Integration test validates that all components work together correctly. All acceptance criteria met. Edge cases (permission denied, broken symlinks, deferred paths, auto-remove, ignored paths, concurrent access) are well-covered by 282 unit tests in individual modules. Recommended optional additional tests for defer workflow, auto-remove mode, and ignore prevention but not required for MVP.
+- semver-nag: Critical risk of exposing overly broad public API. Fixed Stats missing #[non_exhaustive]. Added stability documentation to lib.rs. Noted dependency exposure (rusqlite::Connection, jiff::Timestamp) and recommended consideration for future. At 0.1.0, current exposure is acceptable with documented instability. Structs properly use #[non_exhaustive] for future extensibility except Stats (now fixed). RemovalSummary pattern of private fields with getters is good model.
+
+**Notes for next agent:**
+- Integration test is now feature-complete for US-026
+- All 282 tests pass (281 existing + 1 new integration test)
+- Library API created for testing purposes only - documented as unstable until 1.0.0
+- Semver considerations documented: jiff/rusqlite type exposure, Stats #[non_exhaustive] added
+- Test creates realistic scenario: 3 directories with 4 files at different ages (95/80/10 days), exercises full workflow from scan to removal
+- Next story is US-027: Polish and cleanup
+- US-027 will address TODO(cleanup) comments, remove dead_code allows, ensure all public items have doc comments

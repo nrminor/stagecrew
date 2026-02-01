@@ -14,12 +14,17 @@ pub struct AppPaths {
 
 impl AppPaths {
     /// Initialize with application prefix "stagecrew".
+    #[must_use]
     pub fn new() -> Self {
         let xdg = BaseDirectories::with_prefix("stagecrew");
         Self { xdg }
     }
 
     /// Path to config file: `~/.config/stagecrew/config.toml`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config directory cannot be created.
     pub fn config_file(&self) -> std::io::Result<PathBuf> {
         self.xdg.place_config_file("config.toml")
     }
@@ -38,6 +43,10 @@ impl AppPaths {
     ///
     /// This method creates the parent directory of the database file if it doesn't
     /// exist. This is intentional to ensure the database can be created on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database directory cannot be created.
     pub fn database_file(&self, config: &Config) -> std::io::Result<PathBuf> {
         // Priority 1: Explicit database_path in config
         if let Some(db_path) = &config.database_path {
@@ -64,6 +73,10 @@ impl AppPaths {
     /// Path to log directory: `~/.local/state/stagecrew/`
     ///
     /// Creates the directory if it doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log directory cannot be created.
     // TODO(cleanup): Remove allow once log_dir is wired into daemon.
     #[allow(dead_code)]
     pub fn log_dir(&self) -> std::io::Result<PathBuf> {
@@ -123,6 +136,10 @@ impl Default for Config {
 
 impl Config {
     /// Load configuration from the default path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config file cannot be read or parsed.
     pub fn load(paths: &AppPaths) -> Result<Self> {
         let config_path = paths.config_file()?;
 
@@ -139,6 +156,10 @@ impl Config {
     }
 
     /// Save configuration to the default path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be serialized or written to disk.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let config_path = paths.config_file()?;
         let contents = toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;

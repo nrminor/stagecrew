@@ -84,6 +84,7 @@ impl<'a> AuditService<'a> {
     /// Returns `"unknown"` if neither is set.
     // TODO(cleanup): Remove allow once other modules call this for audit records.
     #[allow(dead_code)]
+    #[must_use]
     pub fn current_user() -> String {
         std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))

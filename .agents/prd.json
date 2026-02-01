@@ -448,8 +448,8 @@
         "just check passes"
       ],
       "priority": 26,
-      "passes": false,
-      "notes": "End-to-end verification of core workflow."
+      "passes": true,
+      "notes": "Completed: Created src/lib.rs exposing audit, config, db, error, removal, and scanner modules for integration testing. Added comprehensive end-to-end test in tests/integration.rs covering full workflow (init → scan → persist → transition → approve → remove → verify). Test creates files with varying ages (95, 80, 10 days), verifies database state, filesystem deletion, and audit trail. Added #[non_exhaustive] to Stats struct per semver review. Added stability documentation to lib.rs. All 282 tests pass."
     },
     {
       "id": "US-027",

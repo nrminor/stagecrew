@@ -17,11 +17,14 @@ impl RemovalService {
     /// Create a new removal service.
     // TODO(cleanup): Remove allow once daemon module constructs RemovalService.
     #[allow(dead_code)]
+    #[must_use]
     pub fn new(dry_run: bool) -> Self {
         Self { dry_run }
     }
 
     /// Attempt to remove a path (file or directory).
+    ///
+    /// # Errors
     ///
     /// Returns an error if:
     /// - Permission is denied

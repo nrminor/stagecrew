@@ -64,6 +64,7 @@ pub struct File {
 ///
 /// Stored in the singleton `stats` table row, updated after each scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
     /// Total number of tracked directories.
     pub total_tracked_paths: i64,

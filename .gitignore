@@ -19,6 +19,7 @@
 # === Allowed: Source code ===
 !/src
 !/src/main.rs
+!/src/lib.rs
 !/src/error.rs
 !/src/cli
 !/src/cli/mod.rs

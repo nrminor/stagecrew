@@ -480,6 +480,7 @@ pub struct Scanner {
 
 impl Scanner {
     /// Create a new scanner.
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }
