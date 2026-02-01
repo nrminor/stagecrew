@@ -10,6 +10,8 @@
 !/justfile
 !/AGENTS.md
 !/opencode.json
+!/README.md
+!/LICENSE
 
 # === Allowed: Agent configuration ===
 !/.agents

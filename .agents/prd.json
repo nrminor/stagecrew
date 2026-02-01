@@ -466,6 +466,81 @@
       "priority": 27,
       "passes": true,
       "notes": "Completed: Removed all TODO(cleanup) comments and temporary #[allow] attributes. Module-level #![allow(dead_code, unused)] removed from tui/mod.rs. Replaced temporary allows with properly justified permanent allows for public API items reserved for future use (AuditAction::ConfigChange, AuditService::list_by_path, AuditEntry, Database::get_directory_by_path, RemovalSummary::empty, App::filter_days). Removed AppPaths::log_dir() per semver-nag recommendation (untested, unused, vague justification). All remaining allows follow AGENTS.md policy with clear justifications. All 282 tests pass, no clippy warnings, docs build successfully."
+    },
+    {
+      "id": "US-028",
+      "title": "Deny unwraps in clippy and resolve violations",
+      "description": "As a developer, I want unwrap() calls flagged by clippy so that error handling is explicit throughout the codebase.",
+      "acceptanceCriteria": [
+        "Add clippy::unwrap_used to deny list in Cargo.toml lints section",
+        "Resolve all resulting clippy errors on a case-by-case basis",
+        "Use expect() with descriptive messages for truly unreachable cases",
+        "Use proper error handling (?, ok_or_else, match) where fallibility is possible",
+        "No blanket #[allow(clippy::unwrap_used)] - each allow needs justification",
+        "just check passes"
+      ],
+      "priority": 28,
+      "passes": false,
+      "notes": "Turning on this lint after initial development means many violations to resolve. Each case requires judgment: expect with good message vs. proper error propagation vs. restructuring."
+    },
+    {
+      "id": "US-029",
+      "title": "Add CI workflow",
+      "description": "As a developer, I want CI to run on PRs and pushes so that code quality is enforced automatically.",
+      "acceptanceCriteria": [
+        "Create .github/workflows/ci.yml",
+        "Workflow triggers on push to main and pull requests",
+        "Runs 'just check' (fmt, clippy, tests, doc build) which uses cargo-nextest for fast parallel test execution",
+        "Install cargo-nextest in CI before running tests",
+        "Uses stable Rust toolchain",
+        "Caches cargo dependencies for faster builds",
+        "Add .github directory and workflow file to .gitignore allow list",
+        "Add CI status badge to README.md at the top",
+        "just check passes"
+      ],
+      "priority": 29,
+      "passes": false,
+      "notes": "Standard CI workflow. Keep it simple - just run the same checks developers run locally. Badge format: ![CI](https://github.com/nrminor/stagecrew/actions/workflows/ci.yml/badge.svg)"
+    },
+    {
+      "id": "US-030",
+      "title": "Add release workflow with cross-platform binaries",
+      "description": "As a user, I want pre-built binaries for my platform so that I can install without compiling.",
+      "acceptanceCriteria": [
+        "Create .github/workflows/release.yml",
+        "Triggers on version tags (v*.*.*)",
+        "Runs CI checks before creating release",
+        "Builds binaries for: x86_64-linux-gnu, x86_64-linux-musl, aarch64-linux-gnu, aarch64-linux-musl, x86_64-macos, aarch64-macos, x86_64-windows, aarch64-windows",
+        "Uses cross for ARM Linux builds",
+        "Packages as .tar.gz (Unix) or .zip (Windows)",
+        "Uploads assets to GitHub release",
+        "Detects pre-release versions (v1.0.0-beta)",
+        "Reference .agents/release-workflow-example.yml as template",
+        "just check passes"
+      ],
+      "priority": 30,
+      "passes": false,
+      "notes": "Adapt the example workflow in .agents/release-workflow-example.yml. Update binary name to 'stagecrew'."
+    },
+    {
+      "id": "US-031",
+      "title": "Add curl-installable install script",
+      "description": "As a user, I want to install stagecrew with a single curl command so that setup is easy.",
+      "acceptanceCriteria": [
+        "Create INSTALL.sh in repository root",
+        "Detects platform (linux/macos/windows) and architecture (x86_64/aarch64)",
+        "Downloads appropriate pre-built binary from GitHub releases",
+        "Falls back to cargo install if no binary available",
+        "Installs to $CONDA_PREFIX/bin if in conda/pixi environment, else ~/.local/bin",
+        "Shows helpful post-install instructions specific to stagecrew",
+        "Supports --help and --version flags",
+        "Reference .agents/install-script-example.sh as template",
+        "Add INSTALL.sh to .gitignore allow list",
+        "just check passes"
+      ],
+      "priority": 31,
+      "passes": false,
+      "notes": "Adapt the example script in .agents/install-script-example.sh. Update repo name, binary name, and post-install instructions for stagecrew."
     }
   ]
 }
