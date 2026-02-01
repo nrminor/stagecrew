@@ -315,8 +315,8 @@
         "just check passes"
       ],
       "priority": 18,
-      "passes": false,
-      "notes": "Deferral resets the clock. Prompt allows custom period."
+      "passes": true,
+      "notes": "Completed: Implemented 'd' key handler with numeric input modal, PendingDeferral struct for state tracking, validation (rejects zero/invalid input), database updates (status='deferred', deferred_until timestamp), and audit logging. Added 10 comprehensive unit tests. Addressed code review feedback: replaced tuple with PendingDeferral struct (includes directory_id, path, input, default_days), fixed hardcoded 90-day default to use config.expiration_days, improved mutation pattern with ref mut. Technical debt noted: Raw SQL for deferred_until update (future: add Database::defer_directory() method). All 158 tests pass."
     },
     {
       "id": "US-019",

@@ -618,3 +618,38 @@
   3. Add 6 additional edge case tests: stale ID, full flow, capital Y/N, view blocking, status transitions (testing-guru)
 - Next story is US-018: Implement TUI defer action
 - US-018 will add 'd' key to defer directory expiration with prompt for days
+
+## US-018: Implement TUI defer action (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `PendingDeferral` struct with fields: directory_id, path, input (buffer), default_days
+- Modified `InputHandler::handle()` signature to accept `&Config` parameter
+- Implemented 'd' key handler that creates PendingDeferral with config.expiration_days as default
+- Implemented `handle_deferral_input()` function with digit input, backspace, Enter confirm, Esc cancel
+- Numeric validation rejects zero and parse errors with warning logs
+- Database update: sets status='deferred' and deferred_until timestamp (using raw SQL, noted as tech debt)
+- Records audit entry with "Deferred for N days" in details field
+- Implemented `render_deferral_modal()` with centered cyan-bordered modal showing current input and default in brackets
+- Updated footer to show '[d] Defer' keybinding hint
+- Added 10 comprehensive unit tests covering all workflows and edge cases
+- Updated all existing input handler tests (21 tests) to pass config parameter
+
+**Agent reviews:**
+- nick-isms: Identified critical issue with hardcoded 90-day default (fixed), recommended PendingDeferral struct instead of tuple (implemented), noted raw SQL bypass (documented as tech debt), overall B+ with issues addressed
+- testing-guru: Comprehensive coverage of happy paths. Recommended 4 additional edge case tests (overflow, backspace on empty, nonexistent directory, leading zeros) as lower priority. Core coverage is solid.
+- semver-nag: Identified API design issues (all fixed): replaced tuple with struct, added PartialEq derive, stored default_days in state. Recommended Database::defer_directory() method to eliminate raw SQL (tracked as future work).
+
+**Technical debt documented:**
+- Raw SQL for deferred_until update bypasses CRUD layer - should add Database::defer_directory() method
+- Consider unified modal state enum when adding US-019 (third modal type)
+
+**Notes for next agent:**
+- Defer action is now feature-complete for US-018
+- All 158 tests pass, clippy clean, docs build successfully
+- All acceptance criteria met and verified including config.expiration_days default
+- PendingDeferral struct provides clean API with named fields and proper encapsulation
+- Config is now threaded through InputHandler::handle() for access to expiration_days
+- Next story is US-019: Implement TUI ignore action
+- US-019 will add 'i' key for permanent exemption with confirmation prompt

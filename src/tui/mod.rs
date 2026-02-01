@@ -25,6 +25,22 @@ use crate::error::Result;
 
 use input::InputHandler;
 
+/// State for an in-progress deferral action.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingDeferral {
+    /// Directory ID being deferred.
+    pub directory_id: i64,
+
+    /// Path of the directory being deferred.
+    pub path: String,
+
+    /// Accumulated input buffer for days to defer.
+    pub input: String,
+
+    /// Default number of days to defer (from config).
+    pub default_days: u32,
+}
+
 /// Main TUI application state.
 pub struct App {
     /// Whether the app should quit.
@@ -52,6 +68,9 @@ pub struct App {
     /// Pending approval confirmation state.
     /// Contains the directory ID and path awaiting user confirmation for approval.
     pub(crate) pending_approval: Option<(i64, String)>,
+
+    /// Pending deferral input state.
+    pub(crate) pending_deferral: Option<PendingDeferral>,
 }
 
 impl App {
@@ -83,6 +102,11 @@ impl App {
     /// Get the pending approval confirmation state.
     pub fn pending_approval(&self) -> Option<&(i64, String)> {
         self.pending_approval.as_ref()
+    }
+
+    /// Get the pending deferral input state.
+    pub fn pending_deferral(&self) -> Option<&PendingDeferral> {
+        self.pending_deferral.as_ref()
     }
 
     /// Select the last item in a list of the given length.
@@ -184,6 +208,7 @@ impl App {
             list_len: Cell::new(0),
             current_directory_id: Cell::new(None),
             pending_approval: None,
+            pending_deferral: None,
         }
     }
 
@@ -217,7 +242,7 @@ impl App {
             if event::poll(Duration::from_millis(100)).map_err(crate::error::Error::Io)?
                 && let Event::Key(key) = event::read().map_err(crate::error::Error::Io)?
             {
-                InputHandler::handle(self, db, key);
+                InputHandler::handle(self, config, db, key);
             }
         }
 
@@ -271,6 +296,10 @@ mod tests {
         assert_eq!(
             app.pending_approval, None,
             "App should start with no pending approval"
+        );
+        assert_eq!(
+            app.pending_deferral, None,
+            "App should start with no pending deferral"
         );
     }
 

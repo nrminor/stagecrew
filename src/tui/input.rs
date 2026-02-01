@@ -2,8 +2,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{App, SortMode, View};
+use super::{App, PendingDeferral, SortMode, View};
 use crate::audit::{AuditAction, AuditService};
+use crate::config::Config;
 use crate::db::Database;
 
 /// Handles keyboard input with vim-style bindings.
@@ -12,10 +13,11 @@ pub(crate) struct InputHandler;
 impl InputHandler {
     /// Process a key event and update app state.
     ///
-    /// Takes a database reference for actions that modify state (approve, defer, ignore).
-    pub fn handle(app: &mut App, db: &Database, key: KeyEvent) {
+    /// Takes a config reference for reading default values and a database reference
+    /// for actions that modify state (approve, defer, ignore).
+    pub fn handle(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
         match app.view {
-            View::DirectoryList => Self::handle_directory_list(app, db, key),
+            View::DirectoryList => Self::handle_directory_list(app, config, db, key),
             View::DirectoryDetail => Self::handle_directory_detail(app, key),
             View::PendingApprovals => Self::handle_pending_approvals(app, key),
             View::AuditLog => Self::handle_audit_log(app, key),
@@ -23,7 +25,13 @@ impl InputHandler {
         }
     }
 
-    fn handle_directory_list(app: &mut App, db: &Database, key: KeyEvent) {
+    fn handle_directory_list(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+        // If there's a pending deferral input, handle numeric input/Enter/Esc
+        if app.pending_deferral.is_some() {
+            Self::handle_deferral_input(app, config, db, key);
+            return;
+        }
+
         // If there's a pending approval confirmation, handle y/n/Esc
         if app.pending_approval.is_some() {
             Self::handle_confirmation(app, db, key);
@@ -82,8 +90,24 @@ impl InputHandler {
                 }
             }
 
+            // Defer expiration (US-018)
+            KeyCode::Char('d') => {
+                // Get the currently selected directory ID from the app state
+                if let Some(dir_id) = app.current_directory_id()
+                    && let Ok(directories) = db.list_directories(None)
+                    && let Some(dir) = directories.iter().find(|d| d.id == dir_id)
+                {
+                    // Set pending deferral with directory ID, path, empty input buffer, and default days
+                    app.pending_deferral = Some(PendingDeferral {
+                        directory_id: dir.id,
+                        path: dir.path.clone(),
+                        input: String::new(),
+                        default_days: config.expiration_days,
+                    });
+                }
+            }
+
             // TODO(tui): Implement these actions in future stories
-            // 'd' - Defer selected (US-018)
             // 'i' - Ignore selected (US-019)
             _ => {}
         }
@@ -123,6 +147,99 @@ impl InputHandler {
             }
             _ => {
                 // Ignore other keys during confirmation
+            }
+        }
+    }
+
+    /// Handle deferral input prompt for numeric days input.
+    ///
+    /// Accepts digit characters to build up the input string, Enter to confirm,
+    /// Backspace to delete digits, and Esc to cancel.
+    fn handle_deferral_input(app: &mut App, _config: &Config, db: &Database, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                // Append digit to input buffer
+                if let Some(ref mut deferral) = app.pending_deferral {
+                    deferral.input.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                // Remove last digit from input buffer
+                if let Some(ref mut deferral) = app.pending_deferral {
+                    deferral.input.pop();
+                }
+            }
+            KeyCode::Enter => {
+                // User confirmed - process the deferral
+                if let Some(deferral) = &app.pending_deferral {
+                    // Parse the input as days (or use default if empty)
+                    let days: u32 = if deferral.input.is_empty() {
+                        // Use default from config
+                        deferral.default_days
+                    } else if let Ok(parsed_days) = deferral.input.parse::<u32>() {
+                        // Validate that days > 0
+                        if parsed_days == 0 {
+                            // Invalid input - clear and return (user can try again)
+                            tracing::warn!("Invalid deferral period: must be > 0");
+                            app.pending_deferral = None;
+                            return;
+                        }
+                        parsed_days
+                    } else {
+                        // Parse error - clear and return
+                        tracing::warn!("Invalid deferral input: {}", deferral.input);
+                        app.pending_deferral = None;
+                        return;
+                    };
+
+                    // Calculate deferred_until timestamp
+                    let now = jiff::Timestamp::now();
+                    let days_i64 = i64::from(days);
+                    let deferred_until = now.as_second() + (days_i64 * 86400);
+
+                    // Update directory status to 'deferred' and set deferred_until
+                    if let Err(e) = db.update_directory_status(deferral.directory_id, "deferred") {
+                        tracing::warn!("Failed to defer directory {}: {}", deferral.path, e);
+                    } else {
+                        // Update deferred_until timestamp using raw SQL
+                        // Note: This is a limitation of the current CRUD interface which doesn't
+                        // expose deferred_until updates. Future work: add update_directory_deferral() method.
+                        let conn = db.conn();
+                        if let Err(e) = conn.execute(
+                            "UPDATE directories SET deferred_until = ? WHERE id = ?",
+                            rusqlite::params![deferred_until, deferral.directory_id],
+                        ) {
+                            tracing::warn!(
+                                "Failed to set deferred_until for {}: {}",
+                                deferral.path,
+                                e
+                            );
+                        } else {
+                            // Record audit entry
+                            let audit = AuditService::new(db);
+                            let user = AuditService::current_user();
+                            let details = Some(format!("Deferred for {days} days"));
+                            if let Err(e) = audit.record(
+                                &user,
+                                AuditAction::Defer,
+                                Some(&deferral.path),
+                                details.as_deref(),
+                                Some(deferral.directory_id),
+                            ) {
+                                tracing::warn!("Failed to record audit entry for deferral: {}", e);
+                            }
+                        }
+                    }
+                }
+                // Clear pending deferral
+                app.pending_deferral = None;
+            }
+            KeyCode::Esc => {
+                // Cancel deferral input
+                app.pending_deferral = None;
+            }
+            _ => {
+                // Ignore other keys during input
             }
         }
     }
@@ -187,6 +304,7 @@ impl InputHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::db::Database;
     use tempfile::tempdir;
 
@@ -205,6 +323,10 @@ mod tests {
         (db, dir)
     }
 
+    fn test_config() -> Config {
+        Config::default()
+    }
+
     #[test]
     fn sort_mode_cycles_on_s_key() {
         let (db, _dir) = temp_database();
@@ -216,7 +338,8 @@ mod tests {
         );
 
         // Press 's' - should cycle to Size
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
+        let config = test_config();
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(
             app.sort_mode,
             SortMode::Size,
@@ -224,7 +347,7 @@ mod tests {
         );
 
         // Press 's' again - should cycle to Name
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(
             app.sort_mode,
             SortMode::Name,
@@ -232,7 +355,7 @@ mod tests {
         );
 
         // Press 's' again - should cycle back to Expiration
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(
             app.sort_mode,
             SortMode::Expiration,
@@ -244,13 +367,14 @@ mod tests {
     fn sort_mode_persists_across_navigation() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
+        let config = test_config();
 
         // Change to Size sort
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(app.sort_mode, SortMode::Size);
 
         // Navigate down
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
         assert_eq!(
             app.sort_mode,
             SortMode::Size,
@@ -258,7 +382,7 @@ mod tests {
         );
 
         // Navigate up
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('k')));
         assert_eq!(
             app.sort_mode,
             SortMode::Size,
@@ -272,12 +396,27 @@ mod tests {
         let mut app = App::new();
 
         // Change to Name sort
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('s')),
+        );
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('s')),
+        );
         assert_eq!(app.sort_mode, SortMode::Name);
 
         // Switch to pending approvals view
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('p')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('p')),
+        );
         assert_eq!(app.view, View::PendingApprovals);
         assert_eq!(
             app.sort_mode,
@@ -286,7 +425,12 @@ mod tests {
         );
 
         // Return to directory list
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('q')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('q')),
+        );
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(
             app.sort_mode,
@@ -301,7 +445,12 @@ mod tests {
         let mut app = App::new();
         assert!(!app.should_quit);
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('q')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('q')),
+        );
         assert!(app.should_quit, "App should quit on 'q' key");
     }
 
@@ -313,6 +462,7 @@ mod tests {
 
         InputHandler::handle(
             &mut app,
+            &test_config(),
             &db,
             make_key_event_with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
@@ -325,10 +475,20 @@ mod tests {
         let mut app = App::new();
         assert_eq!(app.selected_index, 0);
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('j')),
+        );
         assert_eq!(app.selected_index, 1, "'j' should increment selected index");
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('j')),
+        );
         assert_eq!(
             app.selected_index, 2,
             "'j' should increment selected index again"
@@ -341,10 +501,20 @@ mod tests {
         let mut app = App::new();
         app.selected_index = 5;
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('k')),
+        );
         assert_eq!(app.selected_index, 4, "'k' should decrement selected index");
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('k')),
+        );
         assert_eq!(
             app.selected_index, 3,
             "'k' should decrement selected index again"
@@ -357,7 +527,12 @@ mod tests {
         let mut app = App::new();
         app.selected_index = 10;
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('g')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('g')),
+        );
         assert_eq!(app.selected_index, 0, "'g' should go to top (index 0)");
     }
 
@@ -367,7 +542,12 @@ mod tests {
         let mut app = App::new();
         app.list_len.set(10);
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('G')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('G')),
+        );
         assert_eq!(
             app.selected_index, 9,
             "'G' should go to bottom (list_len - 1)"
@@ -380,7 +560,12 @@ mod tests {
         let mut app = App::new();
         assert_eq!(app.view, View::DirectoryList);
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('p')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('p')),
+        );
         assert_eq!(
             app.view,
             View::PendingApprovals,
@@ -394,7 +579,12 @@ mod tests {
         let mut app = App::new();
         assert_eq!(app.view, View::DirectoryList);
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('a')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('a')),
+        );
         assert_eq!(
             app.view,
             View::AuditLog,
@@ -408,7 +598,12 @@ mod tests {
         let mut app = App::new();
         assert_eq!(app.view, View::DirectoryList);
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('?')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('?')),
+        );
         assert_eq!(app.view, View::Help, "'?' should switch to help view");
     }
 
@@ -418,7 +613,12 @@ mod tests {
         let mut app = App::new();
         app.view = View::Help;
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('x')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('x')),
+        );
         assert_eq!(
             app.view,
             View::DirectoryList,
@@ -435,7 +635,12 @@ mod tests {
         app.selected_index = 5;
         app.current_directory_id.set(Some(42)); // Would be set by render
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Enter));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Enter),
+        );
 
         assert_eq!(app.view, View::DirectoryDetail);
         assert_eq!(
@@ -450,7 +655,12 @@ mod tests {
         let mut app = App::new();
         app.current_directory_id.set(Some(42));
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('l')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('l')),
+        );
 
         assert_eq!(app.view, View::DirectoryDetail);
         assert_eq!(
@@ -466,7 +676,7 @@ mod tests {
         app.view = View::DirectoryDetail;
         app.current_directory_id.set(Some(42));
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Esc));
+        InputHandler::handle(&mut app, &test_config(), &db, make_key_event(KeyCode::Esc));
 
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(
@@ -484,7 +694,12 @@ mod tests {
         app.view = View::DirectoryDetail;
         app.current_directory_id.set(Some(42));
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('h')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('h')),
+        );
 
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(app.current_directory_id(), None);
@@ -498,7 +713,12 @@ mod tests {
         app.view = View::DirectoryDetail;
         app.current_directory_id.set(Some(42));
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('q')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('q')),
+        );
 
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(app.current_directory_id(), None);
@@ -512,10 +732,20 @@ mod tests {
         app.view = View::DirectoryDetail;
         app.list_len.set(10);
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('j')),
+        );
         assert_eq!(app.selected_index, 1, "j should move down");
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('k')),
+        );
         assert_eq!(app.selected_index, 0, "k should move up");
     }
 
@@ -527,10 +757,20 @@ mod tests {
         app.selected_index = 5;
         app.list_len.set(10);
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('g')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('g')),
+        );
         assert_eq!(app.selected_index, 0, "g should go to top");
 
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('G')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('G')),
+        );
         assert_eq!(app.selected_index, 9, "G should go to bottom");
     }
 
@@ -545,7 +785,12 @@ mod tests {
         app.current_directory_id.set(Some(42));
 
         // Enter detail view
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Enter));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Enter),
+        );
         assert_eq!(app.view, View::DirectoryDetail);
         assert_eq!(app.selected_index, 0, "Selection resets on entry");
         assert_eq!(
@@ -556,11 +801,16 @@ mod tests {
 
         // Navigate in detail view
         app.list_len.set(3); // Simulate file list
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('j')),
+        );
         assert_eq!(app.selected_index, 1);
 
         // Exit detail view
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Esc));
+        InputHandler::handle(&mut app, &test_config(), &db, make_key_event(KeyCode::Esc));
         assert_eq!(app.view, View::DirectoryList);
         assert_eq!(
             app.current_directory_id(),
@@ -590,7 +840,12 @@ mod tests {
         app.current_directory_id.set(Some(test_dir.id));
 
         // Press 'x' to initiate approval
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('x')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('x')),
+        );
 
         // Should have pending approval set
         assert!(
@@ -609,7 +864,12 @@ mod tests {
         app.current_directory_id.set(None);
 
         // Press 'x' with no directory selected
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('x')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('x')),
+        );
 
         // Should not set pending approval
         assert!(
@@ -637,7 +897,12 @@ mod tests {
         app.pending_approval = Some((test_dir.id, "/test/approve".to_string()));
 
         // Press 'y' to confirm
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('y')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('y')),
+        );
 
         // Should clear pending approval
         assert!(
@@ -675,7 +940,12 @@ mod tests {
         app.pending_approval = Some((test_dir.id, "/test/cancel".to_string()));
 
         // Press 'n' to cancel
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('n')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('n')),
+        );
 
         // Should clear pending approval
         assert!(
@@ -702,7 +972,7 @@ mod tests {
         app.pending_approval = Some((42, "/test/path".to_string()));
 
         // Press Esc to cancel
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Esc));
+        InputHandler::handle(&mut app, &test_config(), &db, make_key_event(KeyCode::Esc));
 
         // Should clear pending approval
         assert!(
@@ -719,7 +989,12 @@ mod tests {
         app.pending_approval = Some((42, "/test/path".to_string()));
 
         // Press random key during confirmation
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('j')),
+        );
 
         // Should still have pending approval (ignored)
         assert!(
@@ -748,7 +1023,12 @@ mod tests {
         app.pending_approval = Some((test_dir.id, "/test/audit".to_string()));
 
         // Press 'y' to approve
-        InputHandler::handle(&mut app, &db, make_key_event(KeyCode::Char('y')));
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('y')),
+        );
 
         // Check audit log
         let audit = AuditService::new(&db);
@@ -764,6 +1044,404 @@ mod tests {
         assert!(
             approve_entry.is_some(),
             "Should have an 'approve' audit entry for the path"
+        );
+    }
+
+    // Tests for deferral action (US-018)
+
+    #[test]
+    fn pressing_d_sets_pending_deferral_with_valid_directory() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/defer", 2048, 3, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        app.current_directory_id.set(Some(test_dir.id));
+
+        // Press 'd' to initiate deferral
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('d')),
+        );
+
+        // Should have pending deferral set
+        assert!(
+            app.pending_deferral.is_some(),
+            "Pending deferral should be set"
+        );
+        let deferral = app.pending_deferral.as_ref().unwrap();
+        assert_eq!(
+            deferral.directory_id, test_dir.id,
+            "Directory ID should match"
+        );
+        assert_eq!(deferral.path, "/test/defer", "Path should match");
+        assert_eq!(deferral.input, "", "Input buffer should be empty initially");
+    }
+
+    #[test]
+    fn pressing_d_with_no_directory_does_nothing() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.current_directory_id.set(None);
+
+        // Press 'd' with no directory selected
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('d')),
+        );
+
+        // Should not set pending deferral
+        assert!(
+            app.pending_deferral.is_none(),
+            "Pending deferral should not be set with no directory"
+        );
+    }
+
+    #[test]
+    fn deferral_input_accumulates_digits() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.pending_deferral = Some(PendingDeferral {
+            directory_id: 42,
+            path: "/test/path".to_string(),
+            input: String::new(),
+            default_days: 90,
+        });
+
+        // Type '3', then '0'
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('3')),
+        );
+        assert!(app.pending_deferral.is_some());
+        let deferral = app.pending_deferral.as_ref().unwrap();
+        assert_eq!(deferral.input, "3", "Input should be '3'");
+
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('0')),
+        );
+        let deferral = app.pending_deferral.as_ref().unwrap();
+        assert_eq!(deferral.input, "30", "Input should be '30'");
+    }
+
+    #[test]
+    fn deferral_input_backspace_removes_digits() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.pending_deferral = Some(PendingDeferral {
+            directory_id: 42,
+            path: "/test/path".to_string(),
+            input: "123".to_string(),
+            default_days: 90,
+        });
+
+        // Press backspace
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Backspace),
+        );
+        assert!(app.pending_deferral.is_some());
+        let deferral = app.pending_deferral.as_ref().unwrap();
+        assert_eq!(deferral.input, "12", "Input should be '12' after backspace");
+
+        // Press backspace again
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Backspace),
+        );
+        let deferral = app.pending_deferral.as_ref().unwrap();
+        assert_eq!(
+            deferral.input, "1",
+            "Input should be '1' after second backspace"
+        );
+    }
+
+    #[test]
+    fn deferral_enter_with_valid_input_defers_directory() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/defer", 1024, 5, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        // Simulate deferral state with input "30"
+        app.pending_deferral = Some(PendingDeferral {
+            directory_id: test_dir.id,
+            path: "/test/defer".to_string(),
+            input: "30".to_string(),
+            default_days: 90,
+        });
+
+        // Press Enter to confirm
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Enter),
+        );
+
+        // Should clear pending deferral
+        assert!(
+            app.pending_deferral.is_none(),
+            "Pending deferral should be cleared after confirmation"
+        );
+
+        // Should update directory status to 'deferred'
+        let updated_dir = db
+            .get_directory_by_path("/test/defer")
+            .expect("Failed to get directory")
+            .expect("Directory should exist");
+        assert_eq!(
+            updated_dir.status, "deferred",
+            "Directory status should be 'deferred'"
+        );
+
+        // Should set deferred_until timestamp (approximately 30 days from now)
+        assert!(
+            updated_dir.deferred_until.is_some(),
+            "deferred_until should be set"
+        );
+        let deferred_until = updated_dir.deferred_until.unwrap();
+        let expected = now + (30 * 86400);
+        // Allow 5 seconds of test execution time
+        assert!(
+            (deferred_until - expected).abs() <= 5,
+            "deferred_until should be approximately 30 days from now"
+        );
+    }
+
+    #[test]
+    fn deferral_enter_with_empty_input_uses_default() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/default", 512, 2, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        // Simulate deferral state with empty input
+        app.pending_deferral = Some(PendingDeferral {
+            directory_id: test_dir.id,
+            path: "/test/default".to_string(),
+            input: String::new(),
+            default_days: 90,
+        });
+
+        // Press Enter to confirm (should use default of 90 days)
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Enter),
+        );
+
+        // Should clear pending deferral
+        assert!(
+            app.pending_deferral.is_none(),
+            "Pending deferral should be cleared"
+        );
+
+        // Should update directory status to 'deferred'
+        let updated_dir = db
+            .get_directory_by_path("/test/default")
+            .expect("Failed to get directory")
+            .expect("Directory should exist");
+        assert_eq!(updated_dir.status, "deferred");
+
+        // Should set deferred_until to approximately 90 days from now (default)
+        let deferred_until = updated_dir.deferred_until.unwrap();
+        let expected = now + (90 * 86400);
+        assert!(
+            (deferred_until - expected).abs() <= 5,
+            "deferred_until should use default of 90 days"
+        );
+    }
+
+    #[test]
+    fn deferral_enter_with_zero_clears_without_change() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/zero", 256, 1, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        // Simulate deferral state with "0" input
+        app.pending_deferral = Some(PendingDeferral {
+            directory_id: test_dir.id,
+            path: "/test/zero".to_string(),
+            input: "0".to_string(),
+            default_days: 90,
+        });
+
+        // Press Enter (should reject zero and clear)
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Enter),
+        );
+
+        // Should clear pending deferral
+        assert!(
+            app.pending_deferral.is_none(),
+            "Pending deferral should be cleared for invalid input"
+        );
+
+        // Should NOT update directory status (should remain 'tracked')
+        let unchanged_dir = db
+            .get_directory_by_path("/test/zero")
+            .expect("Failed to get directory")
+            .expect("Directory should exist");
+        assert_eq!(
+            unchanged_dir.status, "tracked",
+            "Directory status should remain 'tracked' for invalid input"
+        );
+    }
+
+    #[test]
+    fn deferral_esc_cancels_without_change() {
+        let (db, _dir) = temp_database();
+
+        let mut app = App::new();
+        app.pending_deferral = Some(PendingDeferral {
+            directory_id: 42,
+            path: "/test/cancel".to_string(),
+            input: "15".to_string(),
+            default_days: 90,
+        });
+
+        // Press Esc to cancel
+        InputHandler::handle(&mut app, &test_config(), &db, make_key_event(KeyCode::Esc));
+
+        // Should clear pending deferral
+        assert!(
+            app.pending_deferral.is_none(),
+            "Pending deferral should be cleared after Esc"
+        );
+    }
+
+    #[test]
+    fn deferral_creates_audit_entry() {
+        use crate::audit::AuditService;
+
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/audit_defer", 2048, 4, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        app.pending_deferral = Some(PendingDeferral {
+            directory_id: test_dir.id,
+            path: "/test/audit_defer".to_string(),
+            input: "45".to_string(),
+            default_days: 90,
+        });
+
+        // Press Enter to defer
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Enter),
+        );
+
+        // Check audit log
+        let audit = AuditService::new(&db);
+        let entries = audit.list_recent(10).expect("Failed to list audit entries");
+
+        assert!(!entries.is_empty(), "Should have at least one audit entry");
+
+        // Find the defer entry
+        let defer_entry = entries.iter().find(|e| {
+            e.action == "defer" && e.target_path == Some("/test/audit_defer".to_string())
+        });
+
+        assert!(
+            defer_entry.is_some(),
+            "Should have a 'defer' audit entry for the path"
+        );
+
+        // Check that details contains "45 days"
+        let entry = defer_entry.unwrap();
+        assert!(
+            entry.details.as_ref().unwrap().contains("45 days"),
+            "Audit entry should contain deferral period"
+        );
+    }
+
+    #[test]
+    fn deferral_ignores_non_digit_keys() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.pending_deferral = Some(PendingDeferral {
+            directory_id: 42,
+            path: "/test/path".to_string(),
+            input: "12".to_string(),
+            default_days: 90,
+        });
+
+        // Press 'a' (non-digit)
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('a')),
+        );
+
+        // Input should remain unchanged
+        assert!(app.pending_deferral.is_some());
+        let deferral = app.pending_deferral.as_ref().unwrap();
+        assert_eq!(
+            deferral.input, "12",
+            "Input should remain '12' (non-digit ignored)"
         );
     }
 }
