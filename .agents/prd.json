@@ -107,8 +107,8 @@
         "just check passes"
       ],
       "priority": 6,
-      "passes": false,
-      "notes": "Performance critical for large trees. jwalk provides parallelism."
+      "passes": true,
+      "notes": "Completed: Implemented scanner with jwalk for parallel traversal. Scanner collects file metadata (path, size, mtime), resolves symlinks using fs::metadata, and aggregates into per-directory DirectoryInfo. Permission errors and broken symlinks are handled gracefully with warnings via tracing::warn. Scan runs in tokio::task::spawn_blocking to avoid blocking async runtime. Added comprehensive tests including broken symlinks, oldest mtime correctness, and hidden files support. Added #[non_exhaustive] to ScanResult and DirectoryInfo per semver-nag review. #[allow(dead_code)] attributes remain on Scanner, ScanResult, and DirectoryInfo fields until database integration in US-007 uses them."
     },
     {
       "id": "US-007",

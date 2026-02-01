@@ -163,3 +163,45 @@
 - Technical debt: Consider builder pattern for `record()` method before 1.0 (5 positional parameters)
 - Next story is US-006: Implement filesystem scanner with jwalk
 - The scanner module skeleton exists, need to implement Scanner::scan() with jwalk for parallel tree walking
+
+## US-006: Implement filesystem scanner with jwalk (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Implemented `Scanner::scan()` using jwalk for parallel directory tree traversal
+- Collects file metadata: path, size, mtime (using fs::metadata which resolves symlinks)
+- Aggregates files into `DirectoryInfo` by parent directory (path, size_bytes, file_count, oldest_mtime)
+- Returns `ScanResult` containing total statistics and per-directory information
+- Handles permission errors gracefully with `tracing::warn`, continuing scan
+- Handles broken symlinks gracefully (logged and skipped)
+- Scan runs in `tokio::task::spawn_blocking` to avoid blocking async runtime
+- Added `#[non_exhaustive]` to `ScanResult` and `DirectoryInfo` for future extensibility
+- Added `Clone` and `#[must_use]` attributes per semver-nag recommendations
+- Added filetime dev dependency for testing
+
+**Tests added (9 total):**
+- `scanner_finds_all_files` - verifies file discovery and size counting
+- `scanner_aggregates_by_directory` - verifies per-directory aggregation logic
+- `scanner_tracks_oldest_mtime` - verifies oldest_mtime is present
+- `scanner_fails_on_nonexistent_path` - error path test
+- `scanner_fails_on_file_path` - error path test
+- `scanner_handles_empty_directory` - edge case test
+- `scanner_resolves_symlinks` - symlink following (Unix-only)
+- `scanner_skips_broken_symlinks_gracefully` - broken symlink handling (Unix-only)
+- `scanner_correctly_identifies_oldest_mtime` - oldest mtime correctness with filetime
+- `scanner_includes_hidden_files` - verifies skip_hidden(false) works
+
+**Agent reviews:**
+- nick-isms: Solid B+ code, suggested runtime assertions (deferred as optional), noted nesting could be flattened, flagged Error::Config misuse for spawn_blocking panic (acceptable for now)
+- testing-guru: Flagged missing broken symlink test (added), missing oldest mtime correctness test (added), missing hidden files test (added), noted #[allow(dead_code)] still present (intentional until US-007)
+- semver-nag: Recommended #[non_exhaustive] on ScanResult and DirectoryInfo (added), recommended Clone and #[must_use] (added), noted jiff::Timestamp coupling (acceptable for 0.1.0)
+
+**Notes for next agent:**
+- Scanner module is now feature-complete for US-006
+- All acceptance criteria met, including comprehensive test coverage
+- `#[allow(dead_code)]` attributes remain on Scanner struct and public fields - will be removed when database integration (US-007) uses them
+- jwalk parallelism is implemented via .into_iter() on WalkDir, runs in spawn_blocking
+- Next story is US-007: Implement scan-to-database integration
+- US-007 will use the Scanner and persist results to the database, which will allow removal of the dead_code allows
+
