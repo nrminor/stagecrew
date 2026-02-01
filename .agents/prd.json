@@ -380,8 +380,8 @@
         "just check passes"
       ],
       "priority": 22,
-      "passes": false,
-      "notes": "Simple reference. Can be a popup or full view."
+      "passes": true,
+      "notes": "Completed: Updated render_help() in src/tui/ui.rs with comprehensive keybindings organized by categories (Navigation, Views, Actions, Other). Existing input handling (any key dismisses) was already implemented and tested. Fixed stale docstring per @nick-isms review. All 182 tests pass. Code reviews from @nick-isms (approved after docstring fix), @testing-guru (coverage is adequate), and @semver-nag (no semver concerns for binary crate)."
     },
     {
       "id": "US-023",

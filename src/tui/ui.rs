@@ -746,32 +746,41 @@ fn format_timestamp(timestamp: i64) -> String {
         .to_string()
 }
 
-/// Render the help view.
+/// Render the help view with keybinding reference.
 ///
-/// This is a placeholder implementation that will be expanded in US-022.
+/// Displays all available keybindings organized by category (Navigation, Views,
+/// Actions, Other). Any key press dismisses this view and returns to the directory list.
 fn render_help(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let block = Block::default()
-        .title("Help")
+        .title("Stagecrew - Keybinding Reference")
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default());
 
-    let help_text = r"Keybindings:
-
-Navigation:
-  j/k or ↓/↑  - Move selection down/up
-  g/G         - Go to top/bottom
-  
-Actions:
-  Enter or l  - View directory details
-  q           - Quit
-  Ctrl+C      - Quit
+    let help_text = r"Navigation:
+  j / ↓       Move selection down
+  k / ↑       Move selection up
+  g           Jump to top of list
+  G           Jump to bottom of list
   
 Views:
-  p           - Pending approvals
-  a           - Audit log
-  ?           - This help screen
+  Enter / l   View directory details (from directory list)
+  h / Esc     Return to previous view
+  p           Show pending approvals
+  a           Show audit log
+  ?           Show this help screen
+  
+Actions (Directory List & Pending Approvals):
+  x           Approve directory for removal
+  d           Defer directory expiration (reset clock)
+  i           Permanently ignore directory
+  s           Cycle sort mode (Expiration → Size → Name)
+  
+Other:
+  q           Quit application
+  Ctrl+C      Quit application
 
-Press any key to close";
+Press any key to close this help screen";
 
     let text = Paragraph::new(help_text).block(block);
 
