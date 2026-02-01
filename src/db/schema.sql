@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS files (
     path TEXT NOT NULL UNIQUE,
     size_bytes INTEGER NOT NULL,
     mtime INTEGER NOT NULL,  -- Unix timestamp
+    tracked_since INTEGER,  -- Unix timestamp when first added, NULL for legacy files
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
 );
 

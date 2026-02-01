@@ -52,6 +52,12 @@ pub struct File {
     pub size_bytes: i64,
     /// Unix timestamp of the file's modification time.
     pub mtime: i64,
+    /// Unix timestamp when file was first tracked by stagecrew.
+    ///
+    /// Used to calculate expiration based on when the file was added to tracking,
+    /// not its original mtime. This prevents old files from appearing overdue when
+    /// first added. None for legacy files (defaults to mtime for backward compat).
+    pub tracked_since: Option<i64>,
     /// Unix timestamp when record was created.
     pub created_at: i64,
 }
@@ -191,7 +197,9 @@ impl Database {
     /// Insert or update a file in the database.
     ///
     /// Uses UPSERT (INSERT ... ON CONFLICT) to either create a new file
-    /// record or update an existing one based on the path.
+    /// record or update an existing one based on the path. On first insert,
+    /// sets `tracked_since` to the current timestamp. On update, preserves
+    /// the existing `tracked_since` value.
     ///
     /// # Arguments
     ///
@@ -217,8 +225,8 @@ impl Database {
         mtime: i64,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO files (directory_id, path, size_bytes, mtime)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO files (directory_id, path, size_bytes, mtime, tracked_since)
+             VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))
              ON CONFLICT(path) DO UPDATE SET
                  directory_id = excluded.directory_id,
                  size_bytes = excluded.size_bytes,
@@ -329,7 +337,7 @@ impl Database {
     /// Returns an error if the database query fails.
     pub fn list_files_by_directory(&self, directory_id: i64) -> Result<Vec<File>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, directory_id, path, size_bytes, mtime, created_at
+            "SELECT id, directory_id, path, size_bytes, mtime, tracked_since, created_at
              FROM files
              WHERE directory_id = ?1
              ORDER BY path",
@@ -342,7 +350,8 @@ impl Database {
                 path: row.get(2)?,
                 size_bytes: row.get(3)?,
                 mtime: row.get(4)?,
-                created_at: row.get(5)?,
+                tracked_since: row.get(5)?,
+                created_at: row.get(6)?,
             })
         })?;
 

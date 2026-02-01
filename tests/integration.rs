@@ -15,7 +15,9 @@ use stagecrew::audit::{AuditAction, AuditService};
 use stagecrew::config::Config;
 use stagecrew::db::Database;
 use stagecrew::removal::remove_approved;
-use stagecrew::scanner::{Scanner, scan_and_persist, transition_expired_paths};
+use stagecrew::scanner::{
+    Scanner, recalculate_directory_oldest_mtime, scan_and_persist, transition_expired_paths,
+};
 
 /// Test the complete workflow: initialize, scan, transition, approve, remove, audit.
 ///
@@ -133,6 +135,41 @@ async fn test_full_workflow() {
         2,
         "old_dir should have 2 files in database"
     );
+
+    // 5b. Manually backdate tracked_since for old files to simulate long-tracked files
+    // With the new tracked_since logic, newly-scanned old files get tracked_since = now,
+    // giving them a full expiration period. To test expiration, we need to backdate tracked_since.
+    let now = jiff::Timestamp::now();
+    let ninetyfive_days_ago = now
+        .checked_sub(jiff::SignedDuration::from_secs(95 * 86400))
+        .expect("timestamp arithmetic");
+    let eighty_days_ago = now
+        .checked_sub(jiff::SignedDuration::from_secs(80 * 86400))
+        .expect("timestamp arithmetic");
+    // Update tracked_since for old_dir files (to 95 days ago)
+    db.conn()
+        .execute(
+            "UPDATE files SET tracked_since = ?1 WHERE directory_id = ?2",
+            (ninetyfive_days_ago.as_second(), old_dir_record.id),
+        )
+        .expect("failed to backdate tracked_since for old_dir files");
+    // Update tracked_since for middle_dir files (to 80 days ago)
+    let middle_dir_path = middle_dir.to_string_lossy().to_string();
+    let middle_dir_record = db
+        .get_directory_by_path(&middle_dir_path)
+        .expect("should query middle_dir")
+        .expect("middle_dir should exist");
+    db.conn()
+        .execute(
+            "UPDATE files SET tracked_since = ?1 WHERE directory_id = ?2",
+            (eighty_days_ago.as_second(), middle_dir_record.id),
+        )
+        .expect("failed to backdate tracked_since for middle_dir files");
+    // Recalculate oldest_mtime for affected directories
+    recalculate_directory_oldest_mtime(&db, old_dir_record.id)
+        .expect("failed to recalculate old_dir oldest_mtime");
+    recalculate_directory_oldest_mtime(&db, middle_dir_record.id)
+        .expect("failed to recalculate middle_dir oldest_mtime");
 
     // 6. Transition expired paths (should move old_dir to pending)
     let transition_summary = transition_expired_paths(&db, config.expiration_days, false)

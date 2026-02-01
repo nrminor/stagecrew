@@ -418,8 +418,8 @@
         "just check passes"
       ],
       "priority": 24,
-      "passes": false,
-      "notes": "This is a fundamental fix to the expiration model. Without this, users see confusing 'expired 247 days ago' messages for files they just started tracking."
+      "passes": true,
+      "notes": "Completed: Added tracked_since column to files table (NULL for legacy files). File struct updated with tracked_since: Option<i64>. insert_or_update_file() sets tracked_since on INSERT (preserved on UPDATE). Added recalculate_directory_oldest_mtime() using SQL: MIN(MAX(mtime, COALESCE(tracked_since, mtime))) to calculate effective oldest timestamp. Called after each directory's file upserts. Backward compatible: NULL tracked_since defaults to mtime via COALESCE. Added 6 comprehensive unit tests + updated 3 stats tests + integration test. Code reviews: nick-isms approved (added debug assertions), testing-guru confirmed coverage is good (noted optional enhancements for mixed directories), semver-nag approved (added #[doc(hidden)] to recalculate function). All acceptance criteria met."
     },
     {
       "id": "US-025",

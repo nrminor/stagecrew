@@ -1247,3 +1247,46 @@
 - Next story is US-024: Fix expiration clock to start at tracking time
 - US-024 will add tracked_since timestamp to prevent newly-tracked old files from appearing immediately overdue
 
+
+## US-024: Fix expiration clock to start at tracking time (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `tracked_since INTEGER` column to files table in schema.sql (NULL for legacy files)
+- Updated File struct to include `tracked_since: Option<i64>` field with documentation
+- Modified `insert_or_update_file()` to set tracked_since=now on INSERT (preserved on UPDATE via SQL)
+- Added `recalculate_directory_oldest_mtime()` function using SQL: `MIN(MAX(mtime, COALESCE(tracked_since, mtime)))` to calculate effective oldest timestamp
+- Called `recalculate_directory_oldest_mtime()` after each directory's file upserts in `scan_and_persist()`
+- Made function public with `#[doc(hidden)]` for testing, added debug assertions per code review
+- Added 6 comprehensive unit tests:
+  - `scan_sets_tracked_since_on_first_insert` - verifies tracked_since=now, not old mtime
+  - `scan_preserves_tracked_since_on_update` - verifies UPSERT preserves tracked_since
+  - `directory_oldest_mtime_uses_effective_timestamp` - verifies oldest_mtime uses effective timestamp
+  - `expiration_calculation_gives_full_period_for_old_files` - verifies 500-day-old file gets 90 days remaining
+  - `recalculate_directory_oldest_mtime_uses_max_of_mtime_and_tracked_since` - unit tests SQL logic
+  - `recalculate_directory_oldest_mtime_handles_null_tracked_since` - verifies backward compat
+- Updated 3 existing stats tests to backdate tracked_since to simulate long-tracked files
+- Updated integration test to backdate tracked_since for testing expiration workflow
+
+**Agent reviews:**
+- nick-isms: Approved with minor suggestions (added debug assertions to recalculate function). Noted good domain modeling, backward compatibility, declarative SQL, comprehensive tests. Grade: A.
+- testing-guru: Coverage is solid and good enough to ship. Noted optional enhancements: mixed directory test (different file ages), file modification resetting expiration test. Core behavior well-tested.
+- semver-nag: Approved API design. Added #[doc(hidden)] to recalculate_directory_oldest_mtime per recommendation. File struct already marked #[non_exhaustive]. Schema migration backward compatible.
+
+**Backward compatibility:**
+- Files with NULL tracked_since default to mtime via COALESCE(tracked_since, mtime)
+- Existing databases won't break on upgrade
+- insert_or_update_file() signature unchanged (tracked_since handled internally)
+
+**Technical notes:**
+- Expiration formula: `max(mtime, tracked_since)` ensures newly-tracked old files get full expiration period
+- For files modified after tracking, mtime wins (resets expiration appropriately)
+- SQL aggregation: `MIN(MAX(mtime, COALESCE(tracked_since, mtime)))` across all files gives directory's effective oldest timestamp
+- recalculate_directory_oldest_mtime() called after each directory's file upserts (could be optimized for very large scans in future)
+
+**Notes for next agent:**
+- tracked_since feature is now complete for US-024
+- All 300 tests pass (294 existing + 6 new)
+- All acceptance criteria met
+- Next story is US-025: Support tilde expansion in config paths

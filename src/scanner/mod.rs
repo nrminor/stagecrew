@@ -311,6 +311,10 @@ pub async fn scan_and_persist(
                 }
             }
 
+            // Recalculate effective oldest timestamp using max(mtime, tracked_since)
+            // This ensures newly-tracked old files get a full expiration period
+            recalculate_directory_oldest_mtime(db, dir_id)?;
+
             total_directories += 1;
         }
 
@@ -359,6 +363,49 @@ pub async fn scan_and_persist(
         total_files,
         total_size_bytes,
     })
+}
+
+/// Recalculate a directory's effective oldest timestamp.
+///
+/// After file upserts, we need to recalculate the directory's `oldest_mtime` field
+/// to reflect the effective expiration time based on `max(mtime, tracked_since)` for
+/// each file. This ensures newly-tracked old files don't appear overdue.
+///
+/// For backward compatibility, files with `NULL` `tracked_since` default to their mtime.
+///
+/// # Arguments
+///
+/// * `db` - Database connection
+/// * `directory_id` - ID of the directory to recalculate
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+///
+/// # Visibility
+///
+/// This function is public for testing purposes but is not part of the stable API.
+#[doc(hidden)]
+pub fn recalculate_directory_oldest_mtime(db: &Database, directory_id: i64) -> Result<()> {
+    debug_assert!(directory_id > 0, "directory_id must be positive");
+
+    let rows_affected = db.conn().execute(
+        "UPDATE directories
+         SET oldest_mtime = (
+             SELECT MIN(MAX(mtime, COALESCE(tracked_since, mtime)))
+             FROM files
+             WHERE directory_id = ?1
+         )
+         WHERE id = ?1",
+        [directory_id],
+    )?;
+
+    debug_assert!(
+        rows_affected <= 1,
+        "UPDATE should affect at most one row (got {rows_affected})"
+    );
+
+    Ok(())
 }
 
 /// Update the stats table with scan results.
@@ -1934,8 +1981,7 @@ mod tests {
         );
         let root = temp_dir.path();
 
-        // Create a directory with a file that's within the warning period
-        // For 90-day expiration and 14-day warning: file should be 77-89 days old to be in warning
+        // Create a directory with a file
         let warning_dir = root.join("warning");
         fs::create_dir(&warning_dir)
             .expect("failed to create test directory - check disk space and permissions");
@@ -1944,23 +1990,44 @@ mod tests {
             .write_all(&[0u8; 100])
             .expect("failed to write test data to file - disk may be full");
 
-        // Set the file's mtime to 80 days ago (within warning period)
-        let now = jiff::Timestamp::now();
-        let eighty_days_ago = now
-            .checked_sub(jiff::SignedDuration::from_secs(80 * SECS_PER_DAY))
-            .expect("timestamp arithmetic should succeed for test data - check duration values");
-        let old_time = FileTime::from_unix_time(eighty_days_ago.as_second(), 0);
-        set_file_mtime(warning_dir.join("old.txt"), old_time)
-            .expect("failed to set file modification time for test - check filesystem support");
-
-        // Create database and scan
+        // Create database and do first scan
         let db_path = root.join("test.db");
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, &[warning_dir], 90, 14)
+        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&warning_dir), 90, 14)
             .await
             .expect("failed to scan and persist directories - check permissions and database connection");
+
+        // Manually set tracked_since to 80 days ago and mtime to even older
+        // to simulate a file tracked for 80 days. The effective timestamp will be
+        // max(mtime, tracked_since) = tracked_since = 80 days ago.
+        // This puts it in the warning period (10 days remaining, within 14-day warning)
+        let now = jiff::Timestamp::now();
+        let eighty_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(80 * SECS_PER_DAY))
+            .expect("timestamp arithmetic should succeed");
+        let ninety_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(90 * SECS_PER_DAY))
+            .expect("timestamp arithmetic should succeed");
+        db.conn()
+            .execute(
+                "UPDATE files SET tracked_since = ?1, mtime = ?2",
+                (eighty_days_ago.as_second(), ninety_days_ago.as_second()),
+            )
+            .expect("failed to update tracked_since for test");
+
+        // Recalculate directory oldest_mtime and stats
+        let dirs = db
+            .list_directories(None)
+            .expect("failed to list directories");
+        recalculate_directory_oldest_mtime(&db, dirs[0].id).expect("failed to recalculate");
+        // Allow: Test uses single directory, will never overflow i64.
+        #[allow(clippy::cast_possible_wrap)]
+        let total_dirs = dirs.len() as i64;
+        let total_size: i64 = dirs.iter().map(|d| d.size_bytes).sum();
+        update_stats(&db, total_dirs, total_size, now.as_second(), 90, 14)
+            .expect("failed to update stats");
 
         // Verify stats were calculated correctly
         let stats = db
@@ -1969,7 +2036,7 @@ mod tests {
         assert_eq!(stats.total_tracked_paths, 1);
         assert_eq!(
             stats.paths_within_warning, 1,
-            "Directory with file 80 days old should be in warning period (10 days remaining, within 14-day warning)"
+            "Directory with file tracked for 80 days should be in warning period (10 days remaining, within 14-day warning)"
         );
         assert_eq!(stats.paths_pending_approval, 0);
         assert_eq!(stats.paths_overdue, 0);
@@ -2033,32 +2100,57 @@ mod tests {
         );
         let root = temp_dir.path();
 
-        // Create a directory with an old file (expired)
+        // Create a directory with a file
         let overdue_dir = root.join("overdue");
         fs::create_dir(&overdue_dir)
             .expect("failed to create test directory - check disk space and permissions");
-        File::create(overdue_dir.join("ancient.txt"))
+        File::create(overdue_dir.join("file.txt"))
             .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 100])
             .expect("failed to write test data to file - disk may be full");
 
-        // Set file mtime to 100 days ago (overdue for 90-day expiration)
-        let now = jiff::Timestamp::now();
-        let hundred_days_ago = now
-            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .expect("timestamp arithmetic should succeed for test data - check duration values");
-        let old_time = FileTime::from_unix_time(hundred_days_ago.as_second(), 0);
-        set_file_mtime(overdue_dir.join("ancient.txt"), old_time)
-            .expect("failed to set file modification time for test - check filesystem support");
-
-        // Create database and scan
+        // Create database and do first scan (this sets tracked_since to now)
         let db_path = root.join("test.db");
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, &[overdue_dir], 90, 14)
+        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&overdue_dir), 90, 14)
             .await
             .expect("failed to scan and persist directories - check permissions and database connection");
+
+        // Manually set tracked_since to 100 days ago and mtime to even older
+        // to simulate a file that's been tracked for a long time.
+        // The effective timestamp will be max(mtime, tracked_since) = tracked_since = 100 days ago.
+        let now = jiff::Timestamp::now();
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .expect("timestamp arithmetic should succeed");
+        let two_hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(200 * SECS_PER_DAY))
+            .expect("timestamp arithmetic should succeed");
+        db.conn()
+            .execute(
+                "UPDATE files SET tracked_since = ?1, mtime = ?2",
+                (
+                    hundred_days_ago.as_second(),
+                    two_hundred_days_ago.as_second(),
+                ),
+            )
+            .expect("failed to update tracked_since for test");
+
+        // Recalculate directory oldest_mtime based on the backdated tracked_since
+        let dirs = db
+            .list_directories(None)
+            .expect("failed to list directories");
+        recalculate_directory_oldest_mtime(&db, dirs[0].id).expect("failed to recalculate");
+
+        // Update stats again to reflect the backdated tracked_since
+        // Allow: Test uses single directory, will never overflow i64.
+        #[allow(clippy::cast_possible_wrap)]
+        let total_dirs = dirs.len() as i64;
+        let total_size: i64 = dirs.iter().map(|d| d.size_bytes).sum();
+        update_stats(&db, total_dirs, total_size, now.as_second(), 90, 14)
+            .expect("failed to update stats");
 
         // Verify stats - should have 1 overdue path (status is still 'tracked')
         let stats = db
@@ -2067,7 +2159,7 @@ mod tests {
         assert_eq!(stats.total_tracked_paths, 1);
         assert_eq!(
             stats.paths_overdue, 1,
-            "Directory with 100-day-old file should be overdue"
+            "Directory with file tracked for 100 days should be overdue"
         );
         assert_eq!(stats.paths_pending_approval, 0);
         assert_eq!(stats.paths_within_warning, 0);
@@ -2252,7 +2344,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("failed to create temp directory for test - check disk space and system temp directory permissions");
         let root = temp_dir.path();
 
-        // Create directory with file 25 days old
+        // Create directory with file
         let dir = root.join("test");
         fs::create_dir(&dir).expect("failed to create test directory - check disk space and write permissions on temp directory");
         File::create(dir.join("file.txt"))
@@ -2260,26 +2352,44 @@ mod tests {
             .write_all(&[0u8; 50])
             .expect("failed to write test data - disk may be full or readonly");
 
-        let now = jiff::Timestamp::now();
-        let twentyfive_days_ago = now
-            .checked_sub(jiff::SignedDuration::from_secs(25 * SECS_PER_DAY))
-            .expect("timestamp arithmetic overflow - 25 days should be valid, this indicates a system clock issue");
-        set_file_mtime(
-            dir.join("file.txt"),
-            FileTime::from_unix_time(twentyfive_days_ago.as_second(), 0),
-        )
-        .expect("failed to set file modification time - check filesystem supports mtime updates");
-
-        // Create database and scan with custom periods:
-        // expiration_days = 30, warning_days = 7
-        // File is 25 days old, so 5 days remaining - within 7-day warning period
+        // Create database and scan with custom periods: expiration_days = 30, warning_days = 7
         let db_path = root.join("test.db");
         let db = Database::open(&db_path)
             .expect("failed to initialize database - check disk space and SQLite is functioning");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, &[dir], 30, 7)
+        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&dir), 30, 7)
             .await
             .expect("scan_and_persist failed - check file permissions and database connection");
+
+        // Manually set tracked_since to 25 days ago and mtime to even older
+        // to simulate a file tracked for 25 days. The effective timestamp will be
+        // max(mtime, tracked_since) = tracked_since = 25 days ago.
+        // This gives it 5 days remaining, which is within the 7-day warning period
+        let now = jiff::Timestamp::now();
+        let twentyfive_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(25 * SECS_PER_DAY))
+            .expect("timestamp arithmetic overflow");
+        let thirty_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(30 * SECS_PER_DAY))
+            .expect("timestamp arithmetic overflow");
+        db.conn()
+            .execute(
+                "UPDATE files SET tracked_since = ?1, mtime = ?2",
+                (twentyfive_days_ago.as_second(), thirty_days_ago.as_second()),
+            )
+            .expect("failed to update tracked_since for test");
+
+        // Recalculate directory oldest_mtime and stats
+        let dirs = db
+            .list_directories(None)
+            .expect("failed to list directories");
+        recalculate_directory_oldest_mtime(&db, dirs[0].id).expect("failed to recalculate");
+        // Allow: Test uses single directory, will never overflow i64.
+        #[allow(clippy::cast_possible_wrap)]
+        let total_dirs = dirs.len() as i64;
+        let total_size: i64 = dirs.iter().map(|d| d.size_bytes).sum();
+        update_stats(&db, total_dirs, total_size, now.as_second(), 30, 7)
+            .expect("failed to update stats");
 
         // Verify stats
         let stats = db.get_stats().expect(
@@ -2288,7 +2398,7 @@ mod tests {
         assert_eq!(stats.total_tracked_paths, 1);
         assert_eq!(
             stats.paths_within_warning, 1,
-            "With 30-day expiration and 7-day warning, 25-day-old file (5 days remaining) should be in warning"
+            "With 30-day expiration and 7-day warning, file tracked for 25 days (5 days remaining) should be in warning"
         );
         assert_eq!(stats.paths_overdue, 0);
     }
@@ -2369,6 +2479,425 @@ mod tests {
         assert!(
             last_scan >= before_scan && last_scan <= after_scan,
             "last_scan_completed ({last_scan}) should be between {before_scan} and {after_scan}"
+        );
+    }
+
+    // === tracked_since Tests ===
+
+    #[tokio::test]
+    async fn scan_sets_tracked_since_on_first_insert() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new()
+            .expect("failed to create temp directory - check disk space and permissions");
+        let root = temp_dir.path();
+
+        // Create an old file (mtime = 100 days ago)
+        let project_dir = root.join("project");
+        fs::create_dir(&project_dir)
+            .expect("failed to create test directory - check disk space and permissions");
+        let file_path = project_dir.join("old_file.txt");
+        let mut file = File::create(&file_path)
+            .expect("failed to create test file - check disk space and permissions");
+        file.write_all(b"test content")
+            .expect("failed to write test data - disk may be full");
+        file.sync_all()
+            .expect("failed to sync file - check filesystem health");
+
+        // Set mtime to 100 days ago
+        let hundred_days_ago = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .expect("timestamp arithmetic failed");
+        #[cfg(unix)]
+        {
+            use filetime::FileTime;
+            filetime::set_file_mtime(
+                &file_path,
+                FileTime::from_unix_time(hundred_days_ago.as_second(), 0),
+            )
+            .expect("failed to set file mtime - check permissions");
+        }
+
+        // Create database and scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).expect("failed to open database - check permissions");
+        let scanner = Scanner::new();
+        let before_scan = jiff::Timestamp::now().as_second();
+
+        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+            .await
+            .expect("scan failed - check permissions");
+
+        let after_scan = jiff::Timestamp::now().as_second();
+
+        // Query the directory and file
+        let dirs = db
+            .list_directories(None)
+            .expect("failed to list directories");
+        assert_eq!(dirs.len(), 1);
+        let files = db
+            .list_files_by_directory(dirs[0].id)
+            .expect("failed to list files");
+        assert_eq!(files.len(), 1);
+
+        // Verify tracked_since was set to current time (not the old mtime)
+        let tracked_since = files[0]
+            .tracked_since
+            .expect("tracked_since should be set on first insert");
+        assert!(
+            tracked_since >= before_scan && tracked_since <= after_scan,
+            "tracked_since should be current time, not old mtime"
+        );
+
+        // Verify mtime is still the old value
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                files[0].mtime,
+                hundred_days_ago.as_second(),
+                "mtime should preserve file's actual modification time"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_preserves_tracked_since_on_update() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new()
+            .expect("failed to create temp directory - check disk space and permissions");
+        let root = temp_dir.path();
+
+        // Create file
+        let project_dir = root.join("project");
+        fs::create_dir(&project_dir)
+            .expect("failed to create test directory - check disk space and permissions");
+        let file_path = project_dir.join("file.txt");
+        let mut file = File::create(&file_path)
+            .expect("failed to create test file - check disk space and permissions");
+        file.write_all(b"initial content")
+            .expect("failed to write test data - disk may be full");
+        file.sync_all()
+            .expect("failed to sync file - check filesystem health");
+
+        // Create database and do first scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).expect("failed to open database - check permissions");
+        let scanner = Scanner::new();
+
+        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+            .await
+            .expect("first scan failed");
+
+        // Get the directory and file from first scan
+        let dirs = db
+            .list_directories(None)
+            .expect("failed to list directories");
+        let files_before = db
+            .list_files_by_directory(dirs[0].id)
+            .expect("failed to list files");
+        let tracked_since_original = files_before[0]
+            .tracked_since
+            .expect("tracked_since should be set after first scan");
+
+        // Wait to ensure timestamp changes
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Modify file (update mtime and size)
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&file_path)
+            .expect("failed to reopen file for modification");
+        file.write_all(b"updated content with more bytes")
+            .expect("failed to write updated content");
+        file.sync_all().expect("failed to sync updated file");
+
+        // Do second scan
+        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+            .await
+            .expect("second scan failed");
+
+        // Verify tracked_since was NOT changed by the update
+        let files_after = db
+            .list_files_by_directory(dirs[0].id)
+            .expect("failed to list files after second scan");
+        assert_eq!(
+            files_after[0].tracked_since,
+            Some(tracked_since_original),
+            "tracked_since should be preserved on file updates"
+        );
+
+        // Verify mtime and size were updated
+        assert_ne!(
+            files_after[0].mtime, files_before[0].mtime,
+            "mtime should be updated on file modification"
+        );
+        assert_ne!(
+            files_after[0].size_bytes, files_before[0].size_bytes,
+            "size_bytes should be updated on file modification"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_oldest_mtime_uses_effective_timestamp() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new()
+            .expect("failed to create temp directory - check disk space and permissions");
+        let root = temp_dir.path();
+
+        // Create directory with an old file
+        let project_dir = root.join("project");
+        fs::create_dir(&project_dir)
+            .expect("failed to create test directory - check disk space and permissions");
+        let file_path = project_dir.join("old_file.txt");
+        let mut file = File::create(&file_path)
+            .expect("failed to create test file - check disk space and permissions");
+        file.write_all(b"old file")
+            .expect("failed to write test data - disk may be full");
+        file.sync_all()
+            .expect("failed to sync file - check filesystem health");
+
+        // Set mtime to 200 days ago
+        let two_hundred_days_ago = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_secs(200 * SECS_PER_DAY))
+            .expect("timestamp arithmetic failed");
+        #[cfg(unix)]
+        {
+            use filetime::FileTime;
+            filetime::set_file_mtime(
+                &file_path,
+                FileTime::from_unix_time(two_hundred_days_ago.as_second(), 0),
+            )
+            .expect("failed to set file mtime - check permissions");
+        }
+
+        // Create database and scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).expect("failed to open database - check permissions");
+        let scanner = Scanner::new();
+
+        #[cfg(not(unix))]
+        let before_scan = jiff::Timestamp::now().as_second();
+
+        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+            .await
+            .expect("scan failed - check permissions");
+
+        // Query directory
+        let dirs = db
+            .list_directories(None)
+            .expect("failed to list directories");
+        assert_eq!(dirs.len(), 1);
+
+        // Verify directory's oldest_mtime is the effective timestamp (tracked_since, not mtime)
+        let oldest_mtime = dirs[0].oldest_mtime.expect("oldest_mtime should be set");
+
+        #[cfg(unix)]
+        {
+            // oldest_mtime should be close to current time (tracked_since), not 200 days ago (mtime)
+            let now = jiff::Timestamp::now().as_second();
+            let age_days = (now - oldest_mtime) / SECS_PER_DAY;
+            assert!(
+                age_days < 1,
+                "oldest_mtime should be current time (tracked_since), not old mtime. Age: {age_days} days"
+            );
+        }
+
+        // On platforms where we can't set mtime, just verify it's close to scan time
+        #[cfg(not(unix))]
+        {
+            let after_scan = jiff::Timestamp::now().as_second();
+            assert!(
+                oldest_mtime >= before_scan && oldest_mtime <= after_scan,
+                "oldest_mtime should be within scan time range"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expiration_calculation_gives_full_period_for_old_files() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new()
+            .expect("failed to create temp directory - check disk space and permissions");
+        let root = temp_dir.path();
+
+        // Create directory with a very old file (500 days)
+        let project_dir = root.join("project");
+        fs::create_dir(&project_dir)
+            .expect("failed to create test directory - check disk space and permissions");
+        let file_path = project_dir.join("ancient_file.txt");
+        let mut file = File::create(&file_path)
+            .expect("failed to create test file - check disk space and permissions");
+        file.write_all(b"ancient data")
+            .expect("failed to write test data - disk may be full");
+        file.sync_all()
+            .expect("failed to sync file - check filesystem health");
+
+        // Set mtime to 500 days ago
+        let five_hundred_days_ago = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_secs(500 * SECS_PER_DAY))
+            .expect("timestamp arithmetic failed");
+        #[cfg(unix)]
+        {
+            use filetime::FileTime;
+            filetime::set_file_mtime(
+                &file_path,
+                FileTime::from_unix_time(five_hundred_days_ago.as_second(), 0),
+            )
+            .expect("failed to set file mtime - check permissions");
+        }
+
+        // Create database and scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).expect("failed to open database - check permissions");
+        let scanner = Scanner::new();
+
+        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+            .await
+            .expect("scan failed - check permissions");
+
+        // Query directory
+        let dirs = db
+            .list_directories(None)
+            .expect("failed to list directories");
+        assert_eq!(dirs.len(), 1);
+
+        // Calculate expiration
+        let oldest_mtime = dirs[0].oldest_mtime.expect("oldest_mtime should be set");
+        let days_remaining = calculate_expiration(oldest_mtime, 90);
+
+        // Should have ~90 days remaining (not negative), because expiration is based on
+        // tracked_since (current time), not the file's ancient mtime
+        #[cfg(unix)]
+        {
+            assert!(
+                (89..=90).contains(&days_remaining),
+                "newly tracked old file should have full expiration period ({days_remaining} days remaining)"
+            );
+        }
+
+        // On non-Unix platforms, just verify it's not overdue
+        #[cfg(not(unix))]
+        {
+            assert!(
+                days_remaining > 0,
+                "newly tracked file should not be overdue"
+            );
+        }
+    }
+
+    #[test]
+    fn recalculate_directory_oldest_mtime_uses_max_of_mtime_and_tracked_since() {
+        use crate::db::Database;
+
+        let temp_file =
+            tempfile::NamedTempFile::new().expect("failed to create temp file - check disk space");
+        let db =
+            Database::open(temp_file.path()).expect("failed to open database - check permissions");
+
+        // Create a directory
+        let dir_id = db
+            .insert_or_update_directory("/test", 100, 2, None, 1_700_000_000)
+            .expect("failed to insert directory");
+
+        // Insert two files:
+        // File 1: old mtime (100 days ago), recent tracked_since (now)
+        // File 2: recent mtime (now), NULL tracked_since (legacy)
+        let now = jiff::Timestamp::now().as_second();
+        let hundred_days_ago = now - (100 * SECS_PER_DAY);
+
+        // File 1: Manually insert with old mtime but recent tracked_since
+        db.conn()
+            .execute(
+                "INSERT INTO files (directory_id, path, size_bytes, mtime, tracked_since) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (dir_id, "/test/old_file.txt", 50, hundred_days_ago, now),
+            )
+            .expect("failed to insert file 1");
+
+        // File 2: Manually insert with recent mtime but NULL tracked_since (legacy file)
+        db.conn()
+            .execute(
+                "INSERT INTO files (directory_id, path, size_bytes, mtime, tracked_since) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (dir_id, "/test/new_file.txt", 50, now, rusqlite::types::Value::Null),
+            )
+            .expect("failed to insert file 2");
+
+        // Recalculate oldest_mtime
+        super::recalculate_directory_oldest_mtime(&db, dir_id)
+            .expect("recalculate failed - check database connection");
+
+        // Query the directory
+        let dir = db
+            .conn()
+            .query_row(
+                "SELECT oldest_mtime FROM directories WHERE id = ?1",
+                [dir_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .expect("failed to query directory - check database connection");
+
+        let oldest_mtime = dir.expect("oldest_mtime should be set");
+
+        // For File 1: max(old_mtime, recent_tracked_since) = recent_tracked_since = now
+        // For File 2: max(recent_mtime, NULL) = recent_mtime = now
+        // MIN(now, now) = now
+        // So oldest_mtime should be approximately now
+        let age_seconds = now - oldest_mtime;
+        assert!(
+            age_seconds < 2,
+            "oldest_mtime should be recent (age: {age_seconds} seconds)"
+        );
+    }
+
+    #[test]
+    fn recalculate_directory_oldest_mtime_handles_null_tracked_since() {
+        use crate::db::Database;
+
+        let temp_file =
+            tempfile::NamedTempFile::new().expect("failed to create temp file - check disk space");
+        let db =
+            Database::open(temp_file.path()).expect("failed to open database - check permissions");
+
+        // Create a directory
+        let dir_id = db
+            .insert_or_update_directory("/test", 100, 1, None, 1_700_000_000)
+            .expect("failed to insert directory");
+
+        // Insert a legacy file with NULL tracked_since
+        let now = jiff::Timestamp::now().as_second();
+        let fifty_days_ago = now - (50 * SECS_PER_DAY);
+
+        db.conn()
+            .execute(
+                "INSERT INTO files (directory_id, path, size_bytes, mtime, tracked_since) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (dir_id, "/test/legacy_file.txt", 100, fifty_days_ago, rusqlite::types::Value::Null),
+            )
+            .expect("failed to insert legacy file");
+
+        // Recalculate oldest_mtime
+        super::recalculate_directory_oldest_mtime(&db, dir_id)
+            .expect("recalculate failed - check database connection");
+
+        // Query the directory
+        let dir = db
+            .conn()
+            .query_row(
+                "SELECT oldest_mtime FROM directories WHERE id = ?1",
+                [dir_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .expect("failed to query directory - check database connection");
+
+        let oldest_mtime = dir.expect("oldest_mtime should be set");
+
+        // For legacy file with NULL tracked_since, COALESCE(tracked_since, mtime) = mtime
+        // So oldest_mtime should be fifty_days_ago
+        assert_eq!(
+            oldest_mtime, fifty_days_ago,
+            "legacy files should use mtime when tracked_since is NULL"
         );
     }
 }
