@@ -51,6 +51,11 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
             deferral.default_days,
         );
     }
+
+    // Render ignore confirmation modal if pending ignore
+    if let Some((_, path)) = app.pending_ignore() {
+        render_ignore_modal(frame, path);
+    }
 }
 
 /// Render the directory list view.
@@ -544,7 +549,7 @@ Press any key to close";
 fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let hints = match app.view() {
         View::DirectoryList => {
-            "[j/k] Navigate [g/G] Top/Bottom [s] Sort [Enter] Details [d] Defer [x] Approve [p] Pending [a] Audit [?] Help [q] Quit"
+            "[j/k] Navigate [g/G] Top/Bottom [s] Sort [Enter] Details [d] Defer [i] Ignore [x] Approve [p] Pending [a] Audit [?] Help [q] Quit"
         }
         View::DirectoryDetail => "[j/k] Navigate [g/G] Top/Bottom [h/Esc] Back [q] Quit",
         View::PendingApprovals | View::AuditLog => "[j/k] Navigate [Esc] Back [q] Quit",
@@ -630,6 +635,50 @@ fn render_deferral_modal(frame: &mut Frame, path: &str, input: &str, default_day
     let message = format!(
         "Defer expiration for:\n{path}\n\nDays to defer: {display_input}\n\n(Enter to confirm, Esc to cancel)"
     );
+
+    let modal = Paragraph::new(message)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    // Clear the area behind the modal (create a simple background)
+    let background = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+
+    frame.render_widget(background, modal_area);
+    frame.render_widget(modal, modal_area);
+}
+
+/// Render an ignore confirmation modal for permanently exempting a path.
+///
+/// Displays a centered modal prompting the user to confirm permanent exemption
+/// of the selected directory from auto-removal.
+fn render_ignore_modal(frame: &mut Frame, path: &str) {
+    use ratatui::layout::{Alignment, Rect};
+
+    // Calculate centered rectangle for modal (50% width, 7 lines height)
+    let area = frame.area();
+    let modal_width = area.width / 2;
+    let modal_height = 7;
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    // Create the modal content
+    let title = "Ignore Path Permanently";
+    let message = format!("Permanently ignore:\n\n{path}\n\n(y/n)");
 
     let modal = Paragraph::new(message)
         .block(

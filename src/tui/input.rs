@@ -38,6 +38,12 @@ impl InputHandler {
             return;
         }
 
+        // If there's a pending ignore confirmation, handle y/n/Esc
+        if app.pending_ignore.is_some() {
+            Self::handle_ignore_confirmation(app, db, key);
+            return;
+        }
+
         match key.code {
             // Quit
             KeyCode::Char('q') => app.should_quit = true,
@@ -107,9 +113,57 @@ impl InputHandler {
                 }
             }
 
-            // TODO(tui): Implement these actions in future stories
-            // 'i' - Ignore selected (US-019)
+            // Ignore path permanently (US-019)
+            KeyCode::Char('i') => {
+                // Get the currently selected directory ID from the app state
+                if let Some(dir_id) = app.current_directory_id()
+                    && let Ok(directories) = db.list_directories(None)
+                    && let Some(dir) = directories.iter().find(|d| d.id == dir_id)
+                {
+                    // Set pending ignore with directory ID and path
+                    app.pending_ignore = Some((dir.id, dir.path.clone()));
+                }
+            }
+
             _ => {}
+        }
+    }
+
+    /// Handle confirmation prompt (y/n/Esc) for ignore action.
+    fn handle_ignore_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                // User confirmed - perform the ignore
+                if let Some((dir_id, path)) = &app.pending_ignore {
+                    // Update directory status to 'ignored'
+                    if let Err(e) = db.update_directory_status(*dir_id, "ignored") {
+                        // Log error but continue - user will see status unchanged
+                        tracing::warn!("Failed to ignore directory {}: {}", path, e);
+                    } else {
+                        // Record audit entry
+                        let audit = AuditService::new(db);
+                        let user = AuditService::current_user();
+                        if let Err(e) = audit.record(
+                            &user,
+                            AuditAction::Ignore,
+                            Some(path),
+                            None,
+                            Some(*dir_id),
+                        ) {
+                            tracing::warn!("Failed to record audit entry for ignore: {}", e);
+                        }
+                    }
+                }
+                // Clear pending ignore
+                app.pending_ignore = None;
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                // Cancel confirmation
+                app.pending_ignore = None;
+            }
+            _ => {
+                // Ignore other keys during confirmation
+            }
         }
     }
 
@@ -1044,6 +1098,230 @@ mod tests {
         assert!(
             approve_entry.is_some(),
             "Should have an 'approve' audit entry for the path"
+        );
+    }
+
+    // Tests for ignore action (US-019)
+
+    #[test]
+    fn pressing_i_sets_pending_ignore_with_valid_directory() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/ignore", 512, 2, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        app.current_directory_id.set(Some(test_dir.id));
+
+        // Press 'i' to initiate ignore
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('i')),
+        );
+
+        // Should have pending ignore set
+        assert!(app.pending_ignore.is_some(), "Pending ignore should be set");
+        let (dir_id, path) = app.pending_ignore.as_ref().unwrap();
+        assert_eq!(*dir_id, test_dir.id, "Directory ID should match");
+        assert_eq!(path, "/test/ignore", "Path should match");
+    }
+
+    #[test]
+    fn pressing_i_with_no_directory_does_nothing() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.current_directory_id.set(None);
+
+        // Press 'i' with no directory selected
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('i')),
+        );
+
+        // Should not set pending ignore
+        assert!(
+            app.pending_ignore.is_none(),
+            "Pending ignore should not be set with no directory"
+        );
+    }
+
+    #[test]
+    fn pressing_y_ignores_directory() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/ignore_confirm", 1024, 3, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        // Simulate pending ignore state (would be set by pressing 'i')
+        app.pending_ignore = Some((test_dir.id, "/test/ignore_confirm".to_string()));
+
+        // Press 'y' to confirm
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('y')),
+        );
+
+        // Should clear pending ignore
+        assert!(
+            app.pending_ignore.is_none(),
+            "Pending ignore should be cleared after confirmation"
+        );
+
+        // Should update directory status to 'ignored'
+        let updated_dir = db
+            .get_directory_by_path("/test/ignore_confirm")
+            .expect("Failed to get directory")
+            .expect("Directory should exist");
+        assert_eq!(
+            updated_dir.status, "ignored",
+            "Directory status should be 'ignored'"
+        );
+    }
+
+    #[test]
+    fn pressing_n_cancels_ignore() {
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/cancel_ignore", 2048, 4, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        // Simulate pending ignore state
+        app.pending_ignore = Some((test_dir.id, "/test/cancel_ignore".to_string()));
+
+        // Press 'n' to cancel
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('n')),
+        );
+
+        // Should clear pending ignore
+        assert!(
+            app.pending_ignore.is_none(),
+            "Pending ignore should be cleared after cancel"
+        );
+
+        // Should NOT update directory status (should remain 'tracked')
+        let unchanged_dir = db
+            .get_directory_by_path("/test/cancel_ignore")
+            .expect("Failed to get directory")
+            .expect("Directory should exist");
+        assert_eq!(
+            unchanged_dir.status, "tracked",
+            "Directory status should remain 'tracked'"
+        );
+    }
+
+    #[test]
+    fn pressing_esc_cancels_ignore() {
+        let (db, _dir) = temp_database();
+
+        let mut app = App::new();
+        app.pending_ignore = Some((42, "/test/path".to_string()));
+
+        // Press Esc to cancel
+        InputHandler::handle(&mut app, &test_config(), &db, make_key_event(KeyCode::Esc));
+
+        // Should clear pending ignore
+        assert!(
+            app.pending_ignore.is_none(),
+            "Pending ignore should be cleared after Esc"
+        );
+    }
+
+    #[test]
+    fn other_keys_ignored_during_ignore_confirmation() {
+        let (db, _dir) = temp_database();
+
+        let mut app = App::new();
+        app.pending_ignore = Some((42, "/test/path".to_string()));
+
+        // Press random key during confirmation
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('j')),
+        );
+
+        // Should still have pending ignore (ignored)
+        assert!(
+            app.pending_ignore.is_some(),
+            "Pending ignore should remain during confirmation"
+        );
+    }
+
+    #[test]
+    fn ignore_creates_audit_entry() {
+        use crate::audit::AuditService;
+
+        let (db, _dir) = temp_database();
+
+        // Insert a test directory
+        let now = jiff::Timestamp::now().as_second();
+        db.insert_or_update_directory("/test/audit_ignore", 4096, 8, Some(now), now)
+            .expect("Failed to insert directory");
+
+        let directories = db
+            .list_directories(None)
+            .expect("Failed to list directories");
+        let test_dir = &directories[0];
+
+        let mut app = App::new();
+        app.pending_ignore = Some((test_dir.id, "/test/audit_ignore".to_string()));
+
+        // Press 'y' to ignore
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('y')),
+        );
+
+        // Check audit log
+        let audit = AuditService::new(&db);
+        let entries = audit.list_recent(10).expect("Failed to list audit entries");
+
+        assert!(!entries.is_empty(), "Should have at least one audit entry");
+
+        // Find the ignore entry
+        let ignore_entry = entries.iter().find(|e| {
+            e.action == "ignore" && e.target_path == Some("/test/audit_ignore".to_string())
+        });
+
+        assert!(
+            ignore_entry.is_some(),
+            "Should have an 'ignore' audit entry for the path"
         );
     }
 

@@ -331,8 +331,8 @@
         "just check passes"
       ],
       "priority": 19,
-      "passes": false,
-      "notes": "Permanent exemption. Should be deliberate."
+      "passes": true,
+      "notes": "Completed: Implemented 'i' key handler with confirmation modal (cyan border), database status update to 'ignored', audit logging. Added 7 comprehensive unit tests. All 165 tests pass. Code review feedback: nick-isms (B+ - follows patterns, acceptable code duplication), testing-guru (adequate coverage), semver-nag (consistent design, tuple approach acceptable for binary crate). Ignored paths shown in gray per determine_row_style tests. Footer updated with '[i] Ignore' hint."
     },
     {
       "id": "US-020",

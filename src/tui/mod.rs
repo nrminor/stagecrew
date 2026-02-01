@@ -71,6 +71,10 @@ pub struct App {
 
     /// Pending deferral input state.
     pub(crate) pending_deferral: Option<PendingDeferral>,
+
+    /// Pending ignore confirmation state.
+    /// Contains the directory ID and path awaiting user confirmation for ignoring.
+    pub(crate) pending_ignore: Option<(i64, String)>,
 }
 
 impl App {
@@ -107,6 +111,11 @@ impl App {
     /// Get the pending deferral input state.
     pub fn pending_deferral(&self) -> Option<&PendingDeferral> {
         self.pending_deferral.as_ref()
+    }
+
+    /// Get the pending ignore confirmation state.
+    pub fn pending_ignore(&self) -> Option<&(i64, String)> {
+        self.pending_ignore.as_ref()
     }
 
     /// Select the last item in a list of the given length.
@@ -209,6 +218,7 @@ impl App {
             current_directory_id: Cell::new(None),
             pending_approval: None,
             pending_deferral: None,
+            pending_ignore: None,
         }
     }
 
@@ -300,6 +310,10 @@ mod tests {
         assert_eq!(
             app.pending_deferral, None,
             "App should start with no pending deferral"
+        );
+        assert_eq!(
+            app.pending_ignore, None,
+            "App should start with no pending ignore"
         );
     }
 
