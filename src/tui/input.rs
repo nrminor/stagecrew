@@ -35,6 +35,7 @@ impl InputHandler {
                 app.selected_index = app.selected_index.saturating_sub(1);
             }
             KeyCode::Char('g') => app.selected_index = 0, // Go to top
+            KeyCode::Char('G') => app.select_last(app.list_len.get()), // Go to bottom
 
             // Enter detail view
             KeyCode::Enter | KeyCode::Char('l') => {
@@ -55,11 +56,10 @@ impl InputHandler {
             KeyCode::Char('a') => app.view = View::AuditLog,
             KeyCode::Char('?') => app.view = View::Help,
 
-            // TODO(tui): Implement these actions
-            // 'G' - Go to bottom (will be clamped by render)
-            // 'd' - Defer selected
-            // 'i' - Ignore selected
-            // 'x' - Approve removal
+            // TODO(tui): Implement these actions in future stories
+            // 'd' - Defer selected (US-018)
+            // 'i' - Ignore selected (US-019)
+            // 'x' - Approve removal (US-017)
             _ => {}
         }
     }

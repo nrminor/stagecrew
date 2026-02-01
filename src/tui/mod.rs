@@ -7,6 +7,7 @@
 mod input;
 mod ui;
 
+use std::cell::Cell;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
@@ -40,6 +41,9 @@ pub struct App {
 
     /// Filter for days until expiration.
     pub(crate) filter_days: Option<u32>,
+
+    /// Length of the current list (updated by render, used for navigation bounds).
+    pub(crate) list_len: Cell<usize>,
 }
 
 impl App {
@@ -61,6 +65,13 @@ impl App {
     /// Get the filter for days until expiration.
     pub fn filter_days(&self) -> Option<u32> {
         self.filter_days
+    }
+
+    /// Select the last item in a list of the given length.
+    ///
+    /// Sets `selected_index` to `len - 1`, or 0 if the list is empty.
+    pub(crate) fn select_last(&mut self, len: usize) {
+        self.selected_index = len.saturating_sub(1);
     }
 }
 
@@ -152,6 +163,7 @@ impl App {
             selected_index: 0,
             sort_mode: SortMode::default(),
             filter_days: None,
+            list_len: Cell::new(0),
         }
     }
 
@@ -170,7 +182,7 @@ impl App {
     // TODO(cleanup): Remove allow once TUI main loop becomes async (e.g., async database queries).
     // Currently sync event polling doesn't require await, but keeping async for future compatibility.
     #[allow(clippy::unused_async)]
-    pub async fn run(&mut self, _config: &Config, _db: &Database) -> Result<()> {
+    pub async fn run(&mut self, config: &Config, db: &Database) -> Result<()> {
         let mut terminal_manager = TerminalManager::setup().map_err(crate::error::Error::Io)?;
 
         // Main event loop
@@ -178,7 +190,7 @@ impl App {
             // Render the current state
             terminal_manager
                 .terminal_mut()
-                .draw(|frame| ui::render(self, frame))
+                .draw(|frame| ui::render(self, config, db, frame))
                 .map_err(crate::error::Error::Io)?;
 
             // Poll for events with a timeout to limit frame rate

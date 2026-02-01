@@ -245,8 +245,8 @@
         "just check passes"
       ],
       "priority": 14,
-      "passes": false,
-      "notes": "Primary view. Should look polished."
+      "passes": true,
+      "notes": "Completed: Implemented comprehensive directory list view with header stats, sortable table (Path/Size/Expires/Status columns), vim navigation (j/k/g/G), color coding by urgency (red/yellow/green/gray), and human-readable sizes. Added Cell-based list_len tracking for proper 'G' keybinding. Footer shows all keybindings including sort cycling. Added 8 unit tests for determine_row_style covering all status and expiration scenarios. All 106 tests pass. Addressed critical feedback: replaced usize::MAX sentinel with proper select_last() method and list_len tracking, updated footer hints to show s/g/G keys, cleaned up stale TODOs. Technical debt noted: format_bytes duplication with main.rs (deferred), stringly-typed status field (pre-existing DB layer issue). Selection clamping works correctly for empty and populated lists."
     },
     {
       "id": "US-015",

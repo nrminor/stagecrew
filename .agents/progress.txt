@@ -451,3 +451,37 @@
 - US-014 will implement the primary TUI view showing all tracked directories with size, expiration, and status
 
 
+
+## US-014: Implement TUI directory list view (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Implemented render_directory_list view with full feature set: header with aggregate stats (total paths, size, pending, warning, overdue counts), sortable table with Path/Size/Expires/Status columns
+- Added directory sorting by expiration (ascending, most urgent first), size (descending, largest first), or name (alphabetical)
+- Implemented color coding: red for overdue/pending/approved paths, yellow for warning period, green for safe paths, gray for ignored
+- Added human-readable size formatting (format_bytes using SI units)
+- Implemented vim navigation: j/k for up/down, g for top, G for bottom
+- Added selection highlighting with proper clamping to list bounds
+- Used Cell<usize> for list_len tracking to enable proper 'G' (go to bottom) keybinding
+- Updated footer to show all available keybindings: [g/G] Top/Bottom [s] Sort [Enter] Details [p] Pending [a] Audit [?] Help [q] Quit
+- Added 8 unit tests for determine_row_style covering all urgency scenarios (ignored/pending/approved/overdue/warning/safe/no-mtime/precedence)
+
+**Agent reviews:**
+- nick-isms: Flagged usize::MAX sentinel as critical issue (fixed with Cell<usize> list_len and select_last() method), noted stale TODO (cleaned up), missing footer hints (added s, g/G), stringly-typed status (pre-existing DB issue, noted as tech debt), weak too_many_lines justification (acceptable). Overall solid B+ implementation with critical issues addressed.
+- testing-guru: Recommended unit tests for determine_row_style (added 8 tests covering all scenarios), flagged format_bytes duplication with main.rs (noted as medium-priority tech debt, deferred to future PR). Confirmed testing approach is appropriate - no need for render orchestration tests, focus on testable logic.
+- semver-nag: No breaking changes (binary crate). Noted good defensive design with #[non_exhaustive], pub(crate), and private fields with getters. Flagged format_bytes duplication and Stats missing #[non_exhaustive] as suggestions.
+
+**Technical debt documented:**
+- format_bytes duplicated in main.rs and ui.rs (should be extracted to shared module)
+- Stringly-typed Directory.status field (pre-existing DB layer issue, should use Status enum)
+- determine_row_style could use pattern matching for cleaner code (low priority)
+
+**Notes for next agent:**
+- Directory list view is now feature-complete for US-014
+- All 106 tests pass (98 existing + 8 new determine_row_style tests)
+- All acceptance criteria met including vim navigation, color coding, sorting, and human-readable sizes
+- Selection clamping works correctly via list_len Cell tracking updated in render
+- Footer accurately reflects all available keybindings
+- Next story is US-015: Implement TUI sorting (sort cycling is already implemented, just needs testing/polish)
+
