@@ -232,128 +232,7 @@
     },
     {
       "id": "US-014",
-      "title": "Implement TUI directory list view",
-      "description": "As a user, I want to see all tracked directories so that I can understand disk usage and expiration status.",
-      "acceptanceCriteria": [
-        "Header shows: total paths, total size, pending count, paths within warning period",
-        "Table columns: Path, Size, Expires (days), Status",
-        "Rows sorted by expiration (most urgent first) by default",
-        "Selected row highlighted",
-        "vim navigation: j/k or arrows to move, g/G for top/bottom",
-        "Color coding: red=overdue/pending, yellow=within warning, green=safe, gray=ignored",
-        "Human-readable sizes (e.g., '1.2 TB', '523 GB')",
-        "just check passes"
-      ],
-      "priority": 14,
-      "passes": true,
-      "notes": "Completed: Implemented comprehensive directory list view with header stats, sortable table (Path/Size/Expires/Status columns), vim navigation (j/k/g/G), color coding by urgency (red/yellow/green/gray), and human-readable sizes. Added Cell-based list_len tracking for proper 'G' keybinding. Footer shows all keybindings including sort cycling. Added 8 unit tests for determine_row_style covering all status and expiration scenarios. All 106 tests pass. Addressed critical feedback: replaced usize::MAX sentinel with proper select_last() method and list_len tracking, updated footer hints to show s/g/G keys, cleaned up stale TODOs. Technical debt noted: format_bytes duplication with main.rs (deferred), stringly-typed status field (pre-existing DB layer issue). Selection clamping works correctly for empty and populated lists."
-    },
-    {
-      "id": "US-015",
-      "title": "Implement TUI sorting",
-      "description": "As a user, I want to sort the directory list so that I can view by size or name.",
-      "acceptanceCriteria": [
-        "Press 's' to cycle sort modes: Expiration -> Size -> Name -> Expiration",
-        "Current sort mode displayed in header or footer",
-        "Expiration: ascending (most urgent first)",
-        "Size: descending (largest first)",
-        "Name: alphabetical ascending",
-        "Sort persists while navigating",
-        "just check passes"
-      ],
-      "priority": 15,
-      "passes": true,
-      "notes": "Completed: Sorting functionality was already implemented in US-014. This story added comprehensive unit tests to verify all acceptance criteria. Extracted sort_directory_rows() function for testability per testing-guru feedback. Added 30 new tests total (21 input handler + app tests, 9 sorting logic tests). All 133 tests pass."
-    },
-    {
-      "id": "US-016",
-      "title": "Implement TUI directory detail view",
-      "description": "As a user, I want to drill into a directory so that I can see which files are taking up space.",
-      "acceptanceCriteria": [
-        "Press Enter or 'l' on directory to enter detail view",
-        "Shows files within selected directory",
-        "Table columns: Filename, Size, Modified (date)",
-        "Sorted by size descending by default",
-        "Press Esc, 'h', or 'q' to return to directory list",
-        "vim navigation works within file list",
-        "Breadcrumb or title shows which directory is being viewed",
-        "just check passes"
-      ],
-      "priority": 16,
-      "passes": true,
-      "notes": "Completed: Implemented directory detail view with file table, breadcrumb header, and vim navigation. Added current_directory_id field to App state (using Cell for interior mutability). Handles edge cases: no directory selected, error loading files, empty directories. Added 8 unit tests for input handling. All 141 tests pass. Code review feedback addressed: added critical tests for detail view navigation per testing-guru recommendations. Architectural improvement suggestions from nick-isms (eliminate Cell with directory cache) and semver-nag (consider newtype for directory ID) noted as future enhancements but not blockers for MVP."
-    },
-    {
-      "id": "US-017",
-      "title": "Implement TUI approve action",
-      "description": "As a user, I want to approve a path for removal so that it will be deleted on next daemon run.",
-      "acceptanceCriteria": [
-        "Press 'x' on selected directory to approve",
-        "Confirmation prompt: 'Approve removal of /path? (y/n)'",
-        "On 'y': update status to approved, record audit entry",
-        "On 'n' or Esc: cancel, no change",
-        "Visual feedback: row updates to show 'approved' status",
-        "Works from directory list view",
-        "just check passes"
-      ],
-      "priority": 17,
-      "passes": true,
-      "notes": "Completed: Implemented approval action with 'x' key triggering confirmation modal. On 'y', updates directory status to 'approved' in database and records audit entry. On 'n' or Esc, cancels without changes. Added 7 comprehensive unit tests. Modified InputHandler to take Database parameter for performing DB operations. Added tracing::warn for audit failures per code review. Visual feedback works via row re-rendering with red color for approved status. Code review recommendations documented for future improvements: consider PendingApproval struct instead of tuple (semver-nag), add get_directory_by_id method (nick-isms), add 6 additional edge case tests (testing-guru)."
-    },
-    {
-      "id": "US-018",
-      "title": "Implement TUI defer action",
-      "description": "As a user, I want to defer a path so that its expiration clock resets.",
-      "acceptanceCriteria": [
-        "Press 'd' on selected directory to defer",
-        "Prompt for days: 'Defer for how many days? [90]'",
-        "Default to config.expiration_days if user presses Enter",
-        "Accept numeric input, validate > 0",
-        "Update status to deferred, set deferred_until timestamp",
-        "Record audit entry with deferral period in details",
-        "Visual feedback: row updates to show new expiration",
-        "just check passes"
-      ],
-      "priority": 18,
-      "passes": true,
-      "notes": "Completed: Implemented 'd' key handler with numeric input modal, PendingDeferral struct for state tracking, validation (rejects zero/invalid input), database updates (status='deferred', deferred_until timestamp), and audit logging. Added 10 comprehensive unit tests. Addressed code review feedback: replaced tuple with PendingDeferral struct (includes directory_id, path, input, default_days), fixed hardcoded 90-day default to use config.expiration_days, improved mutation pattern with ref mut. Technical debt noted: Raw SQL for deferred_until update (future: add Database::defer_directory() method). All 158 tests pass."
-    },
-    {
-      "id": "US-019",
-      "title": "Implement TUI ignore action",
-      "description": "As a user, I want to ignore a path permanently so that it's never auto-removed.",
-      "acceptanceCriteria": [
-        "Press 'i' on selected directory to ignore",
-        "Confirmation prompt: 'Permanently ignore /path? (y/n)'",
-        "On 'y': update status to ignored, record audit entry",
-        "On 'n' or Esc: cancel, no change",
-        "Ignored paths shown in gray, sorted to bottom (or filtered out optionally)",
-        "just check passes"
-      ],
-      "priority": 19,
-      "passes": true,
-      "notes": "Completed: Implemented 'i' key handler with confirmation modal (cyan border), database status update to 'ignored', audit logging. Added 7 comprehensive unit tests. All 165 tests pass. Code review feedback: nick-isms (B+ - follows patterns, acceptable code duplication), testing-guru (adequate coverage), semver-nag (consistent design, tuple approach acceptable for binary crate). Ignored paths shown in gray per determine_row_style tests. Footer updated with '[i] Ignore' hint."
-    },
-    {
-      "id": "US-020",
-      "title": "Implement TUI pending approvals view",
-      "description": "As a user, I want to see only pending paths so that I can quickly review what needs approval.",
-      "acceptanceCriteria": [
-        "Press 'p' to switch to pending approvals view",
-        "Shows only directories with status=pending",
-        "Same table format as directory list",
-        "Can approve (x), defer (d), or ignore (i) from this view",
-        "Press 'q' or Esc to return to main directory list",
-        "Empty state message if no pending paths",
-        "just check passes"
-      ],
-      "priority": 20,
-      "passes": true,
-      "notes": "Completed: Implemented pending approvals view with filtered directory list (status='pending'), full action support (approve/defer/ignore), navigation (j/k/g/G), sort cycling (s), and proper empty state handling. Added 7 comprehensive unit tests. All 172 tests pass. Code reviews: nick-isms (B+ - noted code duplication as acceptable technical debt), testing-guru (87.5% AC coverage, recommended 3 optional edge case tests), semver-nag (approved API design, consistent with existing patterns)."
-    },
-    {
-      "id": "US-021",
-      "title": "Implement TUI audit log view",
+      "title": "Implement TUI audit log view (legacy)",
       "description": "As a user, I want to see the audit history so that I can review past actions.",
       "acceptanceCriteria": [
         "Press 'a' to switch to audit log view",
@@ -364,13 +243,13 @@
         "Timestamp formatted as human-readable (e.g., '2024-01-15 14:32')",
         "just check passes"
       ],
-      "priority": 21,
+      "priority": 14,
       "passes": true,
-      "notes": "Completed: Implemented render_audit_log() with table view (Timestamp, User, Action, Path columns). Added format_timestamp() helper (YYYY-MM-DD HH:MM:SS format in local timezone). Updated handle_audit_log() to support g/G/h navigation keys. Added 6 input handler tests + 4 format_timestamp unit tests. Footer hints updated with g/G keys. All 182 tests pass. Code reviews addressed: moved local imports to top of file, added selected_index reset on view entry, added comprehensive unit tests for format_timestamp."
+      "notes": "LEGACY - will be superseded by TUI redesign. Completed: Implemented render_audit_log() with table view (Timestamp, User, Action, Path columns). Added format_timestamp() helper (YYYY-MM-DD HH:MM:SS format in local timezone). Updated handle_audit_log() to support g/G/h navigation keys. Added 6 input handler tests + 4 format_timestamp unit tests. Footer hints updated with g/G keys. All 182 tests pass. Code reviews addressed: moved local imports to top of file, added selected_index reset on view entry, added comprehensive unit tests for format_timestamp."
     },
     {
-      "id": "US-022",
-      "title": "Implement TUI help view",
+      "id": "US-015",
+      "title": "Implement TUI help view (legacy)",
       "description": "As a user, I want to see keybinding help so that I can learn how to use the TUI.",
       "acceptanceCriteria": [
         "Press '?' to show help view",
@@ -379,27 +258,12 @@
         "Press any key to dismiss",
         "just check passes"
       ],
-      "priority": 22,
+      "priority": 15,
       "passes": true,
-      "notes": "Completed: Updated render_help() in src/tui/ui.rs with comprehensive keybindings organized by categories (Navigation, Views, Actions, Other). Existing input handling (any key dismisses) was already implemented and tested. Fixed stale docstring per @nick-isms review. All 182 tests pass. Code reviews from @nick-isms (approved after docstring fix), @testing-guru (coverage is adequate), and @semver-nag (no semver concerns for binary crate)."
+      "notes": "LEGACY - will be superseded by TUI redesign. Completed: Updated render_help() in src/tui/ui.rs with comprehensive keybindings organized by categories (Navigation, Views, Actions, Other). Existing input handling (any key dismisses) was already implemented and tested. Fixed stale docstring per @nick-isms review. All 182 tests pass. Code reviews from @nick-isms (approved after docstring fix), @testing-guru (coverage is adequate), and @semver-nag (no semver concerns for binary crate)."
     },
     {
-      "id": "US-023",
-      "title": "Implement TUI footer with keybinding hints",
-      "description": "As a user, I want to see available actions so that I don't have to memorize keybindings.",
-      "acceptanceCriteria": [
-        "Footer bar shows context-sensitive keybinding hints",
-        "Directory list: '[j/k] Navigate [Enter] Details [d] Defer [i] Ignore [x] Approve [?] Help'",
-        "Adapts to current view (different hints for detail view, audit view, etc.)",
-        "Styled distinctly from main content (e.g., inverse colors)",
-        "just check passes"
-      ],
-      "priority": 23,
-      "passes": true,
-      "notes": "Completed: Footer implementation was already complete from earlier stories (US-014 onwards). Verified all 5 views have appropriate context-sensitive hints. Function render_footer (lines 791-807 in ui.rs) uses exhaustive match on View enum to provide different hints per view. Styled with inverse colors (black fg on gray bg) for visual distinction. Code reviews: nick-isms (B+ grade, approved with minor Rect import cleanup suggestion as file-wide pattern), testing-guru (approved - no additional tests needed, type system provides compile-time guarantees via exhaustive match), semver-nag (approved - good API design, proper encapsulation, #[non_exhaustive] used correctly)."
-    },
-    {
-      "id": "US-024",
+      "id": "US-016",
       "title": "Implement daemon main loop",
       "description": "As a user, I want the daemon to run continuously so that scans and removals happen automatically.",
       "acceptanceCriteria": [
@@ -412,12 +276,12 @@
         "Remove temporary #[allow] attributes from daemon module",
         "just check passes"
       ],
-      "priority": 24,
+      "priority": 16,
       "passes": true,
       "notes": "Completed: Implemented daemon main loop with scan → transition → remove workflow, configurable sleep interval (scan_interval_hours * 3600 seconds), graceful shutdown via SIGINT/SIGTERM signals (Unix) or Ctrl+C (Windows), comprehensive logging at info/warn levels. Errors during cycle steps are logged but do not stop the daemon (all three steps attempted each cycle). Addressed code review feedback: Added SIGTERM support per acceptance criteria, removed incorrect #[allow(clippy::cast_lossless)], changed run_cycle to return () instead of Result<()> since errors are handled internally, updated docstring to accurately describe error behavior. All 182 tests pass. Technical notes for future improvements: Consider accepting Database as constructor parameter for testability, consider accepting Arc<Config> instead of owned Config for sharing, consider adding CancellationToken for shutdown control in library extraction. Semver-nag noted API design is appropriate for binary crate but would need refactoring before library extraction."
     },
     {
-      "id": "US-025",
+      "id": "US-017",
       "title": "Implement stats update after scan",
       "description": "As a user, I want stats updated after each scan so that the status command shows current information.",
       "acceptanceCriteria": [
@@ -428,12 +292,12 @@
         "Stats query is single UPDATE statement for efficiency",
         "just check passes"
       ],
-      "priority": 25,
+      "priority": 17,
       "passes": true,
       "notes": "Completed: Enhanced update_stats() to use single SQL UPDATE with subqueries calculating paths_within_warning, paths_pending_approval, and paths_overdue. Added last_scan_completed field to Stats struct. Updated scan_and_persist() signature to accept expiration_days and warning_days parameters. Removed unused _total_files parameter. Added 8 comprehensive unit tests covering warning periods, pending counts, overdue paths, mixed scenarios, custom config values, and last_scan_completed timestamp verification. All 190 tests pass. Addressed code review feedback from nick-isms (removed unused parameter), testing-guru (added critical timestamp test), and semver-nag (removed stale allow)."
     },
     {
-      "id": "US-026",
+      "id": "US-018",
       "title": "Add integration test for full workflow",
       "description": "As a developer, I want an integration test so that the full workflow is verified.",
       "acceptanceCriteria": [
@@ -447,12 +311,12 @@
         "Test uses tempfile for isolation",
         "just check passes"
       ],
-      "priority": 26,
+      "priority": 18,
       "passes": true,
       "notes": "Completed: Created src/lib.rs exposing audit, config, db, error, removal, and scanner modules for integration testing. Added comprehensive end-to-end test in tests/integration.rs covering full workflow (init → scan → persist → transition → approve → remove → verify). Test creates files with varying ages (95, 80, 10 days), verifies database state, filesystem deletion, and audit trail. Added #[non_exhaustive] to Stats struct per semver review. Added stability documentation to lib.rs. All 282 tests pass."
     },
     {
-      "id": "US-027",
+      "id": "US-019",
       "title": "Polish and cleanup",
       "description": "As a developer, I want all temporary allows removed and code polished so that the codebase is production-ready.",
       "acceptanceCriteria": [
@@ -463,28 +327,26 @@
         "No clippy warnings with current lint configuration",
         "just check passes"
       ],
-      "priority": 27,
+      "priority": 19,
       "passes": true,
       "notes": "Completed: Removed all TODO(cleanup) comments and temporary #[allow] attributes. Module-level #![allow(dead_code, unused)] removed from tui/mod.rs. Replaced temporary allows with properly justified permanent allows for public API items reserved for future use (AuditAction::ConfigChange, AuditService::list_by_path, AuditEntry, Database::get_directory_by_path, RemovalSummary::empty, App::filter_days). Removed AppPaths::log_dir() per semver-nag recommendation (untested, unused, vague justification). All remaining allows follow AGENTS.md policy with clear justifications. All 282 tests pass, no clippy warnings, docs build successfully."
     },
     {
-      "id": "US-028",
+      "id": "US-020",
       "title": "Deny unwraps in clippy and resolve violations",
       "description": "As a developer, I want unwrap() calls flagged by clippy so that error handling is explicit throughout the codebase.",
       "acceptanceCriteria": [
         "Add clippy::unwrap_used to deny list in Cargo.toml lints section",
-        "Resolve all resulting clippy errors on a case-by-case basis",
-        "Use expect() with descriptive messages for truly unreachable cases",
-        "Use proper error handling (?, ok_or_else, match) where fallibility is possible",
-        "No blanket #[allow(clippy::unwrap_used)] - each allow needs justification",
+        "Replace all .unwrap() calls with .expect('helpful message')",
+        "Do NOT use module-level #[allow(clippy::unwrap_used)] - each unwrap must be converted to expect",
         "just check passes"
       ],
-      "priority": 28,
+      "priority": 20,
       "passes": false,
-      "notes": "Turning on this lint after initial development means many violations to resolve. Each case requires judgment: expect with good message vs. proper error propagation vs. restructuring."
+      "notes": "IMPORTANT: A previous agent added module-level #![allow(clippy::unwrap_used)] to test modules - these must be REMOVED. The correct approach is replacing every .unwrap() with .expect('message'). Each expect message is an opportunity for exceptional contributor DX. Messages should answer: 'If this panics, what should I check or do?' Good examples: 'failed to create temp directory - check disk space and permissions', 'database connection lost mid-test - is another process holding a lock?', 'expected directory to exist after scan completed'. Bad examples (too abstract, not actionable): 'regex is valid at compile time', 'invariant violated', 'should not fail'. The message should help a novice who just ran cargo test understand what was attempted, what likely went wrong, and what to check."
     },
     {
-      "id": "US-029",
+      "id": "US-021",
       "title": "Add CI workflow",
       "description": "As a developer, I want CI to run on PRs and pushes so that code quality is enforced automatically.",
       "acceptanceCriteria": [
@@ -498,12 +360,12 @@
         "Add CI status badge to README.md at the top",
         "just check passes"
       ],
-      "priority": 29,
+      "priority": 21,
       "passes": false,
       "notes": "Standard CI workflow. Keep it simple - just run the same checks developers run locally. Badge format: ![CI](https://github.com/nrminor/stagecrew/actions/workflows/ci.yml/badge.svg)"
     },
     {
-      "id": "US-030",
+      "id": "US-022",
       "title": "Add release workflow with cross-platform binaries",
       "description": "As a user, I want pre-built binaries for my platform so that I can install without compiling.",
       "acceptanceCriteria": [
@@ -518,12 +380,12 @@
         "Reference .agents/release-workflow-example.yml as template",
         "just check passes"
       ],
-      "priority": 30,
+      "priority": 22,
       "passes": false,
       "notes": "Adapt the example workflow in .agents/release-workflow-example.yml. Update binary name to 'stagecrew'."
     },
     {
-      "id": "US-031",
+      "id": "US-023",
       "title": "Add curl-installable install script",
       "description": "As a user, I want to install stagecrew with a single curl command so that setup is easy.",
       "acceptanceCriteria": [
@@ -538,9 +400,198 @@
         "Add INSTALL.sh to .gitignore allow list",
         "just check passes"
       ],
-      "priority": 31,
+      "priority": 23,
       "passes": false,
       "notes": "Adapt the example script in .agents/install-script-example.sh. Update repo name, binary name, and post-install instructions for stagecrew."
+    },
+    {
+      "id": "US-024",
+      "title": "Fix expiration clock to start at tracking time",
+      "description": "As a user, I want the expiration clock to start when I add a path to stagecrew, not from the file's original mtime, so that newly-tracked old files don't immediately appear overdue.",
+      "acceptanceCriteria": [
+        "Add tracked_since timestamp column to files table (and directories if needed)",
+        "When a file is first inserted, set tracked_since to current time",
+        "Expiration calculation uses max(mtime, tracked_since) + expiration_days",
+        "Existing files without tracked_since default to their mtime (backward compat)",
+        "TUI displays sensible expiration info for newly-tracked files",
+        "Update schema.sql and run migration if needed",
+        "just check passes"
+      ],
+      "priority": 24,
+      "passes": false,
+      "notes": "This is a fundamental fix to the expiration model. Without this, users see confusing 'expired 247 days ago' messages for files they just started tracking."
+    },
+    {
+      "id": "US-025",
+      "title": "Support tilde expansion in config paths",
+      "description": "As a user, I want to use ~ in my config file paths so that configs are portable across systems.",
+      "acceptanceCriteria": [
+        "Config loading expands ~ to user's home directory in tracked_paths",
+        "Config loading expands ~ in database_path if present",
+        "Use shellexpand or dirs crate",
+        "Works on Linux, macOS, and Windows",
+        "Unit tests verify expansion",
+        "just check passes"
+      ],
+      "priority": 25,
+      "passes": false,
+      "notes": "Currently ~/Downloads in config.toml is treated as literal path and fails. This is a small quality-of-life fix."
+    },
+    {
+      "id": "US-026",
+      "title": "Add CLI command to add tracked paths",
+      "description": "As a user, I want to add tracked paths from the command line so that I don't have to manually edit the config file.",
+      "acceptanceCriteria": [
+        "stagecrew add PATH adds path to tracked_paths in config",
+        "Validates path exists and is a directory",
+        "Saves updated config to disk",
+        "Optionally runs initial scan with --scan flag",
+        "Prints confirmation message",
+        "Shell expands ~ before app sees it (natural behavior)",
+        "just check passes"
+      ],
+      "priority": 26,
+      "passes": false,
+      "notes": "This complements tilde expansion - users can run 'stagecrew add ~/Downloads' and the shell handles ~."
+    },
+    {
+      "id": "US-027",
+      "title": "Redesign TUI with file-centric layout",
+      "description": "As a user, I want the TUI to show files as the primary view so that I can manage disk usage at the granularity that matters.",
+      "acceptanceCriteria": [
+        "Main panel shows file list (not directory list)",
+        "Left sidebar shows tracked directories for navigation",
+        "Selecting a directory in sidebar filters file list to that directory",
+        "File table columns: Filename, Size, Expires, Status",
+        "Files sorted by expiration (most urgent first) by default",
+        "Header shows stats for current view (total size, file count, pending count)",
+        "vim navigation (j/k/g/G) works in both panels",
+        "Tab or h/l switches focus between sidebar and main panel",
+        "just check passes"
+      ],
+      "priority": 27,
+      "passes": false,
+      "notes": "This is a significant rewrite of the TUI. The old directory-centric design was wrong - file-level granularity is what users actually need. Existing TUI code in src/tui/ will need substantial changes."
+    },
+    {
+      "id": "US-028",
+      "title": "Add file sorting in TUI",
+      "description": "As a user, I want to sort files by different criteria so that I can find what I'm looking for.",
+      "acceptanceCriteria": [
+        "Press 's' to cycle sort modes: Expiration -> Size -> Name -> Modified -> Expiration",
+        "Current sort mode displayed in header or footer",
+        "Expiration: ascending (most urgent first)",
+        "Size: descending (largest first)",
+        "Name: alphabetical ascending",
+        "Modified: most recent first",
+        "Sort persists while navigating",
+        "just check passes"
+      ],
+      "priority": 28,
+      "passes": false,
+      "notes": "Extends the old directory sorting to work with the new file-centric view."
+    },
+    {
+      "id": "US-029",
+      "title": "Add visual expiration indicator in TUI",
+      "description": "As a user, I want to see at a glance how close files are to expiration so that I can prioritize my cleanup.",
+      "acceptanceCriteria": [
+        "Each file row has a visual indicator of expiration status",
+        "Option A: Mini progress bar showing days_remaining / expiration_days",
+        "Option B: Row color gradient (green=fresh, yellow=warning, red=expired/overdue)",
+        "Implement whichever option feels more usable after prototyping",
+        "Overdue files clearly distinguished (not just 'more red')",
+        "Color-blind friendly (use symbols or patterns as backup)",
+        "just check passes"
+      ],
+      "priority": 29,
+      "passes": false,
+      "notes": "User feedback: 'virtually no control' and 'text is all white'. This addresses the visual feedback gap."
+    },
+    {
+      "id": "US-030",
+      "title": "Implement file-level actions in TUI",
+      "description": "As a user, I want to take actions on individual files so that I can manage my disk usage precisely.",
+      "acceptanceCriteria": [
+        "Press 'd' to delete selected file (with confirmation prompt)",
+        "Press 'r' to defer selected file (reset expiration clock)",
+        "Press 'i' to ignore selected file permanently",
+        "Press 'x' to approve selected file for daemon removal",
+        "All actions record audit entries",
+        "All actions update database status",
+        "Visual feedback after action (row updates or disappears)",
+        "just check passes"
+      ],
+      "priority": 30,
+      "passes": false,
+      "notes": "Key insight from user: 'd' should mean delete (what users expect), 'r' for defer. The old TUI had directory-level actions only."
+    },
+    {
+      "id": "US-031",
+      "title": "Implement multi-select in TUI",
+      "description": "As a user, I want to select multiple files and operate on them at once so that bulk cleanup is efficient.",
+      "acceptanceCriteria": [
+        "Press Space to toggle selection on current file",
+        "Press 'v' to enter visual/selection mode (like vim)",
+        "Selected files highlighted distinctly",
+        "Actions (d/r/i/x) apply to all selected files",
+        "Confirmation prompt shows count: 'Delete 5 files? (y/n)'",
+        "Press Esc to clear selection",
+        "Selection count shown in header/footer",
+        "just check passes"
+      ],
+      "priority": 31,
+      "passes": false,
+      "notes": "Batch operations are essential for practical use. Nobody wants to delete 50 files one at a time."
+    },
+    {
+      "id": "US-032",
+      "title": "Update TUI footer with new keybindings",
+      "description": "As a user, I want the footer to show the correct keybindings so that I know what actions are available.",
+      "acceptanceCriteria": [
+        "Footer shows context-sensitive hints for new keybindings",
+        "File view: '[j/k] Navigate [d] Delete [r] Defer [i] Ignore [x] Approve [Space] Select [?] Help'",
+        "Sidebar: '[j/k] Navigate [Enter] Select [Tab] Switch panel'",
+        "Selection mode: '[d] Delete N [r] Defer N [Esc] Clear'",
+        "Styled distinctly from main content",
+        "just check passes"
+      ],
+      "priority": 32,
+      "passes": false,
+      "notes": "Updates the legacy footer implementation for the new TUI design."
+    },
+    {
+      "id": "US-033",
+      "title": "Update TUI help view with new keybindings",
+      "description": "As a user, I want the help view to document all available actions so that I can learn the interface.",
+      "acceptanceCriteria": [
+        "Help view lists all new keybindings",
+        "Organized by category: Navigation, Actions, Selection, Views",
+        "Explains the file-centric workflow",
+        "Press '?' to show, any key to dismiss",
+        "just check passes"
+      ],
+      "priority": 33,
+      "passes": false,
+      "notes": "Updates the legacy help view for the new TUI design."
+    },
+    {
+      "id": "US-034",
+      "title": "Add TUI interface for managing tracked paths",
+      "description": "As a user, I want to add and remove tracked paths from within the TUI so that I don't have to exit to edit config.",
+      "acceptanceCriteria": [
+        "Press 'A' (shift-a) to add a new tracked path",
+        "Text input prompt for path (with ~ expansion)",
+        "Validates path exists and is a directory",
+        "Press 'X' (shift-x) on sidebar directory to remove from tracking",
+        "Confirmation prompt before removing",
+        "Changes saved to config file",
+        "Triggers scan of newly added path",
+        "just check passes"
+      ],
+      "priority": 34,
+      "passes": false,
+      "notes": "Completes the path management story - CLI (US-026) for scripting, TUI for interactive use."
     }
   ]
 }
