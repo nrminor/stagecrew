@@ -15,8 +15,8 @@
         "just check passes"
       ],
       "priority": 1,
-      "passes": false,
-      "notes": "Foundation for all other modules. Error types already stubbed but need refinement."
+      "passes": true,
+      "notes": "Completed: Removed #[allow(dead_code)] from PermissionDenied and PathNotFound variants (now used by removal module). Added #[non_exhaustive] for future extensibility per semver-nag review."
     },
     {
       "id": "US-002",

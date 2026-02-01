@@ -33,7 +33,7 @@ Stagecrew is a disk usage management tool for shared HPC staging filesystems. It
 ## Before You Do Anything
 
 1. **Read the justfile.** Run `just --list` to see available recipes. You must use these recipes for all repeating commands.
-2. **Read the prd.json** (if it exists) to find the current user story you should implement.
+2. **Read `.agents/prd.json`** (if it exists) to find the current user story you should implement.
 3. **Understand the project structure.** Read `src/main.rs` and the module files relevant to your task.
 
 ## Version Control: jj (Jujutsu)
@@ -239,12 +239,12 @@ Agents must never:
 
 When working in Ralph loops (autonomous agent iterations):
 
-1. **Read `prd.json`** to find the first story where `passes: false`
+1. **Read `.agents/prd.json`** to find the first story where `passes: false`
 2. **Implement only that story** — do not look ahead or implement multiple stories
 3. **Verify all acceptance criteria** before marking complete
 4. **Run `just check`** — all checks must pass
 5. **Commit with message** referencing the story: `US-XXX: Brief description`
-6. **Update `prd.json`** — set `passes: true` and add notes if needed
+6. **Update `.agents/prd.json`** — set `passes: true` and add notes if needed
 
 ### Story Completion Checklist
 

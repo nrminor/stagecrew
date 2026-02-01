@@ -11,6 +11,11 @@
 !/AGENTS.md
 !/opencode.json
 
+# === Allowed: Agent configuration ===
+!/.agents
+!/.agents/prd.json
+!/.agents/progress.txt
+
 # === Allowed: Source code ===
 !/src
 !/src/main.rs

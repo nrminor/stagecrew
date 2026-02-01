@@ -1,0 +1,20 @@
+# Stagecrew Implementation Progress
+
+## US-001: Implement core error types (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Removed `#[allow(dead_code)]` from `PermissionDenied` and `PathNotFound` error variants
+- Added `#[non_exhaustive]` attribute to the Error enum for future extensibility
+
+**Agent reviews:**
+- nick-isms: LGTM - code follows conventions
+- testing-guru: Error types are testable, unit tests optional (coverage via integration tests)
+- semver-nag: Recommended `#[non_exhaustive]` which was added
+
+**Notes for next agent:**
+- The error module is now complete and ready for use
+- All error variants are being used (PermissionDenied and PathNotFound in removal/mod.rs)
+- Next story is US-002: Implement configuration with shared database path
+- The config module already has most of the structure but needs `database_path` field and shared location logic
