@@ -413,8 +413,8 @@
         "just check passes"
       ],
       "priority": 24,
-      "passes": false,
-      "notes": "Simple foreground daemon. Users run in tmux/screen."
+      "passes": true,
+      "notes": "Completed: Implemented daemon main loop with scan → transition → remove workflow, configurable sleep interval (scan_interval_hours * 3600 seconds), graceful shutdown via SIGINT/SIGTERM signals (Unix) or Ctrl+C (Windows), comprehensive logging at info/warn levels. Errors during cycle steps are logged but do not stop the daemon (all three steps attempted each cycle). Addressed code review feedback: Added SIGTERM support per acceptance criteria, removed incorrect #[allow(clippy::cast_lossless)], changed run_cycle to return () instead of Result<()> since errors are handled internally, updated docstring to accurately describe error behavior. All 182 tests pass. Technical notes for future improvements: Consider accepting Database as constructor parameter for testability, consider accepting Arc<Config> instead of owned Config for sharing, consider adding CancellationToken for shutdown control in library extraction. Semver-nag noted API design is appropriate for binary crate but would need refactoring before library extraction."
     },
     {
       "id": "US-025",
