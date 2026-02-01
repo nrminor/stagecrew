@@ -44,6 +44,10 @@ pub struct App {
 
     /// Length of the current list (updated by render, used for navigation bounds).
     pub(crate) list_len: Cell<usize>,
+
+    /// The directory ID currently being viewed in detail view (None if not in detail view).
+    /// Uses Cell for interior mutability since it's updated during rendering.
+    pub(crate) current_directory_id: Cell<Option<i64>>,
 }
 
 impl App {
@@ -65,6 +69,11 @@ impl App {
     /// Get the filter for days until expiration.
     pub fn filter_days(&self) -> Option<u32> {
         self.filter_days
+    }
+
+    /// Get the current directory ID being viewed in detail mode.
+    pub fn current_directory_id(&self) -> Option<i64> {
+        self.current_directory_id.get()
     }
 
     /// Select the last item in a list of the given length.
@@ -164,6 +173,7 @@ impl App {
             sort_mode: SortMode::default(),
             filter_days: None,
             list_len: Cell::new(0),
+            current_directory_id: Cell::new(None),
         }
     }
 
@@ -243,6 +253,11 @@ mod tests {
         );
         assert_eq!(app.filter_days, None, "App should start with no filter");
         assert_eq!(app.list_len.get(), 0, "App should start with list_len 0");
+        assert_eq!(
+            app.current_directory_id.get(),
+            None,
+            "App should start with no directory selected"
+        );
     }
 
     #[test]
@@ -272,10 +287,12 @@ mod tests {
         app.selected_index = 5;
         app.sort_mode = SortMode::Size;
         app.filter_days = Some(30);
+        app.current_directory_id.set(Some(42));
 
         assert_eq!(app.view(), View::Help);
         assert_eq!(app.selected_index(), 5);
         assert_eq!(app.sort_mode(), SortMode::Size);
         assert_eq!(app.filter_days(), Some(30));
+        assert_eq!(app.current_directory_id(), Some(42));
     }
 }

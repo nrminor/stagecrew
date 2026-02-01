@@ -38,8 +38,11 @@ impl InputHandler {
             KeyCode::Char('G') => app.select_last(app.list_len.get()), // Go to bottom
 
             // Enter detail view
+            // Note: current_directory_id will be set by the render function
+            // when it identifies which directory is selected
             KeyCode::Enter | KeyCode::Char('l') => {
                 app.view = View::DirectoryDetail;
+                app.selected_index = 0; // Reset selection for file list
             }
 
             // Sort modes
@@ -66,15 +69,23 @@ impl InputHandler {
 
     fn handle_directory_detail(app: &mut App, key: KeyEvent) {
         match key.code {
+            // Return to directory list
             KeyCode::Char('q' | 'h') | KeyCode::Esc => {
                 app.view = View::DirectoryList;
+                app.current_directory_id.set(None); // Clear the directory context
+                app.selected_index = 0; // Reset selection
             }
+
+            // Navigation (vim-style)
             KeyCode::Char('j') | KeyCode::Down => {
                 app.selected_index = app.selected_index.saturating_add(1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 app.selected_index = app.selected_index.saturating_sub(1);
             }
+            KeyCode::Char('g') => app.selected_index = 0, // Go to top
+            KeyCode::Char('G') => app.select_last(app.list_len.get()), // Go to bottom
+
             _ => {}
         }
     }
@@ -330,5 +341,141 @@ mod tests {
             View::DirectoryList,
             "Any key should close help view and return to directory list"
         );
+    }
+
+    // Tests for directory detail view input handling (US-016)
+
+    #[test]
+    fn enter_detail_view_on_enter_key() {
+        let mut app = App::new();
+        app.selected_index = 5;
+        app.current_directory_id.set(Some(42)); // Would be set by render
+
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Enter));
+
+        assert_eq!(app.view, View::DirectoryDetail);
+        assert_eq!(
+            app.selected_index, 0,
+            "Selection should reset for file list"
+        );
+    }
+
+    #[test]
+    fn enter_detail_view_on_l_key() {
+        let mut app = App::new();
+        app.current_directory_id.set(Some(42));
+
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('l')));
+
+        assert_eq!(app.view, View::DirectoryDetail);
+        assert_eq!(
+            app.selected_index, 0,
+            "Selection should reset for file list"
+        );
+    }
+
+    #[test]
+    fn exit_detail_view_on_esc() {
+        let mut app = App::new();
+        app.view = View::DirectoryDetail;
+        app.current_directory_id.set(Some(42));
+
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Esc));
+
+        assert_eq!(app.view, View::DirectoryList);
+        assert_eq!(
+            app.current_directory_id(),
+            None,
+            "Directory ID should be cleared"
+        );
+        assert_eq!(app.selected_index, 0, "Selection should reset");
+    }
+
+    #[test]
+    fn exit_detail_view_on_h_key() {
+        let mut app = App::new();
+        app.view = View::DirectoryDetail;
+        app.current_directory_id.set(Some(42));
+
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('h')));
+
+        assert_eq!(app.view, View::DirectoryList);
+        assert_eq!(app.current_directory_id(), None);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn exit_detail_view_on_q_key() {
+        let mut app = App::new();
+        app.view = View::DirectoryDetail;
+        app.current_directory_id.set(Some(42));
+
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('q')));
+
+        assert_eq!(app.view, View::DirectoryList);
+        assert_eq!(app.current_directory_id(), None);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn detail_view_navigation_j_k_works() {
+        let mut app = App::new();
+        app.view = View::DirectoryDetail;
+        app.list_len.set(10);
+
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('j')));
+        assert_eq!(app.selected_index, 1, "j should move down");
+
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('k')));
+        assert_eq!(app.selected_index, 0, "k should move up");
+    }
+
+    #[test]
+    fn detail_view_navigation_g_capital_g_works() {
+        let mut app = App::new();
+        app.view = View::DirectoryDetail;
+        app.selected_index = 5;
+        app.list_len.set(10);
+
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('g')));
+        assert_eq!(app.selected_index, 0, "g should go to top");
+
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('G')));
+        assert_eq!(app.selected_index, 9, "G should go to bottom");
+    }
+
+    #[test]
+    fn full_detail_view_navigation_flow() {
+        let mut app = App::new();
+        app.list_len.set(5);
+        app.selected_index = 2;
+
+        // Simulate render setting directory ID
+        app.current_directory_id.set(Some(42));
+
+        // Enter detail view
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Enter));
+        assert_eq!(app.view, View::DirectoryDetail);
+        assert_eq!(app.selected_index, 0, "Selection resets on entry");
+        assert_eq!(
+            app.current_directory_id(),
+            Some(42),
+            "Directory ID preserved"
+        );
+
+        // Navigate in detail view
+        app.list_len.set(3); // Simulate file list
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Char('j')));
+        assert_eq!(app.selected_index, 1);
+
+        // Exit detail view
+        InputHandler::handle(&mut app, make_key_event(KeyCode::Esc));
+        assert_eq!(app.view, View::DirectoryList);
+        assert_eq!(
+            app.current_directory_id(),
+            None,
+            "Directory ID cleared on exit"
+        );
+        assert_eq!(app.selected_index, 0, "Selection resets on exit");
     }
 }

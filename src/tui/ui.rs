@@ -28,7 +28,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     // Render the current view in the main area
     match app.view() {
         View::DirectoryList => render_directory_list(app, config, db, frame, chunks[0]),
-        View::DirectoryDetail => render_directory_detail(app, frame, chunks[0]),
+        View::DirectoryDetail => render_directory_detail(app, config, db, frame, chunks[0]),
         View::PendingApprovals => render_pending_approvals(app, frame, chunks[0]),
         View::AuditLog => render_audit_log(app, frame, chunks[0]),
         View::Help => render_help(app, frame, chunks[0]),
@@ -112,6 +112,12 @@ fn render_directory_list(
     } else {
         app.selected_index().min(dir_rows.len() - 1)
     };
+
+    // Set current directory ID for potential detail view navigation
+    // This allows the detail view to know which directory to display
+    if let Some((dir, _)) = dir_rows.get(selected_idx) {
+        app.current_directory_id.set(Some(dir.id));
+    }
 
     // Build table rows
     let rows: Vec<Row> = dir_rows
@@ -291,18 +297,170 @@ fn format_bytes(bytes: u64) -> String {
 
 /// Render the directory detail view.
 ///
-/// This is a placeholder implementation that will be expanded in US-016.
-fn render_directory_detail(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let block = Block::default()
-        .title("Directory Details")
-        .borders(Borders::ALL)
+/// Displays all files within the currently selected directory, sorted by size descending.
+/// Shows a breadcrumb header with the directory path and a table of files with columns:
+/// Filename, Size, Modified (date).
+// Allow: This function orchestrates the detail view rendering with file loading, sorting,
+// breadcrumb display, and table construction. Breaking it up would make the rendering flow
+// less clear, as all these operations are inherently sequential steps in displaying a single view.
+#[allow(clippy::too_many_lines)]
+fn render_directory_detail(
+    app: &App,
+    config: &Config,
+    db: &Database,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+) {
+    // Split into breadcrumb area and table area
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Breadcrumb header
+            Constraint::Min(0),    // File table
+        ])
+        .split(area);
+
+    // Get the current directory ID from app state
+    let Some(directory_id) = app.current_directory_id() else {
+        // No directory selected - show error message
+        let error_text = Paragraph::new("No directory selected. Press 'h' to go back.")
+            .block(Block::default().borders(Borders::ALL).title("Error"))
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(error_text, area);
+        return;
+    };
+
+    // Fetch files for this directory
+    let Ok(files) = db.list_files_by_directory(directory_id) else {
+        // Error loading files
+        let error_text = Paragraph::new("Error loading files from database")
+            .block(Block::default().borders(Borders::ALL).title("Error"))
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(error_text, area);
+        return;
+    };
+
+    // Get directory info for breadcrumb (using first file's path or fallback)
+    let directory_path = if let Some(first_file) = files.first() {
+        // Extract directory path from file path
+        std::path::Path::new(&first_file.path).parent().map_or_else(
+            || "Unknown".to_string(),
+            |p| p.to_string_lossy().to_string(),
+        )
+    } else {
+        // Try to get directory info from database
+        if let Ok(directories) = db.list_directories(None) {
+            directories
+                .iter()
+                .find(|d| d.id == directory_id)
+                .map_or_else(|| "Unknown".to_string(), |d| d.path.clone())
+        } else {
+            "Unknown".to_string()
+        }
+    };
+
+    // Render breadcrumb header
+    let breadcrumb = Paragraph::new(format!("Viewing: {directory_path}"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Directory Details"),
+        )
         .style(Style::default());
+    frame.render_widget(breadcrumb, chunks[0]);
 
-    let text =
-        Paragraph::new("Directory detail view (US-016)\n\nPress 'q' or 'h' or Esc to go back")
-            .block(block);
+    // Sort files by size descending (largest first)
+    let mut sorted_files = files;
+    sorted_files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
-    frame.render_widget(text, area);
+    // Update list length for navigation
+    app.list_len.set(sorted_files.len());
+
+    // Clamp selected index to valid range
+    let selected_idx = if sorted_files.is_empty() {
+        0
+    } else {
+        app.selected_index().min(sorted_files.len() - 1)
+    };
+
+    // Build table rows
+    let rows: Vec<Row> = sorted_files
+        .iter()
+        .enumerate()
+        .map(|(idx, file)| {
+            // Extract filename from path
+            let filename = std::path::Path::new(&file.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&file.path);
+            let filename_cell = Cell::from(filename);
+
+            // Format size
+            // Allow: size_bytes is guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
+            #[allow(clippy::cast_sign_loss)]
+            let size_cell = Cell::from(format_bytes(file.size_bytes as u64));
+
+            // Format modified time
+            let modified_str = match jiff::Timestamp::from_second(file.mtime) {
+                Ok(timestamp) => {
+                    // Format as YYYY-MM-DD HH:MM
+                    timestamp
+                        .to_zoned(jiff::tz::TimeZone::system())
+                        .strftime("%Y-%m-%d %H:%M")
+                        .to_string()
+                }
+                Err(_) => "Invalid date".to_string(),
+            };
+            let modified_cell = Cell::from(modified_str);
+
+            // Highlight selected row
+            let style = if idx == selected_idx {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+
+            Row::new(vec![filename_cell, size_cell, modified_cell]).style(style)
+        })
+        .collect();
+
+    // Empty state message
+    if rows.is_empty() {
+        let empty_text = Paragraph::new("No files in this directory")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Files (by size)"),
+            )
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty_text, chunks[1]);
+        return;
+    }
+
+    // Build table
+    let widths = [
+        Constraint::Percentage(50), // Filename
+        Constraint::Percentage(20), // Size
+        Constraint::Percentage(30), // Modified
+    ];
+
+    let table = Table::new(rows, widths)
+        .block(
+            Block::default()
+                .title("Files (by size)")
+                .borders(Borders::ALL),
+        )
+        .header(
+            Row::new(vec![
+                Cell::from("Filename"),
+                Cell::from("Size"),
+                Cell::from("Modified"),
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD))
+            .bottom_margin(1),
+        );
+
+    frame.render_widget(table, chunks[1]);
 }
 
 /// Render the pending approvals view.
@@ -373,7 +531,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         View::DirectoryList => {
             "[j/k] Navigate [g/G] Top/Bottom [s] Sort [Enter] Details [p] Pending [a] Audit [?] Help [q] Quit"
         }
-        View::DirectoryDetail => "[j/k] Navigate [h/Esc] Back [q] Quit",
+        View::DirectoryDetail => "[j/k] Navigate [g/G] Top/Bottom [h/Esc] Back [q] Quit",
         View::PendingApprovals | View::AuditLog => "[j/k] Navigate [Esc] Back [q] Quit",
         View::Help => "[Any key] Close",
     };

@@ -536,3 +536,45 @@
 - None expiration values intentionally sort to beginning (directories without files appear most urgent)
 - Next story is US-016: Implement TUI directory detail view
 - US-016 will implement drill-down into a directory to see individual files
+
+## US-016: Implement TUI directory detail view (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `current_directory_id: Cell<Option<i64>>` field to App state for tracking which directory is being viewed
+- Updated `InputHandler::handle_directory_list()` to transition to DirectoryDetail view on Enter/l keys and reset selected_index
+- Updated `InputHandler::handle_directory_detail()` to handle Esc/h/q for returning to directory list, clearing directory ID and resetting selection
+- Added vim navigation (j/k/g/G) to detail view handler
+- Implemented `render_directory_detail()` function (~160 lines) with:
+  - Breadcrumb header showing directory path
+  - File table with Filename, Size, Modified columns
+  - Files sorted by size descending by default
+  - Empty state handling with user-friendly message
+  - Error handling for no directory selected or database errors
+- Updated footer to show [g/G] Top/Bottom keys in detail view
+- Added 8 unit tests for detail view input handling:
+  - enter_detail_view_on_enter_key, enter_detail_view_on_l_key
+  - exit_detail_view_on_esc, exit_detail_view_on_h_key, exit_detail_view_on_q_key
+  - detail_view_navigation_j_k_works, detail_view_navigation_g_capital_g_works
+  - full_detail_view_navigation_flow (integration test)
+
+**Agent reviews:**
+- nick-isms: Flagged Cell usage as design smell (render shouldn't mutate state), noted missing tests for detail view input, and stringly-typed status. Suggested architectural improvements for future work. Overall: functional but with design issues to address later.
+- testing-guru: Recommended adding 8 critical tests for input handling (all added), noted optional tests for rendering (deferred to manual testing). All critical tests implemented.
+- semver-nag: No semver concerns (binary crate). Cell<Option<i64>> is acceptable, suggested newtype for directory ID (optional), noted growing parameter lists (monitor for future). API design is reasonable.
+
+**Technical notes:**
+- Uses Cell<Option<i64>> for interior mutability since current_directory_id is set during render (directory list sets it based on selected index)
+- This creates a unidirectional data flow pattern: render sets directory ID → input handler reads it → transitions view
+- Alternative approach suggested by nick-isms (cache directory list in App state, input handler determines ID) noted as future improvement
+- Stringly-typed status field is pre-existing technical debt noted by all reviewers (affects db module, not specific to US-016)
+
+**Notes for next agent:**
+- Directory detail view is now feature-complete for US-016
+- All 141 tests pass (133 existing + 8 new)
+- All acceptance criteria met including vim navigation, breadcrumb, and proper error handling
+- Cell pattern works correctly but noted as architectural improvement opportunity for future PR
+- Next story is US-017: Implement TUI approve action
+- US-017 will add 'x' key to approve directory for removal with confirmation prompt
+

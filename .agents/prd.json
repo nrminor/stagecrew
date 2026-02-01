@@ -280,8 +280,8 @@
         "just check passes"
       ],
       "priority": 16,
-      "passes": false,
-      "notes": "Drill-down for investigating large directories."
+      "passes": true,
+      "notes": "Completed: Implemented directory detail view with file table, breadcrumb header, and vim navigation. Added current_directory_id field to App state (using Cell for interior mutability). Handles edge cases: no directory selected, error loading files, empty directories. Added 8 unit tests for input handling. All 141 tests pass. Code review feedback addressed: added critical tests for detail view navigation per testing-guru recommendations. Architectural improvement suggestions from nick-isms (eliminate Cell with directory cache) and semver-nag (consider newtype for directory ID) noted as future enhancements but not blockers for MVP."
     },
     {
       "id": "US-017",
