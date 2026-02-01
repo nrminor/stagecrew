@@ -5,6 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
+use crate::audit::AuditService;
 use crate::config::Config;
 use crate::db::Database;
 use crate::scanner::calculate_expiration;
@@ -30,7 +31,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
         View::DirectoryList => render_directory_list(app, config, db, frame, chunks[0]),
         View::DirectoryDetail => render_directory_detail(app, config, db, frame, chunks[0]),
         View::PendingApprovals => render_pending_approvals(app, config, db, frame, chunks[0]),
-        View::AuditLog => render_audit_log(app, frame, chunks[0]),
+        View::AuditLog => render_audit_log(app, db, frame, chunks[0]),
         View::Help => render_help(app, frame, chunks[0]),
     }
 
@@ -645,17 +646,104 @@ fn render_pending_header(pending_count: usize, frame: &mut Frame, area: ratatui:
 
 /// Render the audit log view.
 ///
-/// This is a placeholder implementation that will be expanded in US-021.
-fn render_audit_log(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let block = Block::default()
-        .title("Audit Log")
-        .borders(Borders::ALL)
-        .style(Style::default());
+/// Displays recent audit entries showing timestamp, user, action, and path.
+/// The view is scrollable and shows the most recent entries first.
+fn render_audit_log(app: &App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
+    // Fetch recent audit entries (limit to 1000 for now)
+    let audit = AuditService::new(db);
+    let Ok(entries) = audit.list_recent(1000) else {
+        // Error handling: show error message
+        let error_text = Paragraph::new("Error loading audit log from database")
+            .block(Block::default().borders(Borders::ALL).title("Error"))
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(error_text, area);
+        return;
+    };
 
-    let text =
-        Paragraph::new("Audit log view (US-021)\n\nPress 'q' or Esc to go back").block(block);
+    // Update list length for navigation
+    app.list_len.set(entries.len());
 
-    frame.render_widget(text, area);
+    // Clamp selected index to valid range
+    let selected_idx = if entries.is_empty() {
+        0
+    } else {
+        app.selected_index().min(entries.len() - 1)
+    };
+
+    // Handle empty state
+    if entries.is_empty() {
+        let empty_text = Paragraph::new("No audit entries found.\n\nPress 'q' or Esc to go back")
+            .block(Block::default().borders(Borders::ALL).title("Audit Log"))
+            .style(Style::default());
+        frame.render_widget(empty_text, area);
+        return;
+    }
+
+    // Build table rows
+    let rows: Vec<Row> = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            // Format timestamp as human-readable in local timezone
+            let timestamp_str = format_timestamp(entry.timestamp);
+            let timestamp_cell = Cell::from(timestamp_str);
+
+            let user_cell = Cell::from(entry.user.as_str());
+            let action_cell = Cell::from(entry.action.as_str());
+
+            let path_str = entry.target_path.as_deref().unwrap_or("<system-wide>");
+            let path_cell = Cell::from(path_str);
+
+            // Highlight selected row
+            let style = if idx == selected_idx {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+
+            Row::new(vec![timestamp_cell, user_cell, action_cell, path_cell]).style(style)
+        })
+        .collect();
+
+    // Build table
+    let widths = [
+        Constraint::Percentage(20), // Timestamp
+        Constraint::Percentage(15), // User
+        Constraint::Percentage(15), // Action
+        Constraint::Percentage(50), // Path
+    ];
+
+    let table = Table::new(rows, widths)
+        .block(
+            Block::default()
+                .title("Audit Log (Most Recent First)")
+                .borders(Borders::ALL),
+        )
+        .header(
+            Row::new(vec![
+                Cell::from("Timestamp"),
+                Cell::from("User"),
+                Cell::from("Action"),
+                Cell::from("Path"),
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD))
+            .bottom_margin(1),
+        );
+
+    frame.render_widget(table, area);
+}
+
+/// Format a Unix timestamp as a human-readable string in local timezone.
+///
+/// Formats as "YYYY-MM-DD HH:MM:SS" in local time.
+fn format_timestamp(timestamp: i64) -> String {
+    // Convert Unix timestamp to jiff::Timestamp
+    let ts = jiff::Timestamp::from_second(timestamp).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+
+    // Format in local timezone as "YYYY-MM-DD HH:MM:SS"
+    ts.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 /// Render the help view.
@@ -700,7 +788,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         View::PendingApprovals => {
             "[j/k] Navigate [g/G] Top/Bottom [x] Approve [d] Defer [i] Ignore [s] Sort [Esc] Back [q] Quit"
         }
-        View::AuditLog => "[j/k] Navigate [Esc] Back [q] Quit",
+        View::AuditLog => "[j/k] Navigate [g/G] Top/Bottom [Esc] Back [q] Quit",
         View::Help => "[Any key] Close",
     };
 
@@ -1084,5 +1172,72 @@ mod tests {
         // Ignored should be gray regardless of expiration
         let style = determine_row_style("ignored", Some(-10), 14);
         assert_eq!(style.fg, Some(Color::DarkGray));
+    }
+
+    // Tests for format_timestamp
+
+    #[test]
+    fn format_timestamp_formats_correctly() {
+        // 2024-01-15 14:32:45 UTC
+        let ts = 1_705_329_165;
+        let result = format_timestamp(ts);
+
+        // Verify it contains expected date components
+        // (exact time depends on local timezone, so we check for date)
+        assert!(
+            result.contains("2024"),
+            "Should contain year 2024, got: {result}"
+        );
+        assert!(
+            result.contains("01") || result.contains("1-"),
+            "Should contain month 01, got: {result}"
+        );
+        assert!(
+            result.contains("15") || result.contains("14") || result.contains("16"),
+            "Should contain day 14-16 (timezone variance), got: {result}"
+        );
+    }
+
+    #[test]
+    fn format_timestamp_handles_unix_epoch() {
+        let result = format_timestamp(0);
+        // Unix epoch is 1970-01-01 00:00:00 UTC
+        // Local timezone may shift this slightly, but should contain 1969 or 1970
+        assert!(
+            result.contains("1970") || result.contains("1969"),
+            "Should contain year 1970 or 1969, got: {result}"
+        );
+    }
+
+    #[test]
+    fn format_timestamp_handles_invalid_timestamp_gracefully() {
+        // Timestamp that would fail conversion - should fall back to UNIX_EPOCH
+        let result = format_timestamp(i64::MIN);
+        // Should not panic and should return something reasonable
+        assert!(
+            !result.is_empty(),
+            "Should return non-empty string even for invalid timestamp"
+        );
+    }
+
+    #[test]
+    fn format_timestamp_includes_time_components() {
+        // 2024-06-15 09:30:45 UTC
+        let ts = 1_718_443_845;
+        let result = format_timestamp(ts);
+
+        // Verify format includes time separator ':'
+        assert!(
+            result.contains(':'),
+            "Should include time separator ':', got: {result}"
+        );
+
+        // Verify format roughly matches "YYYY-MM-DD HH:MM:SS"
+        // We check for two colons (HH:MM:SS)
+        assert_eq!(
+            result.matches(':').count(),
+            2,
+            "Should have exactly 2 colons for HH:MM:SS format, got: {result}"
+        );
     }
 }

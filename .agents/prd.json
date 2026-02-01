@@ -365,8 +365,8 @@
         "just check passes"
       ],
       "priority": 21,
-      "passes": false,
-      "notes": "Read-only view of audit trail."
+      "passes": true,
+      "notes": "Completed: Implemented render_audit_log() with table view (Timestamp, User, Action, Path columns). Added format_timestamp() helper (YYYY-MM-DD HH:MM:SS format in local timezone). Updated handle_audit_log() to support g/G/h navigation keys. Added 6 input handler tests + 4 format_timestamp unit tests. Footer hints updated with g/G keys. All 182 tests pass. Code reviews addressed: moved local imports to top of file, added selected_index reset on view entry, added comprehensive unit tests for format_timestamp."
     },
     {
       "id": "US-022",

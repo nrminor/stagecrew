@@ -739,3 +739,42 @@
 - Next story is US-021: Implement TUI audit log view
 - US-021 will implement 'a' key to show recent audit entries (most recent first) with columns for Timestamp, User, Action, Path
 
+
+## US-021: Implement TUI audit log view (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Implemented `render_audit_log()` in src/tui/ui.rs:
+  - Fetches recent audit entries (limit 1000) using `AuditService::list_recent()`
+  - Displays table with Timestamp, User, Action, Path columns
+  - Supports scrolling with j/k/g/G navigation
+  - Shows most recent entries first
+  - Handles empty state and error cases gracefully
+- Added `format_timestamp(i64) -> String` helper function to format Unix timestamps as "YYYY-MM-DD HH:MM:SS" in local timezone
+- Updated `handle_audit_log()` in src/tui/input.rs:
+  - Added g key to go to top
+  - Added G key to go to bottom
+  - Added h key to return to directory list (in addition to q/Esc)
+  - Resets selected_index when entering audit log view
+- Updated footer keybinding hints to include "g/G Top/Bottom"
+- Added 10 comprehensive unit tests:
+  - 6 input handler tests (exits_on_q/esc/h, navigation_j_k, navigation_g_capital_g, full_navigation_flow)
+  - 4 format_timestamp tests (formats_correctly, handles_unix_epoch, handles_invalid_timestamp, includes_time_components)
+
+**Agent reviews:**
+- nick-isms: B+ grade. Identified local imports (fixed by moving to top of file), suggested selection reset on view entry (added), recommended format_timestamp unit tests (added). All high-priority issues addressed.
+- testing-guru: Good coverage. Recommended format_timestamp tests and empty state test. Added 4 format_timestamp tests. Empty state test noted as optional (rendering concern, acceptable technical debt).
+- semver-nag: No semver concerns (binary crate). Flagged format_bytes duplication across main.rs and ui.rs (noted as tech debt, not blocking). API design approved.
+
+**Technical debt documented:**
+- format_bytes() duplicated in main.rs and ui.rs - should be extracted to shared module (tracked as future work)
+- format_timestamp() and similar pattern in render_directory_detail could be unified (minor, intentional format differences)
+
+**Notes for next agent:**
+- Audit log view is now feature-complete for US-021
+- All 182 tests pass (172 existing + 6 input handler + 4 format_timestamp)
+- All acceptance criteria met and verified
+- Code follows project conventions with no local imports
+- Next story is US-022: Implement TUI help view
+- US-022 will implement '?' key to show keybinding reference

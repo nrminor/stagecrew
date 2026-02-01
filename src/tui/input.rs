@@ -80,7 +80,10 @@ impl InputHandler {
 
             // Views
             KeyCode::Char('p') => app.view = View::PendingApprovals,
-            KeyCode::Char('a') => app.view = View::AuditLog,
+            KeyCode::Char('a') => {
+                app.view = View::AuditLog;
+                app.selected_index = 0; // Reset selection for audit log
+            }
             KeyCode::Char('?') => app.view = View::Help,
 
             // Approve removal (US-017)
@@ -414,13 +417,17 @@ impl InputHandler {
 
     fn handle_audit_log(app: &mut App, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => app.view = View::DirectoryList,
+            KeyCode::Char('q' | 'h') | KeyCode::Esc => {
+                app.view = View::DirectoryList;
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 app.selected_index = app.selected_index.saturating_add(1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 app.selected_index = app.selected_index.saturating_sub(1);
             }
+            KeyCode::Char('g') => app.selected_index = 0, // Go to top
+            KeyCode::Char('G') => app.select_last(app.list_len.get()), // Go to bottom
             _ => {}
         }
     }
@@ -2088,6 +2095,157 @@ mod tests {
         assert!(
             app.pending_ignore.is_none(),
             "Pending ignore should not be set for non-pending directory"
+        );
+    }
+
+    #[test]
+    fn audit_log_view_exits_on_q() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.view = View::AuditLog;
+
+        // Press 'q' to exit
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('q')),
+        );
+
+        assert_eq!(
+            app.view,
+            View::DirectoryList,
+            "Should return to DirectoryList view"
+        );
+    }
+
+    #[test]
+    fn audit_log_view_exits_on_esc() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.view = View::AuditLog;
+
+        // Press Esc to exit
+        InputHandler::handle(&mut app, &test_config(), &db, make_key_event(KeyCode::Esc));
+
+        assert_eq!(
+            app.view,
+            View::DirectoryList,
+            "Should return to DirectoryList view"
+        );
+    }
+
+    #[test]
+    fn audit_log_view_exits_on_h() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.view = View::AuditLog;
+
+        // Press 'h' to go back
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('h')),
+        );
+
+        assert_eq!(
+            app.view,
+            View::DirectoryList,
+            "Should return to DirectoryList view"
+        );
+    }
+
+    #[test]
+    fn audit_log_view_navigation_j_k_works() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.view = View::AuditLog;
+        app.selected_index = 0;
+
+        // Press 'j' to move down
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('j')),
+        );
+        assert_eq!(app.selected_index, 1, "j should move down");
+
+        // Press 'k' to move up
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('k')),
+        );
+        assert_eq!(app.selected_index, 0, "k should move up");
+    }
+
+    #[test]
+    fn audit_log_view_navigation_g_capital_g_works() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        app.view = View::AuditLog;
+        app.selected_index = 5;
+        app.list_len.set(10);
+
+        // Press 'g' to go to top
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('g')),
+        );
+        assert_eq!(app.selected_index, 0, "g should go to top");
+
+        // Press 'G' to go to bottom
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('G')),
+        );
+        assert_eq!(app.selected_index, 9, "G should go to bottom (last item)");
+    }
+
+    #[test]
+    fn audit_log_view_full_navigation_flow() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+
+        // Start in directory list
+        assert_eq!(app.view, View::DirectoryList);
+
+        // Press 'a' to enter audit log view
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('a')),
+        );
+        assert_eq!(app.view, View::AuditLog, "Should switch to AuditLog view");
+
+        // Navigate within audit log
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('j')),
+        );
+        assert_eq!(app.selected_index, 1);
+
+        // Exit audit log view
+        InputHandler::handle(
+            &mut app,
+            &test_config(),
+            &db,
+            make_key_event(KeyCode::Char('q')),
+        );
+        assert_eq!(
+            app.view,
+            View::DirectoryList,
+            "Should return to DirectoryList view"
         );
     }
 }
