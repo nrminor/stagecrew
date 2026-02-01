@@ -39,8 +39,6 @@ const SECS_PER_DAY: i64 = 86400;
 /// // In real code: let days_remaining = calculate_expiration(thirty_days_ago.as_second(), 90);
 /// // assert!(days_remaining > 59 && days_remaining <= 60);
 /// ```
-// TODO(cleanup): Remove allow once daemon or TUI uses this function.
-#[allow(dead_code)]
 #[must_use = "expiration calculation result should be used"]
 pub fn calculate_expiration(oldest_mtime: i64, expiration_days: u32) -> i64 {
     let now = jiff::Timestamp::now();
@@ -92,8 +90,6 @@ pub fn calculate_expiration(oldest_mtime: i64, expiration_days: u32) -> i64 {
 /// // println!("Transitioned {} to pending, {} reset from deferred",
 /// //          summary.expired_to_pending, summary.deferred_reset);
 /// ```
-// TODO(cleanup): Remove allow once daemon uses this function.
-#[allow(dead_code)]
 #[must_use = "transition summary should be logged or displayed"]
 pub fn transition_expired_paths(
     db: &Database,
@@ -204,8 +200,6 @@ pub fn transition_expired_paths(
 ///
 /// This struct is marked `#[non_exhaustive]`; new fields may be added in
 /// minor versions. Use `..` when destructuring to remain forward-compatible.
-// TODO(cleanup): Remove allow once daemon or TUI displays this summary.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 #[must_use = "transition summary should be logged or displayed"]
 #[non_exhaustive]
@@ -453,8 +447,6 @@ fn update_stats(
 }
 
 /// Summary of a scan-and-persist operation.
-// TODO(cleanup): Remove allow once main.rs or TUI displays this summary.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 // Allow: The `total_` prefix provides clarity that these are aggregate counts
 // across the entire scan operation, not per-directory values.
@@ -472,8 +464,6 @@ pub struct ScanSummary {
 /// The scanner uses jwalk for parallel filesystem traversal, collecting file metadata
 /// including size and modification time. Symlinks are resolved to track the actual
 /// file's mtime, and permission errors are handled gracefully with warnings.
-// TODO(cleanup): Remove allow once database integration uses this struct.
-#[allow(dead_code)]
 pub struct Scanner {
     // Configuration will be added here
 }
@@ -675,8 +665,6 @@ struct DirectoryAggregator {
 ///
 /// Contains aggregated statistics about the scanned tree, including total file counts,
 /// total size, and per-directory information.
-// TODO(cleanup): Remove allow once database integration reads these fields.
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 #[must_use = "scan results should be processed"]
 #[non_exhaustive]
@@ -691,8 +679,6 @@ pub struct ScanResult {
 /// Represents aggregated metadata for all files within a directory. The `oldest_mtime`
 /// field tracks the oldest modification time of any file in the directory, which is used
 /// for expiration calculations.
-// TODO(cleanup): Remove allow once database integration reads these fields.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DirectoryInfo {

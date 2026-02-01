@@ -328,7 +328,7 @@ fn format_bytes(bytes: u64) -> String {
 #[allow(clippy::too_many_lines)]
 fn render_directory_detail(
     app: &App,
-    config: &Config,
+    _config: &Config,
     db: &Database,
     frame: &mut Frame,
     area: ratatui::layout::Rect,

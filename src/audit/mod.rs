@@ -6,9 +6,6 @@ use crate::db::Database;
 use crate::error::Result;
 
 /// Actions that can be recorded in the audit log.
-// TODO(cleanup): Remove allow once TUI, daemon, or scanner modules use this type.
-// This is part of the public audit API for US-005.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuditAction {
@@ -17,12 +14,13 @@ pub enum AuditAction {
     Ignore,
     Remove,
     Scan,
+    // Allow: ConfigChange variant is part of the public API for future config audit logging.
+    // Not yet implemented but reserved for tracking configuration changes.
+    #[allow(dead_code)]
     ConfigChange,
 }
 
 impl AuditAction {
-    // TODO(cleanup): Remove allow once record() is called by other modules.
-    #[allow(dead_code)]
     fn as_str(self) -> &'static str {
         match self {
             Self::Approve => "approve",
@@ -36,17 +34,12 @@ impl AuditAction {
 }
 
 /// Service for recording and querying audit events.
-// TODO(cleanup): Remove allow once TUI, daemon, or scanner modules instantiate this.
-// This is the main service struct for US-005.
-#[allow(dead_code)]
 pub struct AuditService<'a> {
     db: &'a Database,
 }
 
 impl<'a> AuditService<'a> {
     /// Create a new audit service.
-    // TODO(cleanup): Remove allow once other modules use this constructor.
-    #[allow(dead_code)]
     pub fn new(db: &'a Database) -> Self {
         Self { db }
     }
@@ -60,8 +53,6 @@ impl<'a> AuditService<'a> {
     /// # Errors
     ///
     /// Returns an error if the database insert fails.
-    // TODO(cleanup): Remove allow once TUI/daemon record actions.
-    #[allow(dead_code)]
     pub fn record(
         &self,
         user: &str,
@@ -82,8 +73,6 @@ impl<'a> AuditService<'a> {
     ///
     /// Checks `$USER` and `$LOGNAME` environment variables in that order.
     /// Returns `"unknown"` if neither is set.
-    // TODO(cleanup): Remove allow once other modules call this for audit records.
-    #[allow(dead_code)]
     #[must_use]
     pub fn current_user() -> String {
         std::env::var("USER")
@@ -99,8 +88,6 @@ impl<'a> AuditService<'a> {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    // TODO(cleanup): Remove allow once TUI audit log view calls this.
-    #[allow(dead_code)]
     pub fn list_recent(&self, limit: usize) -> Result<Vec<AuditEntry>> {
         let mut stmt = self.db.conn().prepare(
             "SELECT id, timestamp, user, action, target_path, details, directory_id
@@ -138,7 +125,8 @@ impl<'a> AuditService<'a> {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    // TODO(cleanup): Remove allow once TUI detail view calls this.
+    // Allow: Part of the public audit API. May be used by future TUI detail view
+    // to show path-specific history. Currently unused but part of the stable API.
     #[allow(dead_code)]
     pub fn list_by_path(&self, path: &str) -> Result<Vec<AuditEntry>> {
         let mut stmt = self.db.conn().prepare(
@@ -171,10 +159,12 @@ impl<'a> AuditService<'a> {
 /// Note: The `action` field is a `String` (the raw database value) rather than
 /// `AuditAction` to maintain flexibility. This allows the database to contain
 /// historical actions that may not be present in the current enum definition.
-// TODO(cleanup): Remove allow once TUI displays audit entries.
-#[allow(dead_code)]
 #[derive(Debug)]
 #[non_exhaustive]
+// Allow: Public struct fields are part of the API. Fields like `id`, `details`, and
+// `directory_id` are not directly accessed in the current codebase but are available
+// for external consumers and future TUI enhancements.
+#[allow(dead_code)]
 pub struct AuditEntry {
     pub id: i64,
     pub timestamp: i64,

@@ -69,19 +69,6 @@ impl AppPaths {
         // Priority 3: Fall back to XDG data directory
         self.xdg.place_data_file("stagecrew.db")
     }
-
-    /// Path to log directory: `~/.local/state/stagecrew/`
-    ///
-    /// Creates the directory if it doesn't exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the log directory cannot be created.
-    // TODO(cleanup): Remove allow once log_dir is wired into daemon.
-    #[allow(dead_code)]
-    pub fn log_dir(&self) -> std::io::Result<PathBuf> {
-        self.xdg.create_state_directory("")
-    }
 }
 
 impl Default for AppPaths {

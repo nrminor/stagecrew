@@ -1,9 +1,5 @@
 //! TUI application state and main loop.
 
-// TODO(cleanup): Remove these allows as TUI is fully implemented.
-// Tracking issue: TUI module is stubbed, awaiting full implementation.
-#![allow(dead_code, unused)]
-
 mod input;
 mod ui;
 
@@ -56,6 +52,9 @@ pub struct App {
     pub(crate) sort_mode: SortMode,
 
     /// Filter for days until expiration.
+    // Allow: Planned feature for filtering directory list by expiration days.
+    // Reserved for future implementation.
+    #[allow(dead_code)]
     pub(crate) filter_days: Option<u32>,
 
     /// Length of the current list (updated by render, used for navigation bounds).
@@ -94,6 +93,8 @@ impl App {
     }
 
     /// Get the filter for days until expiration.
+    // Allow: Getter for filter_days field which is planned for future implementation.
+    #[allow(dead_code)]
     pub fn filter_days(&self) -> Option<u32> {
         self.filter_days
     }
@@ -234,8 +235,15 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if terminal setup fails or if rendering encounters an I/O error.
-    // TODO(cleanup): Remove allow once TUI main loop becomes async (e.g., async database queries).
-    // Currently sync event polling doesn't require await, but keeping async for future compatibility.
+    ///
+    /// # Note on async signature
+    ///
+    /// This function is async for future compatibility when async database queries
+    /// are integrated. Currently the event loop is synchronous but maintaining the
+    /// async signature allows smooth transition to async operations without breaking
+    /// the API.
+    // Allow: Async signature maintained for future compatibility when async database
+    // queries are integrated. This prevents a breaking API change later.
     #[allow(clippy::unused_async)]
     pub async fn run(&mut self, config: &Config, db: &Database) -> Result<()> {
         let mut terminal_manager = TerminalManager::setup().map_err(crate::error::Error::Io)?;

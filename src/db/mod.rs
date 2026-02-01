@@ -10,8 +10,6 @@ use crate::error::{Error, Result};
 ///
 /// Represents a directory being monitored by stagecrew. Contains aggregated
 /// statistics about files within the directory and the current lifecycle status.
-// TODO(cleanup): Remove allow once Directory is used by scanner/TUI modules.
-#[allow(dead_code)]
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directory {
@@ -41,8 +39,6 @@ pub struct Directory {
 ///
 /// Represents an individual file with its metadata. Files are associated with
 /// a parent directory via `directory_id`.
-// TODO(cleanup): Remove allow once File is used by scanner/TUI modules.
-#[allow(dead_code)]
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
@@ -145,8 +141,6 @@ impl Database {
     ///
     /// This exposes `rusqlite::Connection` directly. The database schema
     /// is not part of the stable API and may change between versions.
-    // TODO(cleanup): Remove allow once conn() is used by service layer.
-    #[allow(dead_code)]
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -172,8 +166,6 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    // TODO(cleanup): Remove allow once used by scanner module.
-    #[allow(dead_code)]
     pub fn insert_or_update_directory(
         &self,
         path: &str,
@@ -217,8 +209,6 @@ impl Database {
     /// Returns an error if:
     /// - The `directory_id` does not exist (foreign key constraint)
     /// - The database operation fails
-    // TODO(cleanup): Remove allow once used by scanner module.
-    #[allow(dead_code)]
     pub fn insert_or_update_file(
         &self,
         directory_id: i64,
@@ -247,7 +237,8 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    // TODO(cleanup): Remove allow once used by TUI/daemon modules.
+    // Allow: Part of the public database API. May be used by future TUI features or
+    // external tools. Currently unused but maintained for API completeness.
     #[allow(dead_code)]
     pub fn get_directory_by_path(&self, path: &str) -> Result<Option<Directory>> {
         let mut stmt = self.conn.prepare(
@@ -278,19 +269,9 @@ impl Database {
 
     /// List all directories, optionally filtered by status.
     ///
-    /// # Arguments
-    ///
-    /// * `status_filter` - If provided, only return directories with this status
-    ///
-    /// # Returns
-    ///
-    /// A vector of all matching directories, ordered by path.
-    ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    // TODO(cleanup): Remove allow once used by TUI module.
-    #[allow(dead_code)]
     pub fn list_directories(&self, status_filter: Option<&str>) -> Result<Vec<Directory>> {
         // Helper to map database rows to Directory structs
         let row_to_directory = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Directory> {
@@ -346,8 +327,6 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    // TODO(cleanup): Remove allow once used by TUI module.
-    #[allow(dead_code)]
     pub fn list_files_by_directory(&self, directory_id: i64) -> Result<Vec<File>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, directory_id, path, size_bytes, mtime, created_at
@@ -387,8 +366,6 @@ impl Database {
     /// - The `directory_id` does not exist
     /// - The `new_status` violates the CHECK constraint
     /// - The database operation fails
-    // TODO(cleanup): Remove allow once used by TUI/daemon modules.
-    #[allow(dead_code)]
     pub fn update_directory_status(&self, directory_id: i64, new_status: &str) -> Result<()> {
         let rows_affected = self.conn.execute(
             "UPDATE directories

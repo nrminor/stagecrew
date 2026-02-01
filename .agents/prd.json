@@ -464,8 +464,8 @@
         "just check passes"
       ],
       "priority": 27,
-      "passes": false,
-      "notes": "Final cleanup before MVP is complete."
+      "passes": true,
+      "notes": "Completed: Removed all TODO(cleanup) comments and temporary #[allow] attributes. Module-level #![allow(dead_code, unused)] removed from tui/mod.rs. Replaced temporary allows with properly justified permanent allows for public API items reserved for future use (AuditAction::ConfigChange, AuditService::list_by_path, AuditEntry, Database::get_directory_by_path, RemovalSummary::empty, App::filter_days). Removed AppPaths::log_dir() per semver-nag recommendation (untested, unused, vague justification). All remaining allows follow AGENTS.md policy with clear justifications. All 282 tests pass, no clippy warnings, docs build successfully."
     }
   ]
 }

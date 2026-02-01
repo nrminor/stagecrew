@@ -7,16 +7,12 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 
 /// Handles file and directory removal with safety checks.
-// TODO(cleanup): Remove allow once daemon module uses RemovalService.
-#[allow(dead_code)]
 pub struct RemovalService {
     dry_run: bool,
 }
 
 impl RemovalService {
     /// Create a new removal service.
-    // TODO(cleanup): Remove allow once daemon module constructs RemovalService.
-    #[allow(dead_code)]
     #[must_use]
     pub fn new(dry_run: bool) -> Self {
         Self { dry_run }
@@ -94,8 +90,6 @@ pub enum RemovalOutcome {
 ///
 /// Returns an error if database operations fail. Individual removal failures
 /// are handled gracefully and recorded in the summary (not propagated).
-// TODO(cleanup): Remove allow once daemon module calls this function.
-#[allow(dead_code)]
 pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
     let audit = AuditService::new(db);
     let user = AuditService::current_user();
@@ -193,24 +187,18 @@ pub struct RemovalSummary {
 
 impl RemovalSummary {
     /// Number of directories successfully removed.
-    // TODO(cleanup): Remove allow once daemon module uses RemovalSummary.
-    #[allow(dead_code)]
     #[must_use]
     pub const fn removed_count(&self) -> usize {
         self.removed_count
     }
 
     /// Number of directories that could not be removed (blocked).
-    // TODO(cleanup): Remove allow once daemon module uses RemovalSummary.
-    #[allow(dead_code)]
     #[must_use]
     pub const fn blocked_count(&self) -> usize {
         self.blocked_count
     }
 
     /// Total bytes freed from successful removals.
-    // TODO(cleanup): Remove allow once daemon module uses RemovalSummary.
-    #[allow(dead_code)]
     #[must_use]
     pub const fn total_bytes_freed(&self) -> i64 {
         self.total_bytes_freed
@@ -219,7 +207,8 @@ impl RemovalSummary {
     /// Create an empty summary with all counts at zero.
     ///
     /// Primarily useful for testing or initialization.
-    // TODO(cleanup): Remove allow once daemon module uses RemovalSummary.
+    // Allow: Used in tests for creating empty summaries. Part of the public API
+    // for testing and initialization scenarios.
     #[allow(dead_code)]
     pub const fn empty() -> Self {
         Self {
