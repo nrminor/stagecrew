@@ -87,8 +87,8 @@
         "just check passes"
       ],
       "priority": 5,
-      "passes": false,
-      "notes": "Audit trail is critical for accountability among multiple users."
+      "passes": true,
+      "notes": "Completed: Implemented all methods (record, current_user, list_recent, list_by_path) with comprehensive unit tests. Added #[non_exhaustive] to AuditAction and AuditEntry per semver-nag review. Removed module-level #[allow] attributes, replacing with item-level allows with TODO(cleanup) tags. Added 12 unit tests including edge cases (empty db, zero limit, no target_path). Documented decision to keep AuditEntry::action as String rather than AuditAction enum for flexibility with historical data. All three reviewers provided feedback: nick-isms noted cast justification (added), testing-guru recommended edge case tests (added 3 tests), semver-nag approved API design with note about action field being String (documented). Future consideration: builder pattern for record() method before 1.0 (tracked as technical debt)."
     },
     {
       "id": "US-006",
