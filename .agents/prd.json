@@ -178,8 +178,8 @@
         "just check passes"
       ],
       "priority": 10,
-      "passes": false,
-      "notes": "First command users will run."
+      "passes": true,
+      "notes": "Completed: Refactored main() to handle init separately before loading config (since config might not exist yet). Created handle_init() function that checks if config exists, creates default if missing, loads existing otherwise, initializes database (idempotent), and prints appropriate messages. All acceptance criteria met. Code reviews: nick-isms noted good implementation with minor messaging improvements (addressed), testing-guru confirmed existing unit tests are sufficient given simplicity, semver-nag confirmed no public API changes and good CLI design with idempotent behavior."
     },
     {
       "id": "US-011",
