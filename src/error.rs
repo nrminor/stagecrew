@@ -6,6 +6,7 @@ use thiserror::Error;
 
 /// Core error type for stagecrew operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("configuration error: {0}")]
     Config(String),
@@ -20,13 +21,9 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    // TODO(cleanup): Remove allow once removal module is integrated.
-    // These variants are defined for the removal workflow.
-    #[allow(dead_code)]
     #[error("permission denied: {0}")]
     PermissionDenied(PathBuf),
 
-    #[allow(dead_code)]
     #[error("path not found: {0}")]
     PathNotFound(PathBuf),
 
