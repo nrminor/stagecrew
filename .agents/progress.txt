@@ -817,3 +817,47 @@
   5. ✅ just check passes (all tests green)
 - Next story is US-023: Implement TUI footer with keybinding hints
 - US-023 should verify that footer is already implemented (added in US-013-014) with context-sensitive hints for each view
+
+## US-023: Implement TUI footer with keybinding hints (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Status:** Verified complete - implementation already existed from earlier stories
+
+**What was verified:**
+- `render_footer` function exists in src/tui/ui.rs (lines 791-807)
+- Footer shows context-sensitive keybinding hints via exhaustive match on `app.view()`
+- All 5 views have appropriate hints:
+  - DirectoryList: Full action set with navigation, sorting, all actions (d/i/x), view switching (p/a/?), quit
+  - DirectoryDetail: Navigation (j/k/g/G), back (h/Esc), quit
+  - PendingApprovals: Actions (x/d/i), navigation (j/k/g/G), sorting (s), back (Esc), quit
+  - AuditLog: Navigation (j/k/g/G), back (Esc), quit
+  - Help: Any key closes
+- Footer styled distinctly with inverse colors (black fg on gray bg)
+- Called from main `render()` function (line 39)
+
+**Acceptance criteria verification:**
+1. ✅ Footer bar shows context-sensitive keybinding hints (exhaustive match on View enum)
+2. ✅ Directory list shows comprehensive hints matching AC (exact match on line 794)
+3. ✅ Adapts to current view (match statement with 5 different hint strings)
+4. ✅ Styled distinctly from main content (inverse colors: black on gray)
+5. ✅ just check passes (all 182 tests pass)
+
+**Agent reviews:**
+- nick-isms: Grade B+, APPROVED. Implementation is correct and meets all acceptance criteria. Code is readable with exhaustive match (compiler-enforced correctness). Minor observation: `ratatui::layout::Rect` fully-qualified path is a file-wide pattern (affects ~8 function signatures), could extract to import for consistency but not blocking for this story. Overall solid implementation with good defensive patterns.
+- testing-guru: APPROVED - no additional tests needed. The exhaustive match on `View` enum means compiler enforces correctness (adding a new view forces updating render_footer). Function is pure mapping from View → &'static str with no complex logic, edge cases, or error paths. The 60+ input tests provide integration coverage. Only possible "bug" is typo in hint text (cosmetic, not functional). Type system already provides compile-time guarantees that property-based tests would verify.
+- semver-nag: APPROVED - good API design. `render_footer` correctly scoped as private function (implementation detail of public `render()`). Footer string format is UI text, freely changeable without version bumps. `#[non_exhaustive]` on View/SortMode enums is defensive design. `pub(crate)` visibility hierarchy is clean. Private fields with getters provide good encapsulation. No semver concerns for binary crate at 0.1.0.
+
+**Technical notes:**
+- Implementation was incrementally completed during US-014 (directory list hints), US-015 (sort hints), US-016 (detail view hints), US-017-019 (action hints), US-020 (pending approvals hints), US-021 (audit log hints), US-022 (help view hints)
+- This story verified completeness and solicited code reviews
+- Exhaustive match guarantees compiler will catch missing views if new variants added
+- No unit tests needed - type system provides correctness guarantee, integration tests cover view state machine
+
+**Notes for next agent:**
+- Footer implementation is verified complete for US-023
+- All 182 tests pass, clippy clean, docs build successfully
+- Code reviews from all three specialists confirm high quality implementation
+- Optional future improvement: Extract `Rect` to module-level import (file-wide pattern, not specific to render_footer)
+- Next story is US-024: Implement daemon main loop
+- US-024 will implement the background daemon that orchestrates: scan → transition expired → remove approved → sleep
