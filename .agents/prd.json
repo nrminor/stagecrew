@@ -68,8 +68,8 @@
         "just check passes"
       ],
       "priority": 4,
-      "passes": false,
-      "notes": "Core data access layer. Keep queries simple and explicit."
+      "passes": true,
+      "notes": "Completed: Implemented all CRUD operations with comprehensive unit tests (16 tests total). Added #[non_exhaustive] to Directory and File structs per semver-nag review. Fixed code duplication in list_directories() by extracting row mapping helper. Added tests verifying UPSERT preserves status and deferred_until fields (critical for workflow integrity). All #[allow(dead_code)] annotations properly justified with TODO(cleanup) tags."
     },
     {
       "id": "US-005",

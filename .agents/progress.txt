@@ -83,3 +83,42 @@
 - `conn()` method has `#[allow(dead_code)]` - will be used by service layer in US-004
 - Next story is US-004: Implement directory and file CRUD operations
 - The Directory and File structs need to be defined, along with CRUD methods on Database
+
+## US-004: Implement directory and file CRUD operations (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `Directory` struct (11 fields: id, path, size_bytes, file_count, oldest_mtime, last_scanned, status, deferred_until, created_at, updated_at)
+- Added `File` struct (6 fields: id, directory_id, path, size_bytes, mtime, created_at)
+- Both structs marked `#[non_exhaustive]` for semver safety
+- Implemented `insert_or_update_directory()` with UPSERT logic that preserves status, deferred_until, created_at
+- Implemented `insert_or_update_file()` with UPSERT logic
+- Implemented `get_directory_by_path()` returning `Option<Directory>`
+- Implemented `list_directories()` with optional status filter (refactored to eliminate code duplication)
+- Implemented `list_files_by_directory()` for given directory_id
+- Implemented `update_directory_status()` changing status and updating updated_at timestamp
+- All methods have comprehensive doc comments with `# Errors` sections
+- All methods have `#[allow(dead_code)]` with TODO(cleanup) justification
+- Added 16 unit tests (34 total in db module):
+  - insert_or_update_directory: creates new, updates existing, preserves status on update, preserves deferred_until on update
+  - get_directory_by_path: returns None when not found
+  - list_directories: returns all, filters by status
+  - update_directory_status: changes status and timestamp, fails on nonexistent ID, rejects invalid status
+  - insert_or_update_file: creates new, updates existing, fails with invalid directory_id
+  - list_files_by_directory: returns empty for nonexistent directory, returns all files
+  - cascade_delete: removes files when directory deleted
+
+**Agent reviews:**
+- nick-isms: Flagged code duplication in list_directories (fixed by extracting row_to_directory helper), stringly-typed status (documented as future work), missing runtime assertions (noted for future)
+- testing-guru: Flagged missing tests for UPSERT preserving status/deferred_until (added both), comprehensive coverage feedback
+- semver-nag: Recommended #[non_exhaustive] on Directory and File (added), flagged stringly-typed status as semver risk (documented as future work)
+
+**Notes for next agent:**
+- Database CRUD layer is now feature-complete for US-004
+- All operations properly use UPSERT to handle scan updates without resetting workflow state
+- Status and deferred_until preservation is explicitly tested (critical for approval workflow)
+- `#[non_exhaustive]` on Directory and File allows adding fields without breaking changes
+- Stringly-typed status field noted as technical debt by all three reviewers - consider DirectoryStatus enum in future PR
+- Next story is US-005: Implement audit logging service
+- The audit_log table exists in schema, need to implement AuditService with record(), current_user(), list_recent(), list_by_path()
