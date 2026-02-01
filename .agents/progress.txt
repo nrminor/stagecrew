@@ -277,3 +277,48 @@
 - Next story is US-009: Implement removal service
 - US-009 will implement RemovalService::remove_approved() that processes approved paths for deletion
 
+
+## US-009: Implement removal service (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Implemented `remove_approved(db)` function that orchestrates removal of all approved directories
+- Function queries approved directories, attempts removal using `RemovalService::remove()`, updates status based on outcome
+- On success: status → 'removed', audit entry recorded with bytes freed
+- On permission error: status → 'blocked', audit entry recorded with "Blocked: permission denied"
+- On other filesystem error: status → 'blocked', audit entry recorded with error details
+- Returns `RemovalSummary` struct with removed_count, blocked_count, total_bytes_freed
+- Added `#[non_exhaustive]` to `RemovalOutcome` enum per semver-nag review
+- Added `#[must_use]` to `RemovalOutcome` enum to ensure outcome is checked
+- Made `RemovalSummary` fields private with public const getters: `removed_count()`, `blocked_count()`, `total_bytes_freed()`
+- Added `RemovalSummary::empty()` constructor for testing/initialization
+- Removed `Default` derive from `RemovalSummary` to avoid implicit construction with `#[non_exhaustive]`
+- Added 6 integration tests:
+  - `remove_approved_processes_approved_directories` - verifies successful removal, status updates, audit entries
+  - `remove_approved_handles_permission_denied` - verifies blocked status and audit entry for permission errors
+  - `remove_approved_handles_nonexistent_path` - verifies blocked status for missing paths
+  - `remove_approved_handles_mixed_success_and_failure` - verifies partial success scenario
+  - `remove_approved_returns_empty_summary_when_no_approved` - edge case with no approved directories
+  - `remove_approved_records_audit_entries_with_directory_id` - verifies audit trail includes directory_id
+- All tests use tempfile for isolation and verify filesystem state, database status, and audit entries
+- Tests properly clean up permissions after testing permission errors
+
+**Agent reviews:**
+- nick-isms: Solid implementation with good error handling. Flagged stringly-typed status values (cross-cutting concern for database layer), suggested extracting per-directory logic into helper function (acceptable as-is for readability), noted DryRun variant handling could be improved. Overall good quality.
+- testing-guru: Comprehensive test coverage of all acceptance criteria. Flagged missing `#[allow(dead_code)]` removal criterion (intentional - allows remain until daemon integration per AGENTS.md). Recommended adding direct unit tests for RemovalService::remove() (deferred as lower priority). Coverage is good.
+- semver-nag: Identified critical API issues and recommended fixes (all applied): Made RemovalSummary fields private with getters, removed Default derive, added #[non_exhaustive] and #[must_use] to RemovalOutcome. Approved final API design.
+
+**Known technical debt:**
+- Stringly-typed status values ('approved', 'removed', 'blocked') should be replaced with DirectoryStatus enum (cross-cutting concern affecting db module)
+- RemovalService constructor takes bool parameter - consider RemovalOptions builder pattern before 1.0
+- remove_approved() is free function, not method - consider making it RemovalService::remove_approved() for better testability with custom options
+
+**Notes for next agent:**
+- Removal service is now feature-complete for US-009
+- All acceptance criteria met, all checks pass, comprehensive test coverage
+- `#[allow(dead_code)]` attributes remain on RemovalService struct, RemovalService::new(), remove_approved() function, and RemovalSummary getter methods - these will be removed when daemon (US-024) integrates them
+- RemovalSummary API is now semver-safe with private fields and public getters
+- Next story is US-010: Implement CLI init subcommand
+- US-010 will need to use Config, AppPaths, and Database::open() to initialize the application
+

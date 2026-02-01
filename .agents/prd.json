@@ -162,8 +162,8 @@
         "just check passes"
       ],
       "priority": 9,
-      "passes": false,
-      "notes": "Safety critical. Must handle errors gracefully."
+      "passes": true,
+      "notes": "Completed: Implemented remove_approved() function that processes all approved directories, attempts removal, and updates database with results. Added #[non_exhaustive] to RemovalOutcome enum and #[must_use] attribute. Made RemovalSummary fields private with public getters (removed_count(), blocked_count(), total_bytes_freed()) per semver-nag recommendations. Added 6 comprehensive integration tests covering successful removals, permission errors, nonexistent paths, mixed success/failure, empty database, and audit trail verification. All tests use tempfile for isolation. #[allow(dead_code)] attributes remain on RemovalService, RemovalSummary getters, and remove_approved() with TODO(cleanup) justifications until daemon integration (US-024). Code review feedback: nick-isms noted stringly-typed status values (cross-cutting concern for future), testing-guru confirmed comprehensive coverage, semver-nag approved API design with getters. All checks pass."
     },
     {
       "id": "US-010",
