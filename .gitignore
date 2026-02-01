@@ -13,6 +13,7 @@
 !/README.md
 !/LICENSE
 !/rust-toolchain.toml
+!/INSTALL.sh
 
 # === Allowed: Agent configuration ===
 !/.agents

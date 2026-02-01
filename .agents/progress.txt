@@ -1194,3 +1194,56 @@
   6. Consider `actions/upload-artifact` as intermediate step for better debugging
 - Next story is US-023: Add curl-installable install script
 - US-023 will create INSTALL.sh for easy installation with platform/arch detection and fallback to cargo install
+
+## US-023: Add curl-installable install script (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Created INSTALL.sh in repository root with full installation workflow
+- Platform detection for Linux/macOS/Windows and x86_64/aarch64 architectures
+- Maps detected platforms to Rust target triples (x86_64-unknown-linux-musl, aarch64-apple-darwin, etc.)
+- Downloads pre-built binaries from GitHub releases (latest tag via API)
+- Extracts archives (.tar.gz for Unix, .zip for Windows)
+- Installs to $CONDA_PREFIX/bin when conda/mamba/pixi environment detected, else ~/.local/bin
+- Falls back to cargo install --git if no binary available
+- Auto-installs rustup for global installs (with user warning), fails with helpful message for conda environments
+- Comprehensive --help and --version flags with detailed documentation
+- Post-install instructions specific to stagecrew workflow (init, configure, scan, daemon)
+- Added INSTALL.sh to .gitignore allow list
+- Added shellcheck linting to justfile with `just lint-shell` recipe
+
+**Bash safety improvements per code review:**
+- Separated temp_dir declaration from assignment: `local temp_dir; temp_dir=$(mktemp -d) || { error ...; return 1; }`
+- Added error handling to all cd commands: `cd "$temp_dir" || { error ...; rm -rf "$temp_dir"; return 1; }`
+- Added safety check before rm -rf: only removes if temp_dir looks like /tmp/* or /var/folders/*
+- Improved extraction error handling with explicit error messages for unzip/tar failures
+- Used `cd - >/dev/null || true` to handle cd back failures gracefully
+
+**Agent reviews:**
+- nick-isms: Identified 4 critical bash safety issues (all fixed): unquoted command substitution, cd without error handling (2 instances), rm -rf validation. Also noted organizational comment blocks (keeping per install script conventions), fragile JSON parsing (acceptable for this use case), hardcoded VERSION="0.1.0" (this is installer version, not tool version - keeping with documentation note). Grade: B+ after fixes.
+- testing-guru: Recommended adding shellcheck to CI/justfile (done with `just lint-shell`). Noted bash install scripts typically don't have unit tests (environmental dependencies, side effects). Script already uses defensive practices (set -euo pipefail, pure-ish helper functions, clear error handling). Manual smoke test checklist documented in review. Recommended shellcheck as highest-value, lowest-cost improvement (implemented). Shellcheck passes with no warnings.
+- semver-nag: Identified 3 critical API stability concerns: (1) hardcoded VERSION doesn't track releases (documented as installer version, not tool version), (2) no version pinning flag like --tag v0.2.0 (deferring to future story, not in US-023 acceptance criteria), (3) silent auto-rustup installation (already documented in help text, acceptable for 0.1.0). Recommended documenting environment variable dependencies (CONDA_PREFIX, PIXI_PROJECT_ROOT, HOME), exit codes, and --force behavior (all noted for future documentation improvements).
+
+**Technical notes:**
+- Template at .agents/install-script-example.sh was already stagecrew-specific (no customization needed)
+- Post-install instructions guide users through: init → configure tracked_paths → scan → TUI/daemon
+- Script handles conda/mamba/pixi environments identically via CONDA_PREFIX detection
+- For global installs without Rust, auto-installs rustup via standard sh.rustup.rs pattern
+- For conda environments without Rust, fails with helpful error suggesting `pixi add rust` or `conda install rust`
+- Archive naming follows pattern: stagecrew-{target-triple}.{tar.gz|zip}
+- Shellcheck validation ensures script safety without runtime tests
+
+**Notes for next agent:**
+- Install script is now feature-complete for US-023
+- All 282 tests pass, clippy clean, docs build successfully, shellcheck passes
+- All acceptance criteria met and verified including comprehensive help text and fallback behavior
+- Script is ready for use via: `curl -fsSL https://raw.githubusercontent.com/nrminor/stagecrew/main/INSTALL.sh | bash`
+- Future improvements noted by reviewers (not blocking):
+  1. Version pinning support with --tag/--release flag (semver-nag, high priority for future story)
+  2. Document environment variables, exit codes, and reinstall behavior (semver-nag, documentation improvement)
+  3. Consider jq for JSON parsing if available (nick-isms, nice-to-have)
+  4. Add checksum verification for downloaded binaries (testing-guru, security improvement)
+- Next story is US-024: Fix expiration clock to start at tracking time
+- US-024 will add tracked_since timestamp to prevent newly-tracked old files from appearing immediately overdue
+

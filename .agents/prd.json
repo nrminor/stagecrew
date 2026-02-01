@@ -401,8 +401,8 @@
         "just check passes"
       ],
       "priority": 23,
-      "passes": false,
-      "notes": "Adapt the example script in .agents/install-script-example.sh. Update repo name, binary name, and post-install instructions for stagecrew."
+      "passes": true,
+      "notes": "Completed: Created INSTALL.sh with platform detection, binary downloads, cargo fallback, conda/pixi support, and comprehensive help text. Script template was already stagecrew-specific. Fixed critical bash safety issues identified by code review: separated temp_dir declaration from assignment, added error handling to cd commands, added safety check to rm -rf, improved extraction error handling. Added shellcheck to justfile (just lint-shell recipe). All 282 tests pass, shellcheck passes with no warnings. Code reviews: nick-isms identified 4 critical issues (all fixed), testing-guru recommended shellcheck (added), semver-nag noted version pinning and auto-rustup concerns (version pinning deferred to future story per acceptance criteria, auto-rustup documented in help text)."
     },
     {
       "id": "US-024",

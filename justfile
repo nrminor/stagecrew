@@ -30,11 +30,15 @@ fmt:
 
 # Run clippy with deny warnings (on changed files via cargo check)
 lint:
-    cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
 
 # Run clippy on all files
 lint-all:
-    cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
+
+# Lint shell scripts with shellcheck
+lint-shell:
+	shellcheck INSTALL.sh
 
 # === Testing ===
 
