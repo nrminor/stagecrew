@@ -1,5 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "default_agent": "build",
   "permission": {
     "doom_loop": "allow",
     "external_directory": {
@@ -23,8 +24,8 @@
       "git ls-files": "allow",
       "git ls-files *": "allow",
 
-      "jj": "allow",
       "jj *": "allow",
+      "jj": "allow",
 
       "cargo add": "ask",
       "cargo remove": "ask",
