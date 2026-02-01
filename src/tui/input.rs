@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::{App, SortMode, View};
 
 /// Handles keyboard input with vim-style bindings.
-pub struct InputHandler;
+pub(crate) struct InputHandler;
 
 impl InputHandler {
     /// Process a key event and update app state.
@@ -107,11 +107,8 @@ impl InputHandler {
     }
 
     fn handle_help(app: &mut App, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('q' | '?') | KeyCode::Esc => {
-                app.view = View::DirectoryList;
-            }
-            _ => {}
-        }
+        // Any key closes the help view
+        let _ = key;
+        app.view = View::DirectoryList;
     }
 }

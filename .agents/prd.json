@@ -227,8 +227,8 @@
         "just check passes"
       ],
       "priority": 13,
-      "passes": false,
-      "notes": "Foundation for all TUI views. Use crossterm for terminal control."
+      "passes": true,
+      "notes": "Completed: Implemented TUI framework with TerminalManager (Drop trait for cleanup), main event loop in App::run(), mouse capture, and basic UI scaffolding. Made App fields private with getters, added #[non_exhaustive] to View and SortMode enums, made InputHandler and ui::render crate-private per semver review. Fixed help view to accept any key. Module-level #[allow(dead_code, unused)] retained with TODO(cleanup) per project conventions - will be removed as views are implemented (US-014+). InputHandler unit tests deferred to later stories when more complex behavior is added. All 98 tests pass."
     },
     {
       "id": "US-014",
