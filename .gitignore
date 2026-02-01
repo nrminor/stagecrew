@@ -17,6 +17,7 @@
 !/.agents
 !/.agents/prd.json
 !/.agents/progress.txt
+!/.agents/PROMPT.md
 
 # === Allowed: Source code ===
 !/src
