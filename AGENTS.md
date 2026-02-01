@@ -60,11 +60,10 @@ just prepare-commit # Runs checks, then shows jj status
 ```text
 Brief summary of what changed (one line)
 
-Longer description in markdown prose. Write in complete sentences without
-hard line wrapping. Keep it simple and readable. Avoid excessive bullets,
-headings, and other formatting that looks LLM-generated. Explain the why,
-not just the what.
+Longer description in prose. Write in complete sentences. Do NOT hard-wrap lines at 72 or 80 characters — let the text flow naturally and allow the viewer to wrap it. Keep it simple and readable. Avoid bullets, headings, and other formatting that looks LLM-generated. Explain the why, not just the what.
 ```
+
+**Important:** Do not insert manual line breaks in the commit body. Write each paragraph as a single long line. Git tools and viewers will wrap the text appropriately.
 
 **Bad example:**
 
@@ -86,10 +85,7 @@ Add feature X
 ```text
 Add directory scanning with jwalk
 
-This implements the core scanning functionality using jwalk for parallel
-filesystem traversal. The scanner collects file metadata including size
-and modification time, which will be used to calculate expiration dates.
-The scan runs in a background task to avoid blocking the TUI.
+This implements the core scanning functionality using jwalk for parallel filesystem traversal. The scanner collects file metadata including size and modification time, which will be used to calculate expiration dates. The scan runs in a background task to avoid blocking the TUI.
 ```
 
 ### Commit Size
