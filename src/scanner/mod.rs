@@ -10,6 +10,214 @@ use crate::audit::{AuditAction, AuditService};
 use crate::db::Database;
 use crate::error::{Error, Result};
 
+/// Seconds in a 24-hour day (not calendar-aware).
+const SECS_PER_DAY: i64 = 86400;
+
+/// Calculate days remaining until expiration based on oldest modification time.
+///
+/// Calculates the number of days remaining until a path expires, based on the
+/// oldest file's modification time and the configured expiration period. Returns
+/// a negative value if the path is already expired.
+///
+/// # Arguments
+///
+/// * `oldest_mtime` - Unix timestamp of the oldest file in the directory
+/// * `expiration_days` - Number of days until expiration
+///
+/// # Returns
+///
+/// Days remaining until expiration (can be negative if already expired)
+///
+/// # Examples
+///
+/// ```no_run
+/// # use jiff::Timestamp;
+/// // File modified 30 days ago, expires in 90 days
+/// const SECS_PER_DAY: i64 = 86400;
+/// let now = Timestamp::now();
+/// let thirty_days_ago = now.checked_sub(jiff::SignedDuration::from_secs(30 * SECS_PER_DAY)).unwrap();
+/// // In real code: let days_remaining = calculate_expiration(thirty_days_ago.as_second(), 90);
+/// // assert!(days_remaining > 59 && days_remaining <= 60);
+/// ```
+// TODO(cleanup): Remove allow once daemon or TUI uses this function.
+#[allow(dead_code)]
+#[must_use = "expiration calculation result should be used"]
+pub fn calculate_expiration(oldest_mtime: i64, expiration_days: u32) -> i64 {
+    let now = jiff::Timestamp::now();
+    let oldest = jiff::Timestamp::from_second(oldest_mtime).unwrap_or(now);
+
+    // Calculate expiration timestamp (days as 24-hour periods)
+    let expiration_secs = i64::from(expiration_days) * SECS_PER_DAY;
+    let expiration_duration = jiff::SignedDuration::from_secs(expiration_secs);
+    let expires_at = oldest.checked_add(expiration_duration).unwrap_or(now);
+
+    // Calculate days remaining (using 86400-second days)
+    let duration_remaining = expires_at.duration_since(now);
+    duration_remaining.as_secs() / SECS_PER_DAY
+}
+
+/// Transition directories based on expiration and deferral status.
+///
+/// This function implements the core business logic for the removal-by-default
+/// policy. It processes directories in the database and transitions them between
+/// states based on their expiration status:
+///
+/// - **Tracked paths**: If expired, transition to `pending` (or `approved` if `auto_remove` is enabled)
+/// - **Deferred paths**: If the deferral period has ended, reset status to `tracked` and clear `deferred_until`
+/// - **Ignored paths**: Never transitioned (permanent exemption)
+///
+/// This function is typically called after a scan to update the workflow state.
+///
+/// # Arguments
+///
+/// * `db` - Database connection
+/// * `expiration_days` - Number of days until expiration
+/// * `auto_remove` - If true, expired paths go to `approved` instead of `pending`
+///
+/// # Returns
+///
+/// A `TransitionSummary` containing counts of transitions performed.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or if audit logging fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::path::Path;
+/// // In real code:
+/// // let db = Database::open(Path::new("test.db"))?;
+/// // let summary = transition_expired_paths(&db, 90, false)?;
+/// // println!("Transitioned {} to pending, {} reset from deferred",
+/// //          summary.expired_to_pending, summary.deferred_reset);
+/// ```
+// TODO(cleanup): Remove allow once daemon uses this function.
+#[allow(dead_code)]
+#[must_use = "transition summary should be logged or displayed"]
+pub fn transition_expired_paths(
+    db: &Database,
+    expiration_days: u32,
+    auto_remove: bool,
+) -> Result<TransitionSummary> {
+    let mut expired_to_pending = 0u64;
+    let mut expired_to_approved = 0u64;
+    let mut deferred_reset = 0u64;
+
+    let now = jiff::Timestamp::now().as_second();
+
+    // Get all directories with status 'tracked' or 'deferred'
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT id, path, oldest_mtime, status, deferred_until
+         FROM directories
+         WHERE status IN ('tracked', 'deferred')",
+    )?;
+
+    let mut rows = stmt.query([])?;
+    let mut transitions = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let path: String = row.get(1)?;
+        let oldest_mtime: Option<i64> = row.get(2)?;
+        let status: String = row.get(3)?;
+        let deferred_until: Option<i64> = row.get(4)?;
+
+        // Handle deferred paths
+        if status == "deferred"
+            && let Some(deferred_until_ts) = deferred_until
+            && now >= deferred_until_ts
+        {
+            // Deferral period ended, reset to tracked
+            transitions.push((id, path, "tracked".to_string(), true));
+            deferred_reset += 1;
+            continue;
+        }
+
+        // Handle tracked paths (check expiration)
+        if status == "tracked"
+            && let Some(oldest_mtime_ts) = oldest_mtime
+        {
+            let days_remaining = calculate_expiration(oldest_mtime_ts, expiration_days);
+
+            if days_remaining <= 0 {
+                // Path has expired
+                let new_status = if auto_remove { "approved" } else { "pending" };
+                transitions.push((id, path, new_status.to_string(), false));
+
+                if auto_remove {
+                    expired_to_approved += 1;
+                } else {
+                    expired_to_pending += 1;
+                }
+            }
+        }
+    }
+
+    // Drop stmt and rows to release the borrow on conn
+    drop(rows);
+    drop(stmt);
+
+    // Apply transitions
+    let audit = AuditService::new(db);
+    let user = AuditService::current_user();
+
+    for (id, path, new_status, is_deferral_reset) in transitions {
+        // Update status
+        if is_deferral_reset {
+            // Clear deferred_until when resetting to tracked
+            conn.execute(
+                "UPDATE directories SET status = ?1, deferred_until = NULL, updated_at = strftime('%s', 'now') WHERE id = ?2",
+                (&new_status, id),
+            )?;
+        } else {
+            db.update_directory_status(id, &new_status)?;
+        }
+
+        // Record audit entry
+        let action_desc = if is_deferral_reset {
+            "Deferral period ended, reset to tracked"
+        } else if new_status == "approved" {
+            "Expired and auto-approved for removal"
+        } else {
+            "Expired, pending approval for removal"
+        };
+
+        audit.record(
+            &user,
+            AuditAction::Scan,
+            Some(&path),
+            Some(action_desc),
+            Some(id),
+        )?;
+    }
+
+    Ok(TransitionSummary {
+        expired_to_pending,
+        expired_to_approved,
+        deferred_reset,
+    })
+}
+
+/// Summary of state transitions performed.
+///
+/// This struct is marked `#[non_exhaustive]`; new fields may be added in
+/// minor versions. Use `..` when destructuring to remain forward-compatible.
+// TODO(cleanup): Remove allow once daemon or TUI displays this summary.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+#[must_use = "transition summary should be logged or displayed"]
+#[non_exhaustive]
+pub struct TransitionSummary {
+    /// Number of tracked paths transitioned to pending status.
+    pub expired_to_pending: u64,
+    /// Number of tracked paths transitioned to approved status (auto-remove).
+    pub expired_to_approved: u64,
+    /// Number of deferred paths reset to tracked status.
+    pub deferred_reset: u64,
+}
+
 /// Scan tracked paths and persist results to the database.
 ///
 /// This function orchestrates the full scan workflow:
@@ -435,7 +643,14 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
-    use tempfile::TempDir;
+    use tempfile::{NamedTempFile, TempDir};
+
+    /// Creates a temporary database for testing.
+    fn temp_database() -> (NamedTempFile, crate::db::Database) {
+        let temp_file = NamedTempFile::new().expect("failed to create temp file");
+        let db = crate::db::Database::open(temp_file.path()).expect("failed to open database");
+        (temp_file, db)
+    }
 
     /// Helper to create a temporary directory with test files.
     fn create_test_tree() -> TempDir {
@@ -708,6 +923,534 @@ mod tests {
 
         assert_eq!(result.total_files, 1, "Hidden file should be counted");
         assert_eq!(result.total_size_bytes, 50);
+    }
+
+    // === Expiration Calculation Tests ===
+
+    #[test]
+    fn calculate_expiration_returns_positive_for_recent_files() {
+        let now = jiff::Timestamp::now();
+        // File modified 10 days ago
+        let ten_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(10 * SECS_PER_DAY))
+            .unwrap();
+
+        let days_remaining = super::calculate_expiration(ten_days_ago.as_second(), 90);
+
+        // Should have ~80 days remaining (90 - 10)
+        assert!(
+            (79..=80).contains(&days_remaining),
+            "Expected ~80 days remaining, got {days_remaining}"
+        );
+    }
+
+    #[test]
+    fn calculate_expiration_returns_negative_for_expired_files() {
+        let now = jiff::Timestamp::now();
+        // File modified 100 days ago (expired for 90-day policy)
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .unwrap();
+
+        let days_remaining = super::calculate_expiration(hundred_days_ago.as_second(), 90);
+
+        // Should be negative (expired by ~10 days)
+        assert!(
+            (-11..=-9).contains(&days_remaining),
+            "Expected ~-10 days remaining, got {days_remaining}"
+        );
+    }
+
+    #[test]
+    fn calculate_expiration_returns_zero_on_expiration_day() {
+        let now = jiff::Timestamp::now();
+        // File modified exactly 90 days ago
+        let ninety_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(90 * SECS_PER_DAY))
+            .unwrap();
+
+        let days_remaining = super::calculate_expiration(ninety_days_ago.as_second(), 90);
+
+        // Should be at or very close to 0
+        assert!(
+            (-1..=0).contains(&days_remaining),
+            "Expected 0 days remaining, got {days_remaining}"
+        );
+    }
+
+    #[test]
+    fn calculate_expiration_handles_custom_expiration_period() {
+        let now = jiff::Timestamp::now();
+        // File modified 20 days ago
+        let twenty_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(20 * SECS_PER_DAY))
+            .unwrap();
+
+        // 30-day expiration policy
+        let days_remaining = super::calculate_expiration(twenty_days_ago.as_second(), 30);
+
+        // Should have ~10 days remaining (30 - 20)
+        assert!(
+            (9..=10).contains(&days_remaining),
+            "Expected ~10 days remaining, got {days_remaining}"
+        );
+    }
+
+    // === State Transition Tests ===
+
+    #[test]
+    fn transition_expired_paths_moves_expired_tracked_to_pending() {
+        let (_temp, db) = temp_database();
+
+        // Insert a directory with an old mtime (100 days ago)
+        let now = jiff::Timestamp::now();
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .unwrap();
+
+        let _id = db
+            .insert_or_update_directory(
+                "/data/expired",
+                1024,
+                5,
+                Some(hundred_days_ago.as_second()),
+                now.as_second(),
+            )
+            .expect("insert directory");
+
+        // Verify initial status is 'tracked'
+        let dir_before = db
+            .get_directory_by_path("/data/expired")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(dir_before.status, "tracked");
+
+        // Run transition with 90-day expiration policy and auto_remove=false
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        assert_eq!(summary.expired_to_pending, 1);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 0);
+
+        // Verify status changed to 'pending'
+        let dir_after = db
+            .get_directory_by_path("/data/expired")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(dir_after.status, "pending");
+
+        // Verify audit entry was created
+        let audit = crate::audit::AuditService::new(&db);
+        let entries = audit.list_by_path("/data/expired").expect("query audit");
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .details
+                .as_ref()
+                .unwrap()
+                .contains("pending approval")
+        );
+    }
+
+    #[test]
+    fn transition_expired_paths_moves_expired_tracked_to_approved_with_auto_remove() {
+        let (_temp, db) = temp_database();
+
+        // Insert a directory with an old mtime
+        let now = jiff::Timestamp::now();
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .unwrap();
+
+        db.insert_or_update_directory(
+            "/data/expired",
+            1024,
+            5,
+            Some(hundred_days_ago.as_second()),
+            now.as_second(),
+        )
+        .expect("insert directory");
+
+        // Run transition with auto_remove=true
+        let summary = super::transition_expired_paths(&db, 90, true).expect("transition");
+
+        assert_eq!(summary.expired_to_pending, 0);
+        assert_eq!(summary.expired_to_approved, 1);
+        assert_eq!(summary.deferred_reset, 0);
+
+        // Verify status changed to 'approved'
+        let dir = db
+            .get_directory_by_path("/data/expired")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(dir.status, "approved");
+    }
+
+    #[test]
+    fn transition_expired_paths_does_not_transition_non_expired() {
+        let (_temp, db) = temp_database();
+
+        // Insert a directory with recent mtime (10 days ago)
+        let now = jiff::Timestamp::now();
+        let ten_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(10 * SECS_PER_DAY))
+            .unwrap();
+
+        db.insert_or_update_directory(
+            "/data/recent",
+            1024,
+            5,
+            Some(ten_days_ago.as_second()),
+            now.as_second(),
+        )
+        .expect("insert directory");
+
+        // Run transition with 90-day policy
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        assert_eq!(summary.expired_to_pending, 0);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 0);
+
+        // Verify status unchanged
+        let dir = db
+            .get_directory_by_path("/data/recent")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(dir.status, "tracked");
+    }
+
+    #[test]
+    fn transition_expired_paths_resets_expired_deferral() {
+        let (_temp, db) = temp_database();
+
+        let now = jiff::Timestamp::now();
+        let yesterday = now
+            .checked_sub(jiff::SignedDuration::from_secs(SECS_PER_DAY))
+            .unwrap();
+
+        // Insert a directory with deferred status
+        let id = db
+            .insert_or_update_directory("/data/deferred", 1024, 5, None, now.as_second())
+            .expect("insert directory");
+
+        // Set status to 'deferred' with deferred_until in the past
+        db.conn()
+            .execute(
+                "UPDATE directories SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
+                (yesterday.as_second(), id),
+            )
+            .expect("set deferred status");
+
+        // Verify initial state
+        let dir_before = db
+            .get_directory_by_path("/data/deferred")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(dir_before.status, "deferred");
+        assert!(dir_before.deferred_until.is_some());
+
+        // Run transition
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        assert_eq!(summary.expired_to_pending, 0);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 1);
+
+        // Verify status reset to 'tracked' and deferred_until cleared
+        let dir_after = db
+            .get_directory_by_path("/data/deferred")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(dir_after.status, "tracked");
+        assert_eq!(dir_after.deferred_until, None);
+    }
+
+    #[test]
+    fn transition_expired_paths_does_not_reset_active_deferral() {
+        let (_temp, db) = temp_database();
+
+        let now = jiff::Timestamp::now();
+        let next_week = now
+            .checked_add(jiff::SignedDuration::from_secs(7 * SECS_PER_DAY))
+            .unwrap();
+
+        // Insert a directory with deferred status
+        let id = db
+            .insert_or_update_directory("/data/deferred", 1024, 5, None, now.as_second())
+            .expect("insert directory");
+
+        // Set status to 'deferred' with deferred_until in the future
+        db.conn()
+            .execute(
+                "UPDATE directories SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
+                (next_week.as_second(), id),
+            )
+            .expect("set deferred status");
+
+        // Run transition
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        assert_eq!(summary.expired_to_pending, 0);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 0);
+
+        // Verify status unchanged
+        let dir = db
+            .get_directory_by_path("/data/deferred")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(dir.status, "deferred");
+        assert_eq!(dir.deferred_until, Some(next_week.as_second()));
+    }
+
+    #[test]
+    fn transition_expired_paths_ignores_ignored_status() {
+        let (_temp, db) = temp_database();
+
+        // Insert a directory with old mtime but 'ignored' status
+        let now = jiff::Timestamp::now();
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .unwrap();
+
+        let id = db
+            .insert_or_update_directory(
+                "/data/ignored",
+                1024,
+                5,
+                Some(hundred_days_ago.as_second()),
+                now.as_second(),
+            )
+            .expect("insert directory");
+
+        // Set status to 'ignored'
+        db.update_directory_status(id, "ignored")
+            .expect("update status");
+
+        // Run transition
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        assert_eq!(summary.expired_to_pending, 0);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 0);
+
+        // Verify status unchanged
+        let dir = db
+            .get_directory_by_path("/data/ignored")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(dir.status, "ignored");
+    }
+
+    #[test]
+    fn transition_expired_paths_handles_multiple_directories() {
+        let (_temp, db) = temp_database();
+
+        let now = jiff::Timestamp::now();
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .unwrap();
+        let ten_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(10 * SECS_PER_DAY))
+            .unwrap();
+        let yesterday = now
+            .checked_sub(jiff::SignedDuration::from_secs(SECS_PER_DAY))
+            .unwrap();
+
+        // Expired tracked directory
+        db.insert_or_update_directory(
+            "/data/expired1",
+            1024,
+            5,
+            Some(hundred_days_ago.as_second()),
+            now.as_second(),
+        )
+        .expect("insert");
+
+        // Another expired tracked directory
+        db.insert_or_update_directory(
+            "/data/expired2",
+            2048,
+            10,
+            Some(hundred_days_ago.as_second()),
+            now.as_second(),
+        )
+        .expect("insert");
+
+        // Non-expired tracked directory
+        db.insert_or_update_directory(
+            "/data/recent",
+            512,
+            2,
+            Some(ten_days_ago.as_second()),
+            now.as_second(),
+        )
+        .expect("insert");
+
+        // Expired deferral
+        let deferred_id = db
+            .insert_or_update_directory("/data/deferred", 256, 1, None, now.as_second())
+            .expect("insert");
+        db.conn()
+            .execute(
+                "UPDATE directories SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
+                (yesterday.as_second(), deferred_id),
+            )
+            .expect("set deferred");
+
+        // Run transition
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        assert_eq!(summary.expired_to_pending, 2);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 1);
+
+        // Verify each directory
+        assert_eq!(
+            db.get_directory_by_path("/data/expired1")
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert_eq!(
+            db.get_directory_by_path("/data/expired2")
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert_eq!(
+            db.get_directory_by_path("/data/recent")
+                .unwrap()
+                .unwrap()
+                .status,
+            "tracked"
+        );
+        assert_eq!(
+            db.get_directory_by_path("/data/deferred")
+                .unwrap()
+                .unwrap()
+                .status,
+            "tracked"
+        );
+    }
+
+    #[test]
+    fn transition_expired_paths_handles_directory_without_mtime() {
+        let (_temp, db) = temp_database();
+
+        let now = jiff::Timestamp::now();
+
+        // Directory with no oldest_mtime (empty directory)
+        db.insert_or_update_directory("/data/empty", 0, 0, None, now.as_second())
+            .expect("insert directory");
+
+        // Run transition
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        // Should not transition directories without mtime
+        assert_eq!(summary.expired_to_pending, 0);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 0);
+
+        // Verify status unchanged
+        let dir = db
+            .get_directory_by_path("/data/empty")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(dir.status, "tracked");
+    }
+
+    // === Additional High-Priority Tests from testing-guru Review ===
+
+    #[test]
+    fn transition_expired_paths_ignores_pending_approved_removed_blocked() {
+        let (_temp, db) = temp_database();
+        let now = jiff::Timestamp::now();
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .unwrap();
+
+        // Create directories with various statuses that should NOT be transitioned
+        for (path, status) in [
+            ("/data/pending", "pending"),
+            ("/data/approved", "approved"),
+            ("/data/removed", "removed"),
+            ("/data/blocked", "blocked"),
+        ] {
+            let id = db
+                .insert_or_update_directory(
+                    path,
+                    1024,
+                    5,
+                    Some(hundred_days_ago.as_second()),
+                    now.as_second(),
+                )
+                .expect("insert");
+            db.update_directory_status(id, status).expect("set status");
+        }
+
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        assert_eq!(summary.expired_to_pending, 0);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 0);
+
+        // Verify statuses unchanged
+        for (path, expected_status) in [
+            ("/data/pending", "pending"),
+            ("/data/approved", "approved"),
+            ("/data/removed", "removed"),
+            ("/data/blocked", "blocked"),
+        ] {
+            let dir = db.get_directory_by_path(path).unwrap().unwrap();
+            assert_eq!(
+                dir.status, expected_status,
+                "Status for {path} should be unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn transition_expired_paths_handles_deferred_with_null_deferred_until() {
+        let (_temp, db) = temp_database();
+        let now = jiff::Timestamp::now();
+
+        let id = db
+            .insert_or_update_directory("/data/deferred-null", 1024, 5, None, now.as_second())
+            .expect("insert");
+
+        // Set status to deferred but leave deferred_until as NULL
+        db.conn()
+            .execute(
+                "UPDATE directories SET status = 'deferred' WHERE id = ?1",
+                (id,),
+            )
+            .expect("set deferred status without deferred_until");
+
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        // Should NOT reset because deferred_until is None
+        assert_eq!(summary.deferred_reset, 0);
+
+        let dir = db
+            .get_directory_by_path("/data/deferred-null")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dir.status, "deferred");
+    }
+
+    #[test]
+    fn transition_expired_paths_handles_empty_database() {
+        let (_temp, db) = temp_database();
+
+        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+
+        assert_eq!(summary.expired_to_pending, 0);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 0);
     }
 
     // === Integration Tests ===

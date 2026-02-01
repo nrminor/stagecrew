@@ -142,8 +142,8 @@
         "just check passes"
       ],
       "priority": 8,
-      "passes": false,
-      "notes": "Core business logic for the removal-by-default policy."
+      "passes": true,
+      "notes": "Completed: Implemented calculate_expiration() and transition_expired_paths() functions with comprehensive unit tests. Uses 86400-second days (24-hour periods). Transitions tracked paths to pending (or approved if auto_remove enabled) when expired. Resets deferred paths to tracked when deferral period ends. Added 15 unit tests covering all scenarios. Code review feedback addressed: moved SECS_PER_DAY to module level, added #[must_use] to functions, added #[derive(Default)] to TransitionSummary, fixed doctests for binary crate, added 3 high-priority edge case tests (ignoring other statuses, deferred with null, empty database). All checks pass."
     },
     {
       "id": "US-009",
