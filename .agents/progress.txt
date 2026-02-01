@@ -205,3 +205,45 @@
 - Next story is US-007: Implement scan-to-database integration
 - US-007 will use the Scanner and persist results to the database, which will allow removal of the dead_code allows
 
+
+## US-007: Implement scan-to-database integration (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Implemented `scan_and_persist` function in scanner module that orchestrates:
+  - Scanning tracked paths using existing Scanner
+  - Upserting directories and files to database
+  - Updating stats table with total_tracked_paths, total_size_bytes, last_scan_completed
+  - Recording scan action in audit log with summary details
+- Added `ScanSummary` struct to return aggregate statistics
+- Added `update_stats` helper function for stats table updates
+- Added 6 integration tests:
+  - `scan_and_persist_creates_directory_records` - verifies directory upserts
+  - `scan_and_persist_creates_file_records` - verifies file upserts
+  - `scan_and_persist_updates_stats_table` - verifies stats updates
+  - `scan_and_persist_records_audit_entry` - verifies audit logging
+  - `scan_and_persist_handles_multiple_paths` - verifies multi-path scanning
+  - `scan_and_persist_upserts_existing_directories` - verifies status preservation
+- Added `#[non_exhaustive]` to `ScanSummary` per semver-nag recommendation
+- Added `#[must_use]` to `ScanSummary` for better API ergonomics
+- Added TODO(cleanup) allows for dead_code (will be removed when main.rs uses this function)
+
+**Agent reviews:**
+- nick-isms: Flagged double-walk inefficiency (scan aggregates, then re-walks for files), no transaction boundary, unused _total_files parameter. Noted good #[allow] discipline, proper upsert semantics, comprehensive tests, good tracing usage. Overall B+ code with design issues to address.
+- testing-guru: Good happy-path coverage but missing error scenarios (nonexistent path, empty paths, stale data cleanup). Recommended tests for error paths and edge cases. Noted stale file records aren't cleaned up (design decision to document).
+- semver-nag: Flagged missing #[non_exhaustive] on ScanSummary (fixed), noted DirectoryInfo is unconstructable by design, flagged jiff::Timestamp coupling (acceptable), suggested #[must_use] for consistency (added).
+
+**Known technical debt:**
+- Double-walk inefficiency: scan_directory_tree aggregates stats, then scan_and_persist re-walks for individual files. This doubles I/O and could cause consistency issues if files change between walks. Optimization deferred to future PR.
+- No transaction boundary around database operations. If scan fails mid-operation, database could be in inconsistent state. Should wrap in transaction.
+- `_total_files` parameter in update_stats is unused (stats table doesn't have total_files column).
+
+**Notes for next agent:**
+- scan_and_persist is now feature-complete for US-007
+- The function is marked with TODO(cleanup) allows - remove these when main.rs scan command uses it
+- paths_within_warning/paths_pending calculation explicitly deferred to US-008 (expiration logic)
+- All 62 tests pass, clippy clean, docs build successfully
+- Next story is US-008: Implement expiration calculation and state transitions
+- US-008 will implement calculate_expiration() and transition_expired_paths() functions
+

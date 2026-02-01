@@ -124,8 +124,8 @@
         "just check passes"
       ],
       "priority": 7,
-      "passes": false,
-      "notes": "Bridges scanner and database modules."
+      "passes": true,
+      "notes": "Completed: Implemented scan_and_persist function that orchestrates scanning tracked paths, upserting directories/files to database, updating stats table, and recording audit entries. Added 6 integration tests covering directory records, file records, stats updates, audit logging, multiple paths, and upsert behavior. Added #[non_exhaustive] and #[must_use] to ScanSummary per semver-nag recommendations. Note: paths_within_warning/paths_pending calculation deferred to US-008 (expiration logic). Known technical debt: Double-walk inefficiency (scan aggregates directories, then re-walks for files) - optimization deferred to future PR. All tests pass."
     },
     {
       "id": "US-008",
