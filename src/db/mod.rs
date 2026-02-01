@@ -75,6 +75,8 @@ pub struct Stats {
     pub paths_pending_approval: i64,
     /// Number of paths that are overdue (past expiration).
     pub paths_overdue: i64,
+    /// Unix timestamp of the last completed scan.
+    pub last_scan_completed: Option<i64>,
 }
 
 /// Database handle for stagecrew state.
@@ -415,7 +417,7 @@ impl Database {
         self.conn
             .query_row(
                 "SELECT total_tracked_paths, total_size_bytes, paths_within_warning,
-                        paths_pending_approval, paths_overdue
+                        paths_pending_approval, paths_overdue, last_scan_completed
                  FROM stats WHERE id = 1",
                 [],
                 |row| {
@@ -425,6 +427,7 @@ impl Database {
                         paths_within_warning: row.get(2)?,
                         paths_pending_approval: row.get(3)?,
                         paths_overdue: row.get(4)?,
+                        last_scan_completed: row.get(5)?,
                     })
                 },
             )

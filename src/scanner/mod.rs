@@ -223,7 +223,7 @@ pub struct TransitionSummary {
 /// This function orchestrates the full scan workflow:
 /// 1. Scan each tracked path using the scanner
 /// 2. Upsert directories and files into the database
-/// 3. Update the stats table with aggregated totals
+/// 3. Update the stats table with aggregated totals and expiration counts
 /// 4. Record the scan action in the audit log
 ///
 /// # Errors
@@ -238,22 +238,24 @@ pub struct TransitionSummary {
 /// ```no_run
 /// # use stagecrew::scanner::{scan_and_persist, Scanner};
 /// # use stagecrew::db::Database;
+/// # use stagecrew::config::Config;
 /// # use std::path::PathBuf;
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let db = Database::open(std::path::Path::new("test.db"))?;
 /// let scanner = Scanner::new();
+/// let config = Config::default();
 /// let paths = vec![PathBuf::from("/data/staging")];
 ///
-/// scan_and_persist(&db, &scanner, &paths).await?;
+/// scan_and_persist(&db, &scanner, &paths, config.expiration_days, config.warning_days).await?;
 /// # Ok::<(), stagecrew::error::Error>(())
 /// # }).unwrap();
 /// ```
-// TODO(cleanup): Remove allow once main.rs scan command or daemon uses this function.
-#[allow(dead_code)]
 pub async fn scan_and_persist(
     db: &Database,
     scanner: &Scanner,
     tracked_paths: &[PathBuf],
+    expiration_days: u32,
+    warning_days: u32,
 ) -> Result<ScanSummary> {
     let mut total_directories = 0u64;
     let mut total_files = 0u64;
@@ -328,9 +330,10 @@ pub async fn scan_and_persist(
     update_stats(
         db,
         total_directories as i64,
-        total_files as i64,
         total_size_bytes as i64,
         scan_timestamp,
+        expiration_days,
+        warning_days,
     )?;
 
     // Record scan in audit log
@@ -366,25 +369,85 @@ pub async fn scan_and_persist(
 
 /// Update the stats table with scan results.
 ///
-/// This updates the singleton stats row (id=1) with total counts and timestamps.
-/// The stats table is used by the status command for fast queries.
+/// This updates the singleton stats row (id=1) with total counts, warning counts,
+/// and timestamps. The stats table is used by the status command for fast queries.
 ///
-/// Note: `paths_within_warning` and `paths_pending_approval` are computed by
-/// the expiration calculation logic in US-008, so we don't update them here.
+/// This function calculates:
+/// - `paths_within_warning`: directories with `days_remaining` <= `warning_days` AND > 0 AND status = 'tracked'
+/// - `paths_pending_approval`: directories with status = 'pending'
+/// - `paths_overdue`: directories with `days_remaining` <= 0 AND status = 'tracked'
+///
+/// All calculations are performed in a single SQL UPDATE statement using subqueries
+/// for efficiency.
+///
+/// # Arguments
+///
+/// * `db` - Database connection
+/// * `total_directories` - Total number of tracked directories
+/// * `total_size_bytes` - Total size in bytes across all tracked directories
+/// * `scan_timestamp` - Unix timestamp when the scan completed
+/// * `expiration_days` - Number of days until expiration (from config)
+/// * `warning_days` - Number of days before expiration to start warning (from config)
+///
+/// # Errors
+///
+/// Returns an error if the database UPDATE fails.
 fn update_stats(
     db: &Database,
     total_directories: i64,
-    _total_files: i64,
     total_size_bytes: i64,
     scan_timestamp: i64,
+    expiration_days: u32,
+    warning_days: u32,
 ) -> Result<()> {
+    let now = jiff::Timestamp::now().as_second();
+
+    let expiration_days_i64 = i64::from(expiration_days);
+    let warning_days_i64 = i64::from(warning_days);
+
+    // Calculate paths_within_warning, paths_pending_approval, and paths_overdue
+    // using a single UPDATE with subqueries for efficiency.
+    //
+    // days_remaining calculation:
+    //   (oldest_mtime + (expiration_days * 86400) - now) / 86400
+    //
+    // paths_within_warning: 0 < days_remaining <= warning_days AND status = 'tracked'
+    // paths_pending_approval: status = 'pending'
+    // paths_overdue: days_remaining <= 0 AND status = 'tracked'
     db.conn().execute(
         "UPDATE stats SET
             total_tracked_paths = ?1,
             total_size_bytes = ?2,
-            last_scan_completed = ?3
+            last_scan_completed = ?3,
+            paths_within_warning = (
+                SELECT COUNT(*)
+                FROM directories
+                WHERE oldest_mtime IS NOT NULL
+                  AND ((oldest_mtime + (?4 * 86400) - ?5) / 86400) <= ?6
+                  AND ((oldest_mtime + (?4 * 86400) - ?5) / 86400) > 0
+                  AND status = 'tracked'
+            ),
+            paths_pending_approval = (
+                SELECT COUNT(*)
+                FROM directories
+                WHERE status = 'pending'
+            ),
+            paths_overdue = (
+                SELECT COUNT(*)
+                FROM directories
+                WHERE oldest_mtime IS NOT NULL
+                  AND ((oldest_mtime + (?4 * 86400) - ?5) / 86400) <= 0
+                  AND status = 'tracked'
+            )
          WHERE id = 1",
-        (total_directories, total_size_bytes, scan_timestamp),
+        (
+            total_directories,
+            total_size_bytes,
+            scan_timestamp,
+            expiration_days_i64,
+            now,
+            warning_days_i64,
+        ),
     )?;
     Ok(())
 }
@@ -641,6 +704,7 @@ pub struct DirectoryInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filetime::{FileTime, set_file_mtime};
     use std::fs::File;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
@@ -867,8 +931,6 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_correctly_identifies_oldest_mtime() {
-        use filetime::{FileTime, set_file_mtime};
-
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
 
@@ -1475,7 +1537,7 @@ mod tests {
 
         // Run scan_and_persist
         let scanner = Scanner::new();
-        let summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir))
+        let summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
             .unwrap();
 
@@ -1521,7 +1583,7 @@ mod tests {
         let db_path = root.join("test.db");
         let db = Database::open(&db_path).unwrap();
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir))
+        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
             .unwrap();
 
@@ -1561,7 +1623,7 @@ mod tests {
         let db_path = root.join("test.db");
         let db = Database::open(&db_path).unwrap();
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, &[project_dir])
+        let _summary = scan_and_persist(&db, &scanner, &[project_dir], 90, 14)
             .await
             .unwrap();
 
@@ -1601,7 +1663,7 @@ mod tests {
         let db_path = root.join("test.db");
         let db = Database::open(&db_path).unwrap();
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, &[project_dir])
+        let _summary = scan_and_persist(&db, &scanner, &[project_dir], 90, 14)
             .await
             .unwrap();
 
@@ -1648,7 +1710,7 @@ mod tests {
         let db_path = root.join("test.db");
         let db = Database::open(&db_path).unwrap();
         let scanner = Scanner::new();
-        let summary = scan_and_persist(&db, &scanner, &[dir1.clone(), dir2.clone()])
+        let summary = scan_and_persist(&db, &scanner, &[dir1.clone(), dir2.clone()], 90, 14)
             .await
             .unwrap();
 
@@ -1689,7 +1751,7 @@ mod tests {
         let db_path = root.join("test.db");
         let db = Database::open(&db_path).unwrap();
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir))
+        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
             .unwrap();
 
@@ -1707,7 +1769,7 @@ mod tests {
             .unwrap();
 
         // Scan again
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir))
+        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
             .unwrap();
 
@@ -1723,6 +1785,396 @@ mod tests {
         assert_eq!(
             updated_dir.size_bytes, 150,
             "Size should reflect both files"
+        );
+    }
+
+    // === Stats Update Tests ===
+
+    #[tokio::test]
+    async fn stats_update_calculates_paths_within_warning() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create a directory with a file that's within the warning period
+        // For 90-day expiration and 14-day warning: file should be 77-89 days old to be in warning
+        let warning_dir = root.join("warning");
+        fs::create_dir(&warning_dir).unwrap();
+        File::create(warning_dir.join("old.txt"))
+            .unwrap()
+            .write_all(&[0u8; 100])
+            .unwrap();
+
+        // Set the file's mtime to 80 days ago (within warning period)
+        let now = jiff::Timestamp::now();
+        let eighty_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(80 * SECS_PER_DAY))
+            .unwrap();
+        let old_time = FileTime::from_unix_time(eighty_days_ago.as_second(), 0);
+        set_file_mtime(warning_dir.join("old.txt"), old_time).unwrap();
+
+        // Create database and scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let scanner = Scanner::new();
+        let _summary = scan_and_persist(&db, &scanner, &[warning_dir], 90, 14)
+            .await
+            .unwrap();
+
+        // Verify stats were calculated correctly
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.total_tracked_paths, 1);
+        assert_eq!(
+            stats.paths_within_warning, 1,
+            "Directory with file 80 days old should be in warning period (10 days remaining, within 14-day warning)"
+        );
+        assert_eq!(stats.paths_pending_approval, 0);
+        assert_eq!(stats.paths_overdue, 0);
+    }
+
+    #[tokio::test]
+    async fn stats_update_calculates_paths_pending_approval() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create a directory and manually set status to 'pending'
+        let pending_dir = root.join("pending");
+        fs::create_dir(&pending_dir).unwrap();
+        File::create(pending_dir.join("file.txt"))
+            .unwrap()
+            .write_all(&[0u8; 50])
+            .unwrap();
+
+        // Create database and scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let scanner = Scanner::new();
+        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&pending_dir), 90, 14)
+            .await
+            .unwrap();
+
+        // Manually set status to 'pending'
+        let dir = db
+            .get_directory_by_path(&pending_dir.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        db.update_directory_status(dir.id, "pending").unwrap();
+
+        // Scan again to update stats
+        let _summary = scan_and_persist(&db, &scanner, &[pending_dir], 90, 14)
+            .await
+            .unwrap();
+
+        // Verify stats
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.paths_pending_approval, 1);
+    }
+
+    #[tokio::test]
+    async fn stats_update_calculates_paths_overdue() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create a directory with an old file (expired)
+        let overdue_dir = root.join("overdue");
+        fs::create_dir(&overdue_dir).unwrap();
+        File::create(overdue_dir.join("ancient.txt"))
+            .unwrap()
+            .write_all(&[0u8; 100])
+            .unwrap();
+
+        // Set file mtime to 100 days ago (overdue for 90-day expiration)
+        let now = jiff::Timestamp::now();
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .unwrap();
+        let old_time = FileTime::from_unix_time(hundred_days_ago.as_second(), 0);
+        set_file_mtime(overdue_dir.join("ancient.txt"), old_time).unwrap();
+
+        // Create database and scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let scanner = Scanner::new();
+        let _summary = scan_and_persist(&db, &scanner, &[overdue_dir], 90, 14)
+            .await
+            .unwrap();
+
+        // Verify stats - should have 1 overdue path (status is still 'tracked')
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.total_tracked_paths, 1);
+        assert_eq!(
+            stats.paths_overdue, 1,
+            "Directory with 100-day-old file should be overdue"
+        );
+        assert_eq!(stats.paths_pending_approval, 0);
+        assert_eq!(stats.paths_within_warning, 0);
+    }
+
+    #[tokio::test]
+    async fn stats_update_handles_mixed_scenarios() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let now = jiff::Timestamp::now();
+
+        // Create three directories with different scenarios
+        // 1. Recent file (safe)
+        let safe_dir = root.join("safe");
+        fs::create_dir(&safe_dir).unwrap();
+        File::create(safe_dir.join("recent.txt"))
+            .unwrap()
+            .write_all(&[0u8; 50])
+            .unwrap();
+
+        // 2. File 80 days old (warning period)
+        let warning_dir = root.join("warning");
+        fs::create_dir(&warning_dir).unwrap();
+        File::create(warning_dir.join("warning.txt"))
+            .unwrap()
+            .write_all(&[0u8; 50])
+            .unwrap();
+        let eighty_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(80 * SECS_PER_DAY))
+            .unwrap();
+        set_file_mtime(
+            warning_dir.join("warning.txt"),
+            FileTime::from_unix_time(eighty_days_ago.as_second(), 0),
+        )
+        .unwrap();
+
+        // 3. File 100 days old (overdue)
+        let overdue_dir = root.join("overdue");
+        fs::create_dir(&overdue_dir).unwrap();
+        File::create(overdue_dir.join("overdue.txt"))
+            .unwrap()
+            .write_all(&[0u8; 50])
+            .unwrap();
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .unwrap();
+        set_file_mtime(
+            overdue_dir.join("overdue.txt"),
+            FileTime::from_unix_time(hundred_days_ago.as_second(), 0),
+        )
+        .unwrap();
+
+        // Create database and scan all three
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let scanner = Scanner::new();
+        let _summary = scan_and_persist(
+            &db,
+            &scanner,
+            &[safe_dir, warning_dir.clone(), overdue_dir],
+            90,
+            14,
+        )
+        .await
+        .unwrap();
+
+        // Mark warning_dir as 'pending'
+        let dir = db
+            .get_directory_by_path(&warning_dir.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        db.update_directory_status(dir.id, "pending").unwrap();
+
+        // Scan again to update stats
+        let _summary = scan_and_persist(
+            &db,
+            &scanner,
+            &[root.join("safe"), warning_dir, root.join("overdue")],
+            90,
+            14,
+        )
+        .await
+        .unwrap();
+
+        // Verify stats
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.total_tracked_paths, 3);
+        assert_eq!(stats.paths_overdue, 1, "One overdue directory");
+        assert_eq!(stats.paths_pending_approval, 1, "One pending directory");
+        // Note: warning_dir is now 'pending', so paths_within_warning should be 0
+        assert_eq!(
+            stats.paths_within_warning, 0,
+            "Warning path was marked pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_update_excludes_ignored_from_overdue_count() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create directory with old file
+        let ignored_dir = root.join("ignored");
+        fs::create_dir(&ignored_dir).unwrap();
+        File::create(ignored_dir.join("old.txt"))
+            .unwrap()
+            .write_all(&[0u8; 50])
+            .unwrap();
+
+        // Set file to 100 days old
+        let now = jiff::Timestamp::now();
+        let hundred_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
+            .unwrap();
+        set_file_mtime(
+            ignored_dir.join("old.txt"),
+            FileTime::from_unix_time(hundred_days_ago.as_second(), 0),
+        )
+        .unwrap();
+
+        // Create database and scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let scanner = Scanner::new();
+        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&ignored_dir), 90, 14)
+            .await
+            .unwrap();
+
+        // Mark as ignored
+        let dir = db
+            .get_directory_by_path(&ignored_dir.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        db.update_directory_status(dir.id, "ignored").unwrap();
+
+        // Scan again to update stats
+        let _summary = scan_and_persist(&db, &scanner, &[ignored_dir], 90, 14)
+            .await
+            .unwrap();
+
+        // Verify stats - ignored directory should NOT be counted as overdue
+        let stats = db.get_stats().unwrap();
+        assert_eq!(
+            stats.paths_overdue, 0,
+            "Ignored paths should not be counted as overdue"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_update_custom_expiration_warning_periods() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create directory with file 25 days old
+        let dir = root.join("test");
+        fs::create_dir(&dir).unwrap();
+        File::create(dir.join("file.txt"))
+            .unwrap()
+            .write_all(&[0u8; 50])
+            .unwrap();
+
+        let now = jiff::Timestamp::now();
+        let twentyfive_days_ago = now
+            .checked_sub(jiff::SignedDuration::from_secs(25 * SECS_PER_DAY))
+            .unwrap();
+        set_file_mtime(
+            dir.join("file.txt"),
+            FileTime::from_unix_time(twentyfive_days_ago.as_second(), 0),
+        )
+        .unwrap();
+
+        // Create database and scan with custom periods:
+        // expiration_days = 30, warning_days = 7
+        // File is 25 days old, so 5 days remaining - within 7-day warning period
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let scanner = Scanner::new();
+        let _summary = scan_and_persist(&db, &scanner, &[dir], 30, 7)
+            .await
+            .unwrap();
+
+        // Verify stats
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.total_tracked_paths, 1);
+        assert_eq!(
+            stats.paths_within_warning, 1,
+            "With 30-day expiration and 7-day warning, 25-day-old file (5 days remaining) should be in warning"
+        );
+        assert_eq!(stats.paths_overdue, 0);
+    }
+
+    #[tokio::test]
+    async fn stats_update_handles_directories_without_mtime() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create empty directory (no files, so no oldest_mtime)
+        let empty_dir = root.join("empty");
+        fs::create_dir(&empty_dir).unwrap();
+
+        // Create database and scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let scanner = Scanner::new();
+        let _summary = scan_and_persist(&db, &scanner, &[empty_dir], 90, 14)
+            .await
+            .unwrap();
+
+        // Verify stats - directories without mtime should not be counted in warning/overdue
+        let stats = db.get_stats().unwrap();
+        // Note: empty directories don't get inserted by scan_and_persist
+        // because scan_directory_tree only aggregates directories with files
+        assert_eq!(stats.total_tracked_paths, 0);
+        assert_eq!(stats.paths_within_warning, 0);
+        assert_eq!(stats.paths_overdue, 0);
+    }
+
+    #[tokio::test]
+    async fn stats_update_sets_last_scan_completed_timestamp() {
+        use crate::db::Database;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create a directory with a file
+        let dir = root.join("test");
+        fs::create_dir(&dir).unwrap();
+        File::create(dir.join("file.txt"))
+            .unwrap()
+            .write_all(&[0u8; 50])
+            .unwrap();
+
+        // Record current time before scan
+        let before_scan = jiff::Timestamp::now().as_second();
+
+        // Create database and scan
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let scanner = Scanner::new();
+        let _summary = scan_and_persist(&db, &scanner, &[dir], 90, 14)
+            .await
+            .unwrap();
+
+        // Record current time after scan
+        let after_scan = jiff::Timestamp::now().as_second();
+
+        // Verify last_scan_completed was set and is within reasonable range
+        let stats = db.get_stats().unwrap();
+        assert!(
+            stats.last_scan_completed.is_some(),
+            "last_scan_completed should be set"
+        );
+        let last_scan = stats.last_scan_completed.unwrap();
+        assert!(
+            last_scan >= before_scan && last_scan <= after_scan,
+            "last_scan_completed ({last_scan}) should be between {before_scan} and {after_scan}"
         );
     }
 }

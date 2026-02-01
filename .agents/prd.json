@@ -429,8 +429,8 @@
         "just check passes"
       ],
       "priority": 25,
-      "passes": false,
-      "notes": "Enables fast status command for shell hook."
+      "passes": true,
+      "notes": "Completed: Enhanced update_stats() to use single SQL UPDATE with subqueries calculating paths_within_warning, paths_pending_approval, and paths_overdue. Added last_scan_completed field to Stats struct. Updated scan_and_persist() signature to accept expiration_days and warning_days parameters. Removed unused _total_files parameter. Added 8 comprehensive unit tests covering warning periods, pending counts, overdue paths, mixed scenarios, custom config values, and last_scan_completed timestamp verification. All 190 tests pass. Addressed code review feedback from nick-isms (removed unused parameter), testing-guru (added critical timestamp test), and semver-nag (removed stale allow)."
     },
     {
       "id": "US-026",

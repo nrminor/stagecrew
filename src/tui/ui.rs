@@ -103,6 +103,7 @@ fn render_directory_list(
                 paths_within_warning: 0,
                 paths_pending_approval: 0,
                 paths_overdue: 0,
+                last_scan_completed: None,
             }
         }
     };

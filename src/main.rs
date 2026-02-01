@@ -149,9 +149,15 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
     }
 
     // Run the scan
-    let summary = scan_and_persist(db, &scanner, &paths_to_scan)
-        .await
-        .context("Failed to scan and persist paths")?;
+    let summary = scan_and_persist(
+        db,
+        &scanner,
+        &paths_to_scan,
+        config.expiration_days,
+        config.warning_days,
+    )
+    .await
+    .context("Failed to scan and persist paths")?;
 
     // Print summary
     println!(
@@ -337,6 +343,7 @@ mod tests {
             paths_within_warning: 1,
             paths_pending_approval: 2,
             paths_overdue: 3,
+            last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -352,6 +359,7 @@ mod tests {
             paths_within_warning: 1,
             paths_pending_approval: 0,
             paths_overdue: 3,
+            last_scan_completed: None,
         };
         assert_eq!(format_status_output(&stats), "stagecrew: 3 paths overdue");
     }
@@ -364,6 +372,7 @@ mod tests {
             paths_within_warning: 4,
             paths_pending_approval: 2,
             paths_overdue: 0,
+            last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -379,6 +388,7 @@ mod tests {
             paths_within_warning: 0,
             paths_pending_approval: 2,
             paths_overdue: 0,
+            last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -394,6 +404,7 @@ mod tests {
             paths_within_warning: 5,
             paths_pending_approval: 0,
             paths_overdue: 0,
+            last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -409,6 +420,7 @@ mod tests {
             paths_within_warning: 0,
             paths_pending_approval: 0,
             paths_overdue: 0,
+            last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -424,6 +436,7 @@ mod tests {
             paths_within_warning: 0,
             paths_pending_approval: 0,
             paths_overdue: 0,
+            last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),

@@ -135,7 +135,15 @@ impl Daemon {
     async fn run_cycle(&self, db: &Database, scanner: &Scanner) {
         // Step 1: Scan tracked paths
         tracing::info!("Starting scan cycle");
-        match scan_and_persist(db, scanner, &self.config.tracked_paths).await {
+        match scan_and_persist(
+            db,
+            scanner,
+            &self.config.tracked_paths,
+            self.config.expiration_days,
+            self.config.warning_days,
+        )
+        .await
+        {
             Ok(summary) => {
                 tracing::info!(
                     total_directories = summary.total_directories,

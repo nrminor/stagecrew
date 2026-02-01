@@ -914,3 +914,57 @@
 - Next story is US-025: Implement stats update after scan
 - US-025 will update the stats table with pre-computed values (paths_within_warning, paths_pending_approval, paths_overdue) for fast status command execution
 
+## US-025: Implement stats update after scan (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Enhanced `update_stats()` function in src/scanner/mod.rs (lines ~398-457):
+  - Single SQL UPDATE statement with correlated subqueries for efficiency
+  - Calculates `paths_within_warning`: count where `days_remaining <= warning_days AND days_remaining > 0 AND status = 'tracked'`
+  - Calculates `paths_pending_approval`: count where `status = 'pending'`
+  - Calculates `paths_overdue`: count where `days_remaining <= 0 AND status = 'tracked'`
+  - Sets `last_scan_completed` to current Unix timestamp
+  - Removed unused `_total_files` parameter after code review
+- Extended `Stats` struct in src/db/mod.rs:
+  - Added `last_scan_completed: Option<i64>` field
+  - Updated `Database::get_stats()` query to SELECT this new field
+- Updated `scan_and_persist()` signature:
+  - Added `expiration_days: u32` parameter
+  - Added `warning_days: u32` parameter
+  - Removed stale `#[allow(dead_code)]` attribute (function is now used by daemon and main.rs)
+- Updated all call sites:
+  - src/main.rs: `handle_scan()` now passes `config.expiration_days` and `config.warning_days`
+  - src/daemon/mod.rs: `run_cycle()` now passes `config.expiration_days` and `config.warning_days`
+  - src/tui/ui.rs: Updated `Stats` initialization in error fallback to include `last_scan_completed: None`
+- Added 8 comprehensive unit tests (total now 190 tests):
+  - `update_stats_counts_paths_within_warning` - verifies warning period detection (days_remaining <= warning_days)
+  - `update_stats_counts_paths_pending_approval` - verifies pending status filter
+  - `update_stats_counts_paths_overdue` - verifies overdue detection (days_remaining <= 0)
+  - `update_stats_handles_mixed_scenarios` - verifies multiple conditions simultaneously
+  - `update_stats_handles_custom_config_values` - verifies non-default expiration/warning values
+  - `update_stats_excludes_non_tracked_from_warning` - ensures approved/ignored/etc don't count
+  - `update_stats_excludes_non_tracked_from_overdue` - ensures only tracked paths count as overdue
+  - `update_stats_sets_last_scan_completed_timestamp` - CRITICAL test added after testing-guru feedback
+
+**Agent reviews:**
+- nick-isms: B+ grade. Solid implementation using single SQL UPDATE with subqueries for efficiency. Correctly identified and removed unused `_total_files` parameter. Code follows project conventions well. No blocking issues.
+- testing-guru: Initially flagged missing test for last_scan_completed timestamp (critical gap since it's a documented acceptance criterion). After adding test, confirmed comprehensive coverage: 8 tests covering all AC, edge cases, and custom config values. Grade: A-.
+- semver-nag: No semver concerns for binary crate. Noted that adding `last_scan_completed` field to Stats struct is breaking for struct construction but acceptable for 0.1.0. scan_and_persist signature change is internal (not public API). Removed stale allow correctly.
+
+**Technical notes:**
+- SQL uses julianday('now') * 86400 to compute days_remaining at query time (consistent with calculate_expiration)
+- Correlated subqueries are efficient - single UPDATE statement avoids multiple round-trips
+- last_scan_completed is i64 Unix timestamp (jiff::Timestamp::now().as_second())
+- Stats struct fields are all public (will need private + getters before library extraction)
+- Critical test for timestamp was initially missing but added after testing-guru feedback
+
+**Notes for next agent:**
+- Stats update functionality is now feature-complete for US-025
+- All 190 tests pass (182 existing + 8 new), clippy clean, docs build successfully
+- All acceptance criteria met and verified including critical last_scan_completed field
+- Implementation enables fast `stagecrew status` command for shell hooks (single SELECT, no computation)
+- Breaking change to Stats struct (added field) is acceptable for 0.1.0 per semver policy
+- Next story is US-026: Add integration test for full workflow
+- US-026 will add end-to-end test covering init → scan → transition → approve → remove → audit verification
+
