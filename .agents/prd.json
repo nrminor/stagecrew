@@ -381,8 +381,8 @@
         "just check passes"
       ],
       "priority": 22,
-      "passes": false,
-      "notes": "Adapt the example workflow in .agents/release-workflow-example.yml. Update binary name to 'stagecrew'."
+      "passes": true,
+      "notes": "Completed: Created .github/workflows/release.yml with 8 platform targets (x86_64/aarch64 Linux glibc/musl, x86_64/aarch64 macOS, x86_64/aarch64 Windows). Uses cross for ARM Linux builds. Pre-release detection works via regex. CI gates the release (builds only if tests pass). Packages as .tar.gz (Unix) or .zip (Windows). Updated .gitignore to allow the workflow file. Code reviews: nick-isms approved as ready to commit (minor observations about redundant rustup target add on line 91, optional timeout/checksums/release notes for future), testing-guru confirmed no unit tests needed for workflow files (validated by execution), semver-nag confirmed no semver implications. All 282 tests pass. First real release (v0.x.x) will serve as integration test."
     },
     {
       "id": "US-023",

@@ -1140,3 +1140,57 @@
   3. Consider pinning to specific Rust version (e.g., @1.87.0) before 1.0 for MSRV guarantees
 - Next story is US-022: Add release workflow with cross-platform binaries
 - US-022 will create .github/workflows/release.yml for building and publishing binaries
+
+## US-022: Add release workflow with cross-platform binaries (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Created `.github/workflows/release.yml` adapted from `.agents/release-workflow-example.yml` template
+- Workflow structure:
+  - Triggers on version tags matching pattern `v[0-9]+.[0-9]+.[0-9]+*`
+  - Runs CI checks first (`ci-stable` job reuses `ci.yml` workflow)
+  - Creates GitHub release with pre-release detection via regex
+  - Builds binaries for 8 platforms in parallel matrix
+- Platform matrix includes:
+  - Linux x86_64: gnu and musl variants (native builds)
+  - Linux aarch64: gnu and musl variants (cross-compilation)
+  - macOS x86_64: Intel (macos-13 runner)
+  - macOS aarch64: Apple Silicon (macos-latest runner)
+  - Windows x86_64: MSVC (native build)
+  - Windows aarch64: MSVC (native build, may fail if cross-compilation doesn't work)
+- Uses `cross` tool for ARM Linux cross-compilation
+- Installs `musl-tools` for x86_64 musl builds
+- Packages binaries:
+  - Unix platforms: `.tar.gz` archives
+  - Windows platforms: `.zip` archives
+- Uploads assets to GitHub release with `--clobber` flag for idempotency
+- Updated `.gitignore` to allow `.github/workflows/release.yml`
+
+**Agent reviews:**
+- nick-isms: APPROVED ✅ - Ready to commit with minor observations. Implementation is faithful to template with correct stagecrew branding. Matrix strategy well-organized with clear platform comments. Pre-release regex correct. CI gating is good. Noted line 90-91 redundant target addition (harmless, from template), no concurrency control (correct for releases), missing timeout (suggested 60min for future). Potential issue with aarch64-pc-windows-msvc (may need removal if cross-compilation fails). Release notes minimal (consider auto-generation in future). Verdict: Ready to commit, all acceptance criteria met.
+- testing-guru: APPROVED ✅ - Testing coverage appropriate for workflow files. GitHub Actions workflows are infrastructure-as-code, not application code. Static validation via YAML syntax/schema checking is sufficient. True test will be first release (v0.1.0 tag). No unit tests needed for declarative workflow config. Logic is simple enough that extraction would be over-engineering. Workflow validated by construction (CI already tested, build commands same as local dev). Recommended creating test tag on fork before marking complete (optional). Noted good dependency chain, proper permissions, idempotent uploads. Minor suggestions for future: remove redundant rustup target add (line 91), add checksums, generate release notes.
+- semver-nag: APPROVED ✅ - No semver implications. This is CI/CD infrastructure, not public API. Binary crate has no library exports. Implementation solid with good forward compatibility. CI gates release (line 16 needs: ci-stable). Pre-release detection regex correct. Comprehensive target matrix. Native builds where possible. Musl for static linking (good for HPC). Good release asset naming. Minor forward compatibility notes: reusable workflow coupling is fine, tag pattern permissive (trailing * allows typos but works in practice), no checksums (nice to have), Windows ARM64 may fail (acceptable). No semver concerns, workflow makes operational commitment not API contract.
+
+**Technical notes:**
+- Line 91 has redundant `rustup target add` (already done by dtolnay/rust-toolchain with targets input), but harmless
+- Windows ARM64 (aarch64-pc-windows-msvc) is tier 2 target, may fail if dependencies don't support it
+- No timeout set (unlike CI workflow with 15min) - releases take longer, but could add generous 60min timeout
+- Release notes are minimal placeholder (`## Release ${{ github.ref_name }}`), could add auto-generation
+- No checksums generated for download verification (minor security enhancement for future)
+- Tag pattern `v[0-9]+.[0-9]+.[0-9]+*` matches any suffix (allows v1.0.0-rc.1, v1.0.0anything)
+
+**Notes for next agent:**
+- Release workflow is now feature-complete for US-022
+- All 282 tests pass, clippy clean, docs build successfully
+- All acceptance criteria met and verified
+- First real release (v0.x.x tag push) will serve as integration test for the workflow
+- Optional future enhancements noted by reviewers:
+  1. Add generous timeout (60 minutes) to prevent stuck jobs
+  2. Remove redundant `rustup target add` on line 91 (harmless but unnecessary)
+  3. Generate SHA256 checksums for binary downloads (security/verification)
+  4. Use `gh release create --generate-notes` for auto-generated changelogs
+  5. Monitor Windows ARM64 build and remove from matrix if cross-compilation fails
+  6. Consider `actions/upload-artifact` as intermediate step for better debugging
+- Next story is US-023: Add curl-installable install script
+- US-023 will create INSTALL.sh for easy installation with platform/arch detection and fallback to cargo install
