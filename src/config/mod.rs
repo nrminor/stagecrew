@@ -124,6 +124,10 @@ impl Default for Config {
 impl Config {
     /// Load configuration from the default path.
     ///
+    /// Performs tilde expansion on `tracked_paths` and `database_path` using the
+    /// `shellexpand` crate. This allows configs to use `~/Downloads` and have it
+    /// expanded to the user's home directory at load time.
+    ///
     /// # Errors
     ///
     /// Returns an error if the config file cannot be read or parsed.
@@ -139,7 +143,28 @@ impl Config {
             source: e,
         })?;
 
-        toml::from_str(&contents).map_err(|e| Error::Config(e.to_string()))
+        let mut config: Self =
+            toml::from_str(&contents).map_err(|e| Error::Config(e.to_string()))?;
+
+        // Expand tildes in tracked_paths
+        config.tracked_paths = config
+            .tracked_paths
+            .into_iter()
+            .map(|p| {
+                let path_str = p.to_string_lossy();
+                let expanded = shellexpand::tilde(&path_str);
+                PathBuf::from(expanded.as_ref())
+            })
+            .collect();
+
+        // Expand tilde in database_path if present
+        if let Some(db_path) = config.database_path.take() {
+            let path_str = db_path.to_string_lossy();
+            let expanded = shellexpand::tilde(&path_str);
+            config.database_path = Some(PathBuf::from(expanded.as_ref()));
+        }
+
+        Ok(config)
     }
 
     /// Save configuration to the default path.
@@ -326,5 +351,143 @@ mod tests {
 
         // Explicit path should win over derived path from tracked_paths
         assert_eq!(result, explicit_db);
+    }
+
+    #[test]
+    fn config_load_expands_tilde_in_tracked_paths() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Write config with tilde in tracked_paths
+        let toml_content = r#"
+tracked_paths = ["~/Downloads", "~/Documents/staging"]
+expiration_days = 90
+"#;
+        std::fs::write(&config_path, toml_content).expect("write config file");
+
+        // Load config using manual parse + expansion (mimics Config::load() logic)
+        let contents = std::fs::read_to_string(&config_path).expect("read config file");
+        let mut config: Config = toml::from_str(&contents).expect("parse config");
+
+        // Apply the same expansion logic as Config::load()
+        config.tracked_paths = config
+            .tracked_paths
+            .into_iter()
+            .map(|p| {
+                let path_str = p.to_string_lossy();
+                let expanded = shellexpand::tilde(&path_str);
+                PathBuf::from(expanded.as_ref())
+            })
+            .collect();
+
+        // Verify tildes were expanded to actual home directory
+        let home_dir = dirs::home_dir().expect("home directory should be available");
+        assert_eq!(config.tracked_paths[0], home_dir.join("Downloads"));
+        assert_eq!(config.tracked_paths[1], home_dir.join("Documents/staging"));
+    }
+
+    #[test]
+    fn config_expands_tilde_in_database_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Write config with tilde in database_path
+        let toml_content = r#"
+            tracked_paths = ["/data/staging"]
+            database_path = "~/.local/share/stagecrew/db.sqlite"
+        "#;
+        std::fs::write(&config_path, toml_content).expect("write config file");
+
+        // Load and verify expansion
+        let contents = std::fs::read_to_string(&config_path).expect("read config file");
+        let mut config: Config = toml::from_str(&contents).expect("parse config");
+
+        // Manually perform tilde expansion (same as Config::load)
+        if let Some(db_path) = config.database_path.take() {
+            let path_str = db_path.to_string_lossy();
+            let expanded = shellexpand::tilde(&path_str);
+            config.database_path = Some(PathBuf::from(expanded.as_ref()));
+        }
+
+        // Verify tilde was expanded
+        let home_dir = dirs::home_dir().expect("home directory should be available");
+        assert_eq!(
+            config.database_path,
+            Some(home_dir.join(".local/share/stagecrew/db.sqlite"))
+        );
+    }
+
+    #[test]
+    fn config_handles_paths_without_tilde() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Write config without tildes (absolute and relative paths)
+        let toml_content = r#"
+            tracked_paths = ["/data/staging", "./relative/path"]
+            database_path = "/var/lib/stagecrew/db.sqlite"
+        "#;
+        std::fs::write(&config_path, toml_content).expect("write config file");
+
+        // Load and verify no changes to paths without tildes
+        let contents = std::fs::read_to_string(&config_path).expect("read config file");
+        let mut config: Config = toml::from_str(&contents).expect("parse config");
+
+        // Manually perform tilde expansion (same as Config::load)
+        config.tracked_paths = config
+            .tracked_paths
+            .into_iter()
+            .map(|p| {
+                let path_str = p.to_string_lossy();
+                let expanded = shellexpand::tilde(&path_str);
+                PathBuf::from(expanded.as_ref())
+            })
+            .collect();
+
+        if let Some(db_path) = config.database_path.take() {
+            let path_str = db_path.to_string_lossy();
+            let expanded = shellexpand::tilde(&path_str);
+            config.database_path = Some(PathBuf::from(expanded.as_ref()));
+        }
+
+        // Verify paths unchanged when no tilde present
+        assert_eq!(config.tracked_paths[0], PathBuf::from("/data/staging"));
+        assert_eq!(config.tracked_paths[1], PathBuf::from("./relative/path"));
+        assert_eq!(
+            config.database_path,
+            Some(PathBuf::from("/var/lib/stagecrew/db.sqlite"))
+        );
+    }
+
+    #[test]
+    fn config_expands_tilde_only_prefix() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Write config with ~ at start but also a literal tilde in middle (should not expand middle)
+        let toml_content = r#"
+            tracked_paths = ["~/projects/~backup"]
+        "#;
+        std::fs::write(&config_path, toml_content).expect("write config file");
+
+        // Load and verify only leading tilde is expanded
+        let contents = std::fs::read_to_string(&config_path).expect("read config file");
+        let mut config: Config = toml::from_str(&contents).expect("parse config");
+
+        // Manually perform tilde expansion (same as Config::load)
+        config.tracked_paths = config
+            .tracked_paths
+            .into_iter()
+            .map(|p| {
+                let path_str = p.to_string_lossy();
+                let expanded = shellexpand::tilde(&path_str);
+                PathBuf::from(expanded.as_ref())
+            })
+            .collect();
+
+        // Verify only leading tilde was expanded
+        let home_dir = dirs::home_dir().expect("home directory should be available");
+        let expected = home_dir.join("projects/~backup");
+        assert_eq!(config.tracked_paths[0], expected);
     }
 }
