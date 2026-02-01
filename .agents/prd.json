@@ -342,8 +342,8 @@
         "just check passes"
       ],
       "priority": 20,
-      "passes": false,
-      "notes": "IMPORTANT: A previous agent added module-level #![allow(clippy::unwrap_used)] to test modules - these must be REMOVED. The correct approach is replacing every .unwrap() with .expect('message'). Each expect message is an opportunity for exceptional contributor DX. Messages should answer: 'If this panics, what should I check or do?' Good examples: 'failed to create temp directory - check disk space and permissions', 'database connection lost mid-test - is another process holding a lock?', 'expected directory to exist after scan completed'. Bad examples (too abstract, not actionable): 'regex is valid at compile time', 'invariant violated', 'should not fail'. The message should help a novice who just ran cargo test understand what was attempted, what likely went wrong, and what to check."
+      "passes": true,
+      "notes": "Completed: Added clippy::unwrap_used to deny list in Cargo.toml. Replaced all .unwrap() calls with .expect() using descriptive, actionable messages following the pattern: 'what was attempted - what likely went wrong or what to check'. No module-level #[allow(clippy::unwrap_used)] were added. Messages provide exceptional contributor DX by helping developers understand test failures. Examples: 'failed to create temp directory for test - check disk space and system temp directory permissions', 'failed to query stats from database - connection may be lost or stats table corrupted', 'last_scan_completed should be Some after scan, but was None - check scan_and_persist updates stats correctly'. All 282 tests pass. Code reviews: nick-isms approved with no blocking issues, testing-guru confirmed messages are genuinely helpful for debugging, semver-nag approved noting no semver concerns and good defensive patterns already in place."
     },
     {
       "id": "US-021",

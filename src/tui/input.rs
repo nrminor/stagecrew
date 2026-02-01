@@ -990,7 +990,9 @@ mod tests {
             app.pending_approval.is_some(),
             "Pending approval should be set"
         );
-        let (dir_id, path) = app.pending_approval.as_ref().unwrap();
+        let (dir_id, path) = app.pending_approval.as_ref().expect(
+            "pending approval should be set by 'x' key press - check InputHandler approval logic",
+        );
         assert_eq!(*dir_id, test_dir.id, "Directory ID should match");
         assert_eq!(path, "/test/path", "Path should match");
     }
@@ -1214,7 +1216,9 @@ mod tests {
 
         // Should have pending ignore set
         assert!(app.pending_ignore.is_some(), "Pending ignore should be set");
-        let (dir_id, path) = app.pending_ignore.as_ref().unwrap();
+        let (dir_id, path) = app.pending_ignore.as_ref().expect(
+            "pending ignore should be set by 'i' key press - check InputHandler ignore logic",
+        );
         assert_eq!(*dir_id, test_dir.id, "Directory ID should match");
         assert_eq!(path, "/test/ignore", "Path should match");
     }
@@ -1441,7 +1445,9 @@ mod tests {
             app.pending_deferral.is_some(),
             "Pending deferral should be set"
         );
-        let deferral = app.pending_deferral.as_ref().unwrap();
+        let deferral = app.pending_deferral.as_ref().expect(
+            "pending deferral should be set by 'd' key press - check InputHandler defer logic",
+        );
         assert_eq!(
             deferral.directory_id, test_dir.id,
             "Directory ID should match"
@@ -1490,7 +1496,9 @@ mod tests {
             make_key_event(KeyCode::Char('3')),
         );
         assert!(app.pending_deferral.is_some());
-        let deferral = app.pending_deferral.as_ref().unwrap();
+        let deferral = app.pending_deferral.as_ref().expect(
+            "pending deferral should be set by 'd' key press - check InputHandler defer logic",
+        );
         assert_eq!(deferral.input, "3", "Input should be '3'");
 
         InputHandler::handle(
@@ -1499,7 +1507,9 @@ mod tests {
             &db,
             make_key_event(KeyCode::Char('0')),
         );
-        let deferral = app.pending_deferral.as_ref().unwrap();
+        let deferral = app.pending_deferral.as_ref().expect(
+            "pending deferral should be set by 'd' key press - check InputHandler defer logic",
+        );
         assert_eq!(deferral.input, "30", "Input should be '30'");
     }
 
@@ -1522,7 +1532,9 @@ mod tests {
             make_key_event(KeyCode::Backspace),
         );
         assert!(app.pending_deferral.is_some());
-        let deferral = app.pending_deferral.as_ref().unwrap();
+        let deferral = app.pending_deferral.as_ref().expect(
+            "pending deferral should be set by 'd' key press - check InputHandler defer logic",
+        );
         assert_eq!(deferral.input, "12", "Input should be '12' after backspace");
 
         // Press backspace again
@@ -1532,7 +1544,9 @@ mod tests {
             &db,
             make_key_event(KeyCode::Backspace),
         );
-        let deferral = app.pending_deferral.as_ref().unwrap();
+        let deferral = app.pending_deferral.as_ref().expect(
+            "pending deferral should be set by 'd' key press - check InputHandler defer logic",
+        );
         assert_eq!(
             deferral.input, "1",
             "Input should be '1' after second backspace"
@@ -1591,7 +1605,7 @@ mod tests {
             updated_dir.deferred_until.is_some(),
             "deferred_until should be set"
         );
-        let deferred_until = updated_dir.deferred_until.unwrap();
+        let deferred_until = updated_dir.deferred_until.expect("deferred_until should be set after deferral confirmation - check database update logic");
         let expected = now + (30 * 86400);
         // Allow 5 seconds of test execution time
         assert!(
@@ -1645,7 +1659,7 @@ mod tests {
         assert_eq!(updated_dir.status, "deferred");
 
         // Should set deferred_until to approximately 90 days from now (default)
-        let deferred_until = updated_dir.deferred_until.unwrap();
+        let deferred_until = updated_dir.deferred_until.expect("deferred_until should be set after deferral confirmation - check database update logic");
         let expected = now + (90 * 86400);
         assert!(
             (deferred_until - expected).abs() <= 5,
@@ -1772,9 +1786,14 @@ mod tests {
         );
 
         // Check that details contains "45 days"
-        let entry = defer_entry.unwrap();
+        let entry = defer_entry
+            .expect("audit entry should exist after defer action - check AuditService recording");
         assert!(
-            entry.details.as_ref().unwrap().contains("45 days"),
+            entry
+                .details
+                .as_ref()
+                .expect("audit entry should have details field - check AuditService recording")
+                .contains("45 days"),
             "Audit entry should contain deferral period"
         );
     }
@@ -1800,7 +1819,9 @@ mod tests {
 
         // Input should remain unchanged
         assert!(app.pending_deferral.is_some());
-        let deferral = app.pending_deferral.as_ref().unwrap();
+        let deferral = app.pending_deferral.as_ref().expect(
+            "pending deferral should be set by 'd' key press - check InputHandler defer logic",
+        );
         assert_eq!(
             deferral.input, "12",
             "Input should remain '12' (non-digit ignored)"
@@ -1962,7 +1983,9 @@ mod tests {
             app.pending_approval.is_some(),
             "Pending approval should be set"
         );
-        let (dir_id, path) = app.pending_approval.as_ref().unwrap();
+        let (dir_id, path) = app.pending_approval.as_ref().expect(
+            "pending approval should be set by 'x' key press - check InputHandler approval logic",
+        );
         assert_eq!(*dir_id, test_dir.id, "Directory ID should match");
         assert_eq!(path, "/test/pending", "Path should match");
     }
@@ -1999,7 +2022,9 @@ mod tests {
             app.pending_deferral.is_some(),
             "Pending deferral should be set"
         );
-        let deferral = app.pending_deferral.as_ref().unwrap();
+        let deferral = app.pending_deferral.as_ref().expect(
+            "pending deferral should be set by 'd' key press - check InputHandler defer logic",
+        );
         assert_eq!(
             deferral.directory_id, test_dir.id,
             "Directory ID should match"
@@ -2037,7 +2062,9 @@ mod tests {
 
         // Should have pending ignore set
         assert!(app.pending_ignore.is_some(), "Pending ignore should be set");
-        let (dir_id, path) = app.pending_ignore.as_ref().unwrap();
+        let (dir_id, path) = app.pending_ignore.as_ref().expect(
+            "pending ignore should be set by 'i' key press - check InputHandler ignore logic",
+        );
         assert_eq!(*dir_id, test_dir.id, "Directory ID should match");
         assert_eq!(path, "/test/ignore_pending", "Path should match");
     }

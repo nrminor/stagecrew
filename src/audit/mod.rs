@@ -183,9 +183,12 @@ mod tests {
 
     /// Helper to create a temporary database for testing.
     fn temp_database() -> (Database, TempDir) {
-        let temp_dir = TempDir::with_prefix("stagecrew-audit-test-").unwrap();
+        let temp_dir = TempDir::with_prefix("stagecrew-audit-test-").expect(
+            "failed to create temp directory for audit test - check disk space and permissions",
+        );
         let db_path = temp_dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         (db, temp_dir)
     }
 
@@ -202,10 +205,14 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
 
         // Verify entry was recorded
-        let entries = audit.list_recent(10).unwrap();
+        let entries = audit
+            .list_recent(10)
+            .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(entries.len(), 1, "Expected 1 audit entry");
         assert_eq!(entries[0].user, "alice");
         assert_eq!(entries[0].action, "approve");
@@ -228,9 +235,13 @@ mod tests {
                 Some("Changed expiration to 60 days"),
                 None,
             )
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
 
-        let entries = audit.list_recent(10).unwrap();
+        let entries = audit
+            .list_recent(10)
+            .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].user, "system");
         assert_eq!(entries[0].action, "config_change");
@@ -251,11 +262,15 @@ mod tests {
 
         // Create a directory first so we have a valid foreign key
         db.insert_or_update_directory("/data/important", 1024, 5, Some(1000), 1_700_000_000)
-            .unwrap();
+            .expect(
+                "failed to insert test directory to database - connection may be lost or disk full",
+            );
         let dir = db
             .get_directory_by_path("/data/important")
-            .unwrap()
-            .unwrap();
+            .expect("failed to query directory by path - database connection may be lost")
+            .expect(
+                "expected directory to exist after insertion - verify test database is working",
+            );
 
         audit
             .record(
@@ -265,9 +280,13 @@ mod tests {
                 Some("Deferred for 30 days"),
                 Some(dir.id),
             )
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
 
-        let entries = audit.list_recent(10).unwrap();
+        let entries = audit
+            .list_recent(10)
+            .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].user, "bob");
         assert_eq!(entries[0].action, "defer");
@@ -293,10 +312,14 @@ mod tests {
         for (action, _expected_str) in &actions {
             audit
                 .record("user", *action, Some("/test"), None, None)
-                .unwrap();
+                .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
         }
 
-        let entries = audit.list_recent(10).unwrap();
+        let entries = audit
+            .list_recent(10)
+            .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(
             entries.len(),
             actions.len(),
@@ -316,7 +339,9 @@ mod tests {
         let (db, _temp_dir) = temp_database();
         let audit = AuditService::new(&db);
 
-        let entries = audit.list_recent(10).unwrap();
+        let entries = audit
+            .list_recent(10)
+            .expect("failed to query recent audit entries - database connection may be lost");
         assert!(entries.is_empty(), "Expected empty list for empty database");
     }
 
@@ -327,9 +352,13 @@ mod tests {
 
         audit
             .record("user", AuditAction::Scan, Some("/test"), None, None)
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
 
-        let entries = audit.list_recent(0).unwrap();
+        let entries = audit
+            .list_recent(0)
+            .expect("failed to query recent audit entries - database connection may be lost");
         assert!(entries.is_empty(), "Expected empty list when limit is zero");
     }
 
@@ -348,10 +377,12 @@ mod tests {
                     None,
                     None,
                 )
-                .unwrap();
+                .expect("failed to record audit entry to database - connection may be lost or disk full");
         }
 
-        let entries = audit.list_recent(5).unwrap();
+        let entries = audit
+            .list_recent(5)
+            .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(entries.len(), 5, "Expected limit of 5 to be respected");
 
         // Should get most recent entries (9, 8, 7, 6, 5)
@@ -367,19 +398,27 @@ mod tests {
         // Record entries with slight delays to ensure different timestamps
         audit
             .record("user", AuditAction::Scan, Some("/first"), None, None)
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         audit
             .record("user", AuditAction::Approve, Some("/second"), None, None)
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         audit
             .record("user", AuditAction::Remove, Some("/third"), None, None)
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
 
-        let entries = audit.list_recent(10).unwrap();
+        let entries = audit
+            .list_recent(10)
+            .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(entries.len(), 3);
 
         // Most recent first
@@ -406,7 +445,9 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
         audit
             .record(
                 "bob",
@@ -415,7 +456,9 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
         audit
             .record(
                 "charlie",
@@ -424,7 +467,9 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
         audit
             .record(
                 "dave",
@@ -433,9 +478,13 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
 
-        let entries = audit.list_by_path("/data/project1").unwrap();
+        let entries = audit
+            .list_by_path("/data/project1")
+            .expect("failed to query audit entries by path - database connection may be lost");
         assert_eq!(entries.len(), 3, "Expected 3 entries for /data/project1");
 
         // All entries should be for project1
@@ -456,9 +505,13 @@ mod tests {
 
         audit
             .record("user", AuditAction::Scan, Some("/data/exists"), None, None)
-            .unwrap();
+            .expect(
+                "failed to record audit entry to database - connection may be lost or disk full",
+            );
 
-        let entries = audit.list_by_path("/data/nonexistent").unwrap();
+        let entries = audit
+            .list_by_path("/data/nonexistent")
+            .expect("failed to query audit entries by path - database connection may be lost");
         assert!(
             entries.is_empty(),
             "Expected no entries for nonexistent path"

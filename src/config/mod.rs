@@ -162,6 +162,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -256,7 +257,14 @@ mod tests {
 
         assert_eq!(result, explicit_db);
         // Parent directory should have been created
-        assert!(explicit_db.parent().unwrap().exists());
+        assert!(
+            explicit_db
+                .parent()
+                .expect(
+                    "database path should have a parent directory - check that the path is not root"
+                )
+                .exists()
+        );
     }
 
     #[test]
@@ -278,7 +286,14 @@ mod tests {
         let expected = temp_dir.path().join("staging/.stagecrew/stagecrew.db");
         assert_eq!(result, expected);
         // .stagecrew directory should have been created
-        assert!(expected.parent().unwrap().exists());
+        assert!(
+            expected
+                .parent()
+                .expect(
+                    "database path should have a parent directory - check that the path is not root"
+                )
+                .exists()
+        );
     }
 
     #[test]

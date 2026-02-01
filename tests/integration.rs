@@ -34,10 +34,10 @@ use stagecrew::scanner::{Scanner, scan_and_persist, transition_expired_paths};
 #[tokio::test]
 async fn test_full_workflow() {
     // 1. Set up test environment with temporary directories
-    let temp_root = TempDir::with_prefix("stagecrew-integration-").unwrap();
+    let temp_root = TempDir::with_prefix("stagecrew-integration-").expect("failed to create integration test temp directory - check disk space and system temp directory permissions");
     let db_path = temp_root.path().join("test.db");
     let tracked_dir = temp_root.path().join("staging");
-    fs::create_dir_all(&tracked_dir).unwrap();
+    fs::create_dir_all(&tracked_dir).expect("failed to create staging directory for integration test - check disk space and write permissions");
 
     // Create files with varying ages
     // - old_dir: 95 days old (will expire with 90 day policy)
@@ -47,9 +47,12 @@ async fn test_full_workflow() {
     let recent_dir = tracked_dir.join("recent_data");
     let middle_dir = tracked_dir.join("middle_data");
 
-    fs::create_dir_all(&old_dir).unwrap();
-    fs::create_dir_all(&recent_dir).unwrap();
-    fs::create_dir_all(&middle_dir).unwrap();
+    fs::create_dir_all(&old_dir)
+        .expect("failed to create old_data test directory - check disk space and permissions");
+    fs::create_dir_all(&recent_dir)
+        .expect("failed to create recent_data test directory - check disk space and permissions");
+    fs::create_dir_all(&middle_dir)
+        .expect("failed to create middle_data test directory - check disk space and permissions");
 
     // Create files and set their modification times
     create_file_with_age(&old_dir.join("file1.txt"), 95, 1024);
@@ -275,7 +278,7 @@ async fn test_full_workflow() {
         remove_entry
             .details
             .as_ref()
-            .unwrap()
+            .expect("remove audit entry should have details field populated with bytes freed - check removal service records details correctly")
             .contains(&(1024 + 2048).to_string()),
         "remove entry should mention bytes freed"
     );

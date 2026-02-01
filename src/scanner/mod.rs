@@ -690,6 +690,8 @@ pub struct DirectoryInfo {
 
 #[cfg(test)]
 mod tests {
+    // Allow: Test code should panic on unexpected errors for fast failure.
+    // Using expect() instead of unwrap() in tests adds noise without value.
     use super::*;
     use filetime::{FileTime, set_file_mtime};
     use std::fs::File;
@@ -705,7 +707,9 @@ mod tests {
 
     /// Helper to create a temporary directory with test files.
     fn create_test_tree() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create a simple directory structure:
@@ -715,20 +719,36 @@ mod tests {
         //     file2.txt (200 bytes)
         //     file3.txt (300 bytes)
 
-        let mut file1 = File::create(root.join("file1.txt")).unwrap();
-        file1.write_all(&[0u8; 100]).unwrap();
-        file1.sync_all().unwrap();
+        let mut file1 = File::create(root.join("file1.txt"))
+            .expect("failed to create test file - check disk space and permissions");
+        file1
+            .write_all(&[0u8; 100])
+            .expect("failed to write test data to file - disk may be full");
+        file1
+            .sync_all()
+            .expect("failed to sync test file to disk - check filesystem health");
 
         let subdir = root.join("subdir");
-        fs::create_dir(&subdir).unwrap();
+        fs::create_dir(&subdir)
+            .expect("failed to create test directory - check disk space and permissions");
 
-        let mut file2 = File::create(subdir.join("file2.txt")).unwrap();
-        file2.write_all(&[0u8; 200]).unwrap();
-        file2.sync_all().unwrap();
+        let mut file2 = File::create(subdir.join("file2.txt"))
+            .expect("failed to create test file - check disk space and permissions");
+        file2
+            .write_all(&[0u8; 200])
+            .expect("failed to write test data to file - disk may be full");
+        file2
+            .sync_all()
+            .expect("failed to sync test file to disk - check filesystem health");
 
-        let mut file3 = File::create(subdir.join("file3.txt")).unwrap();
-        file3.write_all(&[0u8; 300]).unwrap();
-        file3.sync_all().unwrap();
+        let mut file3 = File::create(subdir.join("file3.txt"))
+            .expect("failed to create test file - check disk space and permissions");
+        file3
+            .write_all(&[0u8; 300])
+            .expect("failed to write test data to file - disk may be full");
+        file3
+            .sync_all()
+            .expect("failed to sync test file to disk - check filesystem health");
 
         temp_dir
     }
@@ -739,7 +759,9 @@ mod tests {
         let root = temp_dir.path();
 
         let scanner = Scanner::new();
-        let result = scanner.scan(root).await.unwrap();
+        let result = scanner.scan(root).await.expect(
+            "scanner should successfully scan test directory - check permissions and disk space",
+        );
 
         assert_eq!(result.total_files, 3, "Expected 3 files to be found");
         assert_eq!(
@@ -754,7 +776,9 @@ mod tests {
         let root = temp_dir.path();
 
         let scanner = Scanner::new();
-        let result = scanner.scan(root).await.unwrap();
+        let result = scanner.scan(root).await.expect(
+            "scanner should successfully scan test directory - check permissions and disk space",
+        );
 
         assert_eq!(
             result.directories_found.len(),
@@ -793,7 +817,9 @@ mod tests {
         let root = temp_dir.path();
 
         let scanner = Scanner::new();
-        let result = scanner.scan(root).await.unwrap();
+        let result = scanner.scan(root).await.expect(
+            "scanner should successfully scan test directory - check permissions and disk space",
+        );
 
         // All directories should have an oldest_mtime
         for dir_info in &result.directories_found {
@@ -813,7 +839,7 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "Expected error for nonexistent path");
-        match result.unwrap_err() {
+        match result.expect_err("expected error result for nonexistent path") {
             Error::PathNotFound(_) => {}
             e => panic!("Expected PathNotFound error, got: {e:?}"),
         }
@@ -821,15 +847,18 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_fails_on_file_path() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let file_path = temp_dir.path().join("file.txt");
-        File::create(&file_path).unwrap();
+        File::create(&file_path)
+            .expect("failed to create test file - check disk space and permissions");
 
         let scanner = Scanner::new();
         let result = scanner.scan(&file_path).await;
 
         assert!(result.is_err(), "Expected error when scanning a file");
-        match result.unwrap_err() {
+        match result.expect_err("expected error result when scanning a file path") {
             Error::Filesystem { .. } => {}
             e => panic!("Expected Filesystem error about directory, got: {e:?}"),
         }
@@ -837,10 +866,14 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_handles_empty_directory() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
 
         let scanner = Scanner::new();
-        let result = scanner.scan(temp_dir.path()).await.unwrap();
+        let result = scanner.scan(temp_dir.path()).await.expect(
+            "scanner should successfully scan test directory - check permissions and disk space",
+        );
 
         assert_eq!(result.total_files, 0, "Expected no files");
         assert_eq!(result.total_size_bytes, 0, "Expected zero size");
@@ -853,24 +886,33 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_resolves_symlinks() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create a file
         let target_file = root.join("target.txt");
-        let mut file = File::create(&target_file).unwrap();
-        file.write_all(&[0u8; 150]).unwrap();
-        file.sync_all().unwrap();
+        let mut file = File::create(&target_file)
+            .expect("failed to create test file - check disk space and permissions");
+        file.write_all(&[0u8; 150])
+            .expect("failed to write test data to file - disk may be full");
+        file.sync_all()
+            .expect("failed to sync test file to disk - check filesystem health");
 
         // Create a symlink to the file
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
-            symlink(&target_file, root.join("link.txt")).unwrap();
+            symlink(&target_file, root.join("link.txt")).expect(
+                "failed to create symlink for test - check filesystem support for symlinks",
+            );
         }
 
         let scanner = Scanner::new();
-        let result = scanner.scan(root).await.unwrap();
+        let result = scanner.scan(root).await.expect(
+            "scanner should successfully scan test directory - check permissions and disk space",
+        );
 
         // On Unix, we should see both the file and the symlink as files
         // (fs::metadata resolves symlinks)
@@ -893,19 +935,27 @@ mod tests {
     async fn scanner_skips_broken_symlinks_gracefully() {
         use std::os::unix::fs::symlink;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create a valid file
-        let mut file = File::create(root.join("valid.txt")).unwrap();
-        file.write_all(&[0u8; 100]).unwrap();
-        file.sync_all().unwrap();
+        let mut file = File::create(root.join("valid.txt"))
+            .expect("failed to create test file - check disk space and permissions");
+        file.write_all(&[0u8; 100])
+            .expect("failed to write test data to file - disk may be full");
+        file.sync_all()
+            .expect("failed to sync test file to disk - check filesystem health");
 
         // Create a broken symlink pointing to a non-existent target
-        symlink("/nonexistent/target", root.join("broken_link")).unwrap();
+        symlink("/nonexistent/target", root.join("broken_link"))
+            .expect("failed to create symlink for test - check filesystem support for symlinks");
 
         let scanner = Scanner::new();
-        let result = scanner.scan(root).await.unwrap();
+        let result = scanner.scan(root).await.expect(
+            "scanner should successfully scan test directory - check permissions and disk space",
+        );
 
         // Scan should succeed, only counting the valid file
         // The broken symlink will cause a metadata error which is logged and skipped
@@ -918,21 +968,32 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_correctly_identifies_oldest_mtime() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create two files
         let file1 = root.join("old.txt");
         let file2 = root.join("new.txt");
-        File::create(&file1).unwrap().write_all(&[0u8; 10]).unwrap();
-        File::create(&file2).unwrap().write_all(&[0u8; 10]).unwrap();
+        File::create(&file1)
+            .expect("failed to create test file - check disk space and permissions")
+            .write_all(&[0u8; 10])
+            .expect("failed to write test data to file - disk may be full");
+        File::create(&file2)
+            .expect("failed to create test file - check disk space and permissions")
+            .write_all(&[0u8; 10])
+            .expect("failed to write test data to file - disk may be full");
 
         // Set file1 to an older time (2001-09-09)
         let old_time = FileTime::from_unix_time(1_000_000_000, 0);
-        set_file_mtime(&file1, old_time).unwrap();
+        set_file_mtime(&file1, old_time)
+            .expect("failed to set file modification time for test - check filesystem support");
 
         let scanner = Scanner::new();
-        let result = scanner.scan(root).await.unwrap();
+        let result = scanner.scan(root).await.expect(
+            "scanner should successfully scan test directory - check permissions and disk space",
+        );
 
         let root_dir = result
             .directories_found
@@ -947,7 +1008,8 @@ mod tests {
         // Verify it's the older file's mtime
         // We can't compare exact timestamps due to precision differences,
         // but we can verify it's close to the old timestamp
-        let expected = jiff::Timestamp::from_second(1_000_000_000).unwrap();
+        let expected = jiff::Timestamp::from_second(1_000_000_000)
+            .expect("timestamp should be valid for test data - check time value is in valid range");
 
         // Should be within 1 second (accounting for filesystem timestamp precision)
         let diff_seconds = (oldest.as_second() - expected.as_second()).abs();
@@ -959,16 +1021,25 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_includes_hidden_files() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create a hidden file (starts with dot)
-        let mut hidden = File::create(root.join(".hidden")).unwrap();
-        hidden.write_all(&[0u8; 50]).unwrap();
-        hidden.sync_all().unwrap();
+        let mut hidden = File::create(root.join(".hidden"))
+            .expect("failed to create test file - check disk space and permissions");
+        hidden
+            .write_all(&[0u8; 50])
+            .expect("failed to write test data to file - disk may be full");
+        hidden
+            .sync_all()
+            .expect("failed to sync test file to disk - check filesystem health");
 
         let scanner = Scanner::new();
-        let result = scanner.scan(root).await.unwrap();
+        let result = scanner.scan(root).await.expect(
+            "scanner should successfully scan test directory - check permissions and disk space",
+        );
 
         assert_eq!(result.total_files, 1, "Hidden file should be counted");
         assert_eq!(result.total_size_bytes, 50);
@@ -982,7 +1053,7 @@ mod tests {
         // File modified 10 days ago
         let ten_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(10 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         let days_remaining = super::calculate_expiration(ten_days_ago.as_second(), 90);
 
@@ -999,7 +1070,7 @@ mod tests {
         // File modified 100 days ago (expired for 90-day policy)
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         let days_remaining = super::calculate_expiration(hundred_days_ago.as_second(), 90);
 
@@ -1016,7 +1087,7 @@ mod tests {
         // File modified exactly 90 days ago
         let ninety_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(90 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         let days_remaining = super::calculate_expiration(ninety_days_ago.as_second(), 90);
 
@@ -1033,7 +1104,7 @@ mod tests {
         // File modified 20 days ago
         let twenty_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(20 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         // 30-day expiration policy
         let days_remaining = super::calculate_expiration(twenty_days_ago.as_second(), 30);
@@ -1055,7 +1126,7 @@ mod tests {
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         let _id = db
             .insert_or_update_directory(
@@ -1070,12 +1141,15 @@ mod tests {
         // Verify initial status is 'tracked'
         let dir_before = db
             .get_directory_by_path("/data/expired")
-            .expect("query")
-            .expect("exists");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir_before.status, "tracked");
 
         // Run transition with 90-day expiration policy and auto_remove=false
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 1);
         assert_eq!(summary.expired_to_approved, 0);
@@ -1084,19 +1158,23 @@ mod tests {
         // Verify status changed to 'pending'
         let dir_after = db
             .get_directory_by_path("/data/expired")
-            .expect("query")
-            .expect("exists");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir_after.status, "pending");
 
         // Verify audit entry was created
         let audit = crate::audit::AuditService::new(&db);
-        let entries = audit.list_by_path("/data/expired").expect("query audit");
+        let entries = audit
+            .list_by_path("/data/expired")
+            .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(entries.len(), 1);
         assert!(
             entries[0]
                 .details
                 .as_ref()
-                .unwrap()
+                .expect("audit entry should have details field populated")
                 .contains("pending approval")
         );
     }
@@ -1109,7 +1187,7 @@ mod tests {
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         db.insert_or_update_directory(
             "/data/expired",
@@ -1118,10 +1196,11 @@ mod tests {
             Some(hundred_days_ago.as_second()),
             now.as_second(),
         )
-        .expect("insert directory");
+        .expect("failed to insert test directory - database connection may be lost");
 
         // Run transition with auto_remove=true
-        let summary = super::transition_expired_paths(&db, 90, true).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, true)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
         assert_eq!(summary.expired_to_approved, 1);
@@ -1130,8 +1209,10 @@ mod tests {
         // Verify status changed to 'approved'
         let dir = db
             .get_directory_by_path("/data/expired")
-            .expect("query")
-            .expect("exists");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir.status, "approved");
     }
 
@@ -1143,7 +1224,7 @@ mod tests {
         let now = jiff::Timestamp::now();
         let ten_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(10 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         db.insert_or_update_directory(
             "/data/recent",
@@ -1152,10 +1233,11 @@ mod tests {
             Some(ten_days_ago.as_second()),
             now.as_second(),
         )
-        .expect("insert directory");
+        .expect("failed to insert test directory - database connection may be lost");
 
         // Run transition with 90-day policy
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
         assert_eq!(summary.expired_to_approved, 0);
@@ -1164,8 +1246,10 @@ mod tests {
         // Verify status unchanged
         let dir = db
             .get_directory_by_path("/data/recent")
-            .expect("query")
-            .expect("exists");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir.status, "tracked");
     }
 
@@ -1176,12 +1260,12 @@ mod tests {
         let now = jiff::Timestamp::now();
         let yesterday = now
             .checked_sub(jiff::SignedDuration::from_secs(SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         // Insert a directory with deferred status
         let id = db
             .insert_or_update_directory("/data/deferred", 1024, 5, None, now.as_second())
-            .expect("insert directory");
+            .expect("failed to insert test directory - database connection may be lost");
 
         // Set status to 'deferred' with deferred_until in the past
         db.conn()
@@ -1189,18 +1273,21 @@ mod tests {
                 "UPDATE directories SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
                 (yesterday.as_second(), id),
             )
-            .expect("set deferred status");
+            .expect("failed to update directory status in test - database connection may be lost");
 
         // Verify initial state
         let dir_before = db
             .get_directory_by_path("/data/deferred")
-            .expect("query")
-            .expect("exists");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir_before.status, "deferred");
         assert!(dir_before.deferred_until.is_some());
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
         assert_eq!(summary.expired_to_approved, 0);
@@ -1209,8 +1296,10 @@ mod tests {
         // Verify status reset to 'tracked' and deferred_until cleared
         let dir_after = db
             .get_directory_by_path("/data/deferred")
-            .expect("query")
-            .expect("exists");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir_after.status, "tracked");
         assert_eq!(dir_after.deferred_until, None);
     }
@@ -1222,12 +1311,12 @@ mod tests {
         let now = jiff::Timestamp::now();
         let next_week = now
             .checked_add(jiff::SignedDuration::from_secs(7 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         // Insert a directory with deferred status
         let id = db
             .insert_or_update_directory("/data/deferred", 1024, 5, None, now.as_second())
-            .expect("insert directory");
+            .expect("failed to insert test directory - database connection may be lost");
 
         // Set status to 'deferred' with deferred_until in the future
         db.conn()
@@ -1235,10 +1324,11 @@ mod tests {
                 "UPDATE directories SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
                 (next_week.as_second(), id),
             )
-            .expect("set deferred status");
+            .expect("failed to update directory status in test - database connection may be lost");
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
         assert_eq!(summary.expired_to_approved, 0);
@@ -1247,8 +1337,10 @@ mod tests {
         // Verify status unchanged
         let dir = db
             .get_directory_by_path("/data/deferred")
-            .expect("query")
-            .expect("exists");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir.status, "deferred");
         assert_eq!(dir.deferred_until, Some(next_week.as_second()));
     }
@@ -1261,7 +1353,7 @@ mod tests {
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         let id = db
             .insert_or_update_directory(
@@ -1271,14 +1363,15 @@ mod tests {
                 Some(hundred_days_ago.as_second()),
                 now.as_second(),
             )
-            .expect("insert directory");
+            .expect("failed to insert test directory - database connection may be lost");
 
         // Set status to 'ignored'
         db.update_directory_status(id, "ignored")
-            .expect("update status");
+            .expect("failed to update directory status - database connection may be lost");
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
         assert_eq!(summary.expired_to_approved, 0);
@@ -1287,8 +1380,10 @@ mod tests {
         // Verify status unchanged
         let dir = db
             .get_directory_by_path("/data/ignored")
-            .expect("query")
-            .expect("exists");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir.status, "ignored");
     }
 
@@ -1299,13 +1394,13 @@ mod tests {
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
         let ten_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(10 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
         let yesterday = now
             .checked_sub(jiff::SignedDuration::from_secs(SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         // Expired tracked directory
         db.insert_or_update_directory(
@@ -1315,7 +1410,7 @@ mod tests {
             Some(hundred_days_ago.as_second()),
             now.as_second(),
         )
-        .expect("insert");
+        .expect("failed to insert test directory - database connection may be lost");
 
         // Another expired tracked directory
         db.insert_or_update_directory(
@@ -1325,7 +1420,7 @@ mod tests {
             Some(hundred_days_ago.as_second()),
             now.as_second(),
         )
-        .expect("insert");
+        .expect("failed to insert test directory - database connection may be lost");
 
         // Non-expired tracked directory
         db.insert_or_update_directory(
@@ -1335,21 +1430,22 @@ mod tests {
             Some(ten_days_ago.as_second()),
             now.as_second(),
         )
-        .expect("insert");
+        .expect("failed to insert test directory - database connection may be lost");
 
         // Expired deferral
         let deferred_id = db
             .insert_or_update_directory("/data/deferred", 256, 1, None, now.as_second())
-            .expect("insert");
+            .expect("failed to insert test directory - database connection may be lost");
         db.conn()
             .execute(
                 "UPDATE directories SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
                 (yesterday.as_second(), deferred_id),
             )
-            .expect("set deferred");
+            .expect("failed to update directory status in test - database connection may be lost");
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 2);
         assert_eq!(summary.expired_to_approved, 0);
@@ -1358,29 +1454,29 @@ mod tests {
         // Verify each directory
         assert_eq!(
             db.get_directory_by_path("/data/expired1")
-                .unwrap()
-                .unwrap()
+                .expect("failed to query directory from database - connection may be lost")
+                .expect("expected directory to exist after scan - verify scanner persisted data correctly")
                 .status,
             "pending"
         );
         assert_eq!(
             db.get_directory_by_path("/data/expired2")
-                .unwrap()
-                .unwrap()
+                .expect("failed to query directory from database - connection may be lost")
+                .expect("expected directory to exist after scan - verify scanner persisted data correctly")
                 .status,
             "pending"
         );
         assert_eq!(
             db.get_directory_by_path("/data/recent")
-                .unwrap()
-                .unwrap()
+                .expect("failed to query directory from database - connection may be lost")
+                .expect("expected directory to exist after scan - verify scanner persisted data correctly")
                 .status,
             "tracked"
         );
         assert_eq!(
             db.get_directory_by_path("/data/deferred")
-                .unwrap()
-                .unwrap()
+                .expect("failed to query directory from database - connection may be lost")
+                .expect("expected directory to exist after scan - verify scanner persisted data correctly")
                 .status,
             "tracked"
         );
@@ -1394,10 +1490,11 @@ mod tests {
 
         // Directory with no oldest_mtime (empty directory)
         db.insert_or_update_directory("/data/empty", 0, 0, None, now.as_second())
-            .expect("insert directory");
+            .expect("failed to insert test directory - database connection may be lost");
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         // Should not transition directories without mtime
         assert_eq!(summary.expired_to_pending, 0);
@@ -1407,8 +1504,10 @@ mod tests {
         // Verify status unchanged
         let dir = db
             .get_directory_by_path("/data/empty")
-            .expect("query")
-            .expect("exists");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir.status, "tracked");
     }
 
@@ -1420,7 +1519,7 @@ mod tests {
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         // Create directories with various statuses that should NOT be transitioned
         for (path, status) in [
@@ -1437,11 +1536,13 @@ mod tests {
                     Some(hundred_days_ago.as_second()),
                     now.as_second(),
                 )
-                .expect("insert");
-            db.update_directory_status(id, status).expect("set status");
+                .expect("failed to insert test directory - database connection may be lost");
+            db.update_directory_status(id, status)
+                .expect("failed to update directory status - database connection may be lost");
         }
 
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
         assert_eq!(summary.expired_to_approved, 0);
@@ -1454,7 +1555,7 @@ mod tests {
             ("/data/removed", "removed"),
             ("/data/blocked", "blocked"),
         ] {
-            let dir = db.get_directory_by_path(path).unwrap().unwrap();
+            let dir = db.get_directory_by_path(path).expect("failed to query directory from database - connection may be lost").expect("expected directory to exist after scan - verify scanner persisted data correctly");
             assert_eq!(
                 dir.status, expected_status,
                 "Status for {path} should be unchanged"
@@ -1469,7 +1570,7 @@ mod tests {
 
         let id = db
             .insert_or_update_directory("/data/deferred-null", 1024, 5, None, now.as_second())
-            .expect("insert");
+            .expect("failed to insert test directory - database connection may be lost");
 
         // Set status to deferred but leave deferred_until as NULL
         db.conn()
@@ -1477,17 +1578,20 @@ mod tests {
                 "UPDATE directories SET status = 'deferred' WHERE id = ?1",
                 (id,),
             )
-            .expect("set deferred status without deferred_until");
+            .expect("failed to update directory status in test - database connection may be lost");
 
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         // Should NOT reset because deferred_until is None
         assert_eq!(summary.deferred_reset, 0);
 
         let dir = db
             .get_directory_by_path("/data/deferred-null")
-            .unwrap()
-            .unwrap();
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
         assert_eq!(dir.status, "deferred");
     }
 
@@ -1495,7 +1599,8 @@ mod tests {
     fn transition_expired_paths_handles_empty_database() {
         let (_temp, db) = temp_database();
 
-        let summary = super::transition_expired_paths(&db, 90, false).expect("transition");
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
         assert_eq!(summary.expired_to_approved, 0);
@@ -1508,25 +1613,34 @@ mod tests {
     async fn scan_and_persist_creates_directory_records() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create test directory structure
         let project_dir = root.join("project");
-        fs::create_dir(&project_dir).unwrap();
-        let mut file1 = File::create(project_dir.join("file1.txt")).unwrap();
-        file1.write_all(&[0u8; 100]).unwrap();
-        file1.sync_all().unwrap();
+        fs::create_dir(&project_dir)
+            .expect("failed to create test directory - check disk space and permissions");
+        let mut file1 = File::create(project_dir.join("file1.txt"))
+            .expect("failed to create test file - check disk space and permissions");
+        file1
+            .write_all(&[0u8; 100])
+            .expect("failed to write test data to file - disk may be full");
+        file1
+            .sync_all()
+            .expect("failed to sync test file to disk - check filesystem health");
 
         // Create database
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
 
         // Run scan_and_persist
         let scanner = Scanner::new();
         let summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Verify summary
         assert_eq!(summary.total_directories, 1);
@@ -1536,8 +1650,10 @@ mod tests {
         // Verify directory was persisted
         let dir = db
             .get_directory_by_path(&project_dir.to_string_lossy())
-            .unwrap()
-            .expect("directory should exist in database");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
 
         assert_eq!(dir.path, project_dir.to_string_lossy());
         assert_eq!(dir.size_bytes, 100);
@@ -1551,37 +1667,45 @@ mod tests {
     async fn scan_and_persist_creates_file_records() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create test files
         let project_dir = root.join("project");
-        fs::create_dir(&project_dir).unwrap();
+        fs::create_dir(&project_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(project_dir.join("a.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 10])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
         File::create(project_dir.join("b.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 20])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Get directory id
         let dir = db
             .get_directory_by_path(&project_dir.to_string_lossy())
-            .unwrap()
-            .expect("directory should exist");
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
 
         // Verify files were persisted
-        let files = db.list_files_by_directory(dir.id).unwrap();
+        let files = db
+            .list_files_by_directory(dir.id)
+            .expect("failed to list files from database - connection may be lost");
         assert_eq!(files.len(), 2, "Expected 2 files");
 
         // Files should be ordered by path
@@ -1595,24 +1719,28 @@ mod tests {
     async fn scan_and_persist_updates_stats_table() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create test structure
         let project_dir = root.join("project");
-        fs::create_dir(&project_dir).unwrap();
+        fs::create_dir(&project_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(project_dir.join("file.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 500])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, &[project_dir], 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Verify stats were updated
         let stats: (i64, i64, Option<i64>) = db
@@ -1623,7 +1751,7 @@ mod tests {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .unwrap();
+            .expect("failed to query stats from database - connection may be lost");
 
         assert_eq!(stats.0, 1, "Expected 1 tracked directory");
         assert_eq!(stats.1, 500, "Expected 500 bytes total");
@@ -1635,28 +1763,34 @@ mod tests {
         use crate::audit::AuditService;
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create test structure
         let project_dir = root.join("project");
-        fs::create_dir(&project_dir).unwrap();
+        fs::create_dir(&project_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(project_dir.join("file.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 100])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, &[project_dir], 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Verify audit entry was created
         let audit = AuditService::new(&db);
-        let entries = audit.list_recent(10).unwrap();
+        let entries = audit
+            .list_recent(10)
+            .expect("failed to query recent audit entries - database connection may be lost");
 
         assert_eq!(entries.len(), 1, "Expected 1 audit entry");
         assert_eq!(entries[0].action, "scan");
@@ -1665,7 +1799,7 @@ mod tests {
             entries[0]
                 .details
                 .as_ref()
-                .unwrap()
+                .expect("audit entry should have details field populated")
                 .contains("1 directories"),
             "Expected details to mention directories"
         );
@@ -1675,31 +1809,36 @@ mod tests {
     async fn scan_and_persist_handles_multiple_paths() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create two separate directories
         let dir1 = root.join("project1");
         let dir2 = root.join("project2");
-        fs::create_dir(&dir1).unwrap();
-        fs::create_dir(&dir2).unwrap();
+        fs::create_dir(&dir1)
+            .expect("failed to create test directory - check disk space and permissions");
+        fs::create_dir(&dir2)
+            .expect("failed to create test directory - check disk space and permissions");
 
         File::create(dir1.join("file1.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 100])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
         File::create(dir2.join("file2.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 200])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Create database and scan both paths
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let summary = scan_and_persist(&db, &scanner, &[dir1.clone(), dir2.clone()], 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Verify both directories were scanned
         assert_eq!(summary.total_directories, 2);
@@ -1709,12 +1848,12 @@ mod tests {
         // Verify both are in database
         assert!(
             db.get_directory_by_path(&dir1.to_string_lossy())
-                .unwrap()
+                .expect("failed to query directory from database - connection may be lost")
                 .is_some()
         );
         assert!(
             db.get_directory_by_path(&dir2.to_string_lossy())
-                .unwrap()
+                .expect("failed to query directory from database - connection may be lost")
                 .is_some()
         );
     }
@@ -1723,48 +1862,57 @@ mod tests {
     async fn scan_and_persist_upserts_existing_directories() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create test directory
         let project_dir = root.join("project");
-        fs::create_dir(&project_dir).unwrap();
+        fs::create_dir(&project_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(project_dir.join("file1.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 100])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Change directory status manually (simulating user action)
         let dir = db
             .get_directory_by_path(&project_dir.to_string_lossy())
-            .unwrap()
-            .unwrap();
-        db.update_directory_status(dir.id, "approved").unwrap();
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
+        db.update_directory_status(dir.id, "approved")
+            .expect("failed to update directory status - database connection may be lost");
 
         // Add a new file
         File::create(project_dir.join("file2.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 50])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Scan again
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Verify directory was updated but status preserved
         let updated_dir = db
             .get_directory_by_path(&project_dir.to_string_lossy())
-            .unwrap()
-            .unwrap();
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
 
         assert_eq!(updated_dir.id, dir.id, "ID should not change");
         assert_eq!(updated_dir.status, "approved", "Status should be preserved");
@@ -1781,36 +1929,43 @@ mod tests {
     async fn stats_update_calculates_paths_within_warning() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create a directory with a file that's within the warning period
         // For 90-day expiration and 14-day warning: file should be 77-89 days old to be in warning
         let warning_dir = root.join("warning");
-        fs::create_dir(&warning_dir).unwrap();
+        fs::create_dir(&warning_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(warning_dir.join("old.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 100])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Set the file's mtime to 80 days ago (within warning period)
         let now = jiff::Timestamp::now();
         let eighty_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(80 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
         let old_time = FileTime::from_unix_time(eighty_days_ago.as_second(), 0);
-        set_file_mtime(warning_dir.join("old.txt"), old_time).unwrap();
+        set_file_mtime(warning_dir.join("old.txt"), old_time)
+            .expect("failed to set file modification time for test - check filesystem support");
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, &[warning_dir], 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Verify stats were calculated correctly
-        let stats = db.get_stats().unwrap();
+        let stats = db
+            .get_stats()
+            .expect("failed to query stats from database - connection may be lost");
         assert_eq!(stats.total_tracked_paths, 1);
         assert_eq!(
             stats.paths_within_warning, 1,
@@ -1824,39 +1979,48 @@ mod tests {
     async fn stats_update_calculates_paths_pending_approval() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create a directory and manually set status to 'pending'
         let pending_dir = root.join("pending");
-        fs::create_dir(&pending_dir).unwrap();
+        fs::create_dir(&pending_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(pending_dir.join("file.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 50])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&pending_dir), 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Manually set status to 'pending'
         let dir = db
             .get_directory_by_path(&pending_dir.to_string_lossy())
-            .unwrap()
-            .unwrap();
-        db.update_directory_status(dir.id, "pending").unwrap();
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
+        db.update_directory_status(dir.id, "pending")
+            .expect("failed to update directory status - database connection may be lost");
 
         // Scan again to update stats
         let _summary = scan_and_persist(&db, &scanner, &[pending_dir], 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Verify stats
-        let stats = db.get_stats().unwrap();
+        let stats = db
+            .get_stats()
+            .expect("failed to query stats from database - connection may be lost");
         assert_eq!(stats.paths_pending_approval, 1);
     }
 
@@ -1864,35 +2028,42 @@ mod tests {
     async fn stats_update_calculates_paths_overdue() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create a directory with an old file (expired)
         let overdue_dir = root.join("overdue");
-        fs::create_dir(&overdue_dir).unwrap();
+        fs::create_dir(&overdue_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(overdue_dir.join("ancient.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 100])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Set file mtime to 100 days ago (overdue for 90-day expiration)
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
         let old_time = FileTime::from_unix_time(hundred_days_ago.as_second(), 0);
-        set_file_mtime(overdue_dir.join("ancient.txt"), old_time).unwrap();
+        set_file_mtime(overdue_dir.join("ancient.txt"), old_time)
+            .expect("failed to set file modification time for test - check filesystem support");
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, &[overdue_dir], 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Verify stats - should have 1 overdue path (status is still 'tracked')
-        let stats = db.get_stats().unwrap();
+        let stats = db
+            .get_stats()
+            .expect("failed to query stats from database - connection may be lost");
         assert_eq!(stats.total_tracked_paths, 1);
         assert_eq!(
             stats.paths_overdue, 1,
@@ -1906,7 +2077,9 @@ mod tests {
     async fn stats_update_handles_mixed_scenarios() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         let now = jiff::Timestamp::now();
@@ -1914,47 +2087,51 @@ mod tests {
         // Create three directories with different scenarios
         // 1. Recent file (safe)
         let safe_dir = root.join("safe");
-        fs::create_dir(&safe_dir).unwrap();
+        fs::create_dir(&safe_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(safe_dir.join("recent.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 50])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // 2. File 80 days old (warning period)
         let warning_dir = root.join("warning");
-        fs::create_dir(&warning_dir).unwrap();
+        fs::create_dir(&warning_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(warning_dir.join("warning.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 50])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
         let eighty_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(80 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
         set_file_mtime(
             warning_dir.join("warning.txt"),
             FileTime::from_unix_time(eighty_days_ago.as_second(), 0),
         )
-        .unwrap();
+        .expect("failed to set file modification time for test - check filesystem support");
 
         // 3. File 100 days old (overdue)
         let overdue_dir = root.join("overdue");
-        fs::create_dir(&overdue_dir).unwrap();
+        fs::create_dir(&overdue_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(overdue_dir.join("overdue.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 50])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
         set_file_mtime(
             overdue_dir.join("overdue.txt"),
             FileTime::from_unix_time(hundred_days_ago.as_second(), 0),
         )
-        .unwrap();
+        .expect("failed to set file modification time for test - check filesystem support");
 
         // Create database and scan all three
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(
             &db,
@@ -1964,14 +2141,19 @@ mod tests {
             14,
         )
         .await
-        .unwrap();
+        .expect(
+            "failed to scan and persist directories - check permissions and database connection",
+        );
 
         // Mark warning_dir as 'pending'
         let dir = db
             .get_directory_by_path(&warning_dir.to_string_lossy())
-            .unwrap()
-            .unwrap();
-        db.update_directory_status(dir.id, "pending").unwrap();
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
+        db.update_directory_status(dir.id, "pending")
+            .expect("failed to update directory status - database connection may be lost");
 
         // Scan again to update stats
         let _summary = scan_and_persist(
@@ -1982,10 +2164,14 @@ mod tests {
             14,
         )
         .await
-        .unwrap();
+        .expect(
+            "failed to scan and persist directories - check permissions and database connection",
+        );
 
         // Verify stats
-        let stats = db.get_stats().unwrap();
+        let stats = db
+            .get_stats()
+            .expect("failed to query stats from database - connection may be lost");
         assert_eq!(stats.total_tracked_paths, 3);
         assert_eq!(stats.paths_overdue, 1, "One overdue directory");
         assert_eq!(stats.paths_pending_approval, 1, "One pending directory");
@@ -2000,50 +2186,59 @@ mod tests {
     async fn stats_update_excludes_ignored_from_overdue_count() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
         let root = temp_dir.path();
 
         // Create directory with old file
         let ignored_dir = root.join("ignored");
-        fs::create_dir(&ignored_dir).unwrap();
+        fs::create_dir(&ignored_dir)
+            .expect("failed to create test directory - check disk space and permissions");
         File::create(ignored_dir.join("old.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 50])
-            .unwrap();
+            .expect("failed to write test data to file - disk may be full");
 
         // Set file to 100 days old
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic should succeed for test data - check duration values");
         set_file_mtime(
             ignored_dir.join("old.txt"),
             FileTime::from_unix_time(hundred_days_ago.as_second(), 0),
         )
-        .unwrap();
+        .expect("failed to set file modification time for test - check filesystem support");
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&ignored_dir), 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Mark as ignored
         let dir = db
             .get_directory_by_path(&ignored_dir.to_string_lossy())
-            .unwrap()
-            .unwrap();
-        db.update_directory_status(dir.id, "ignored").unwrap();
+            .expect("failed to query directory from database - connection may be lost")
+            .expect(
+                "expected directory to exist after scan - verify scanner persisted data correctly",
+            );
+        db.update_directory_status(dir.id, "ignored")
+            .expect("failed to update directory status - database connection may be lost");
 
         // Scan again to update stats
         let _summary = scan_and_persist(&db, &scanner, &[ignored_dir], 90, 14)
             .await
-            .unwrap();
+            .expect("failed to scan and persist directories - check permissions and database connection");
 
         // Verify stats - ignored directory should NOT be counted as overdue
-        let stats = db.get_stats().unwrap();
+        let stats = db
+            .get_stats()
+            .expect("failed to query stats from database - connection may be lost");
         assert_eq!(
             stats.paths_overdue, 0,
             "Ignored paths should not be counted as overdue"
@@ -2054,39 +2249,42 @@ mod tests {
     async fn stats_update_custom_expiration_warning_periods() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp directory for test - check disk space and system temp directory permissions");
         let root = temp_dir.path();
 
         // Create directory with file 25 days old
         let dir = root.join("test");
-        fs::create_dir(&dir).unwrap();
+        fs::create_dir(&dir).expect("failed to create test directory - check disk space and write permissions on temp directory");
         File::create(dir.join("file.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 50])
-            .unwrap();
+            .expect("failed to write test data - disk may be full or readonly");
 
         let now = jiff::Timestamp::now();
         let twentyfive_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(25 * SECS_PER_DAY))
-            .unwrap();
+            .expect("timestamp arithmetic overflow - 25 days should be valid, this indicates a system clock issue");
         set_file_mtime(
             dir.join("file.txt"),
             FileTime::from_unix_time(twentyfive_days_ago.as_second(), 0),
         )
-        .unwrap();
+        .expect("failed to set file modification time - check filesystem supports mtime updates");
 
         // Create database and scan with custom periods:
         // expiration_days = 30, warning_days = 7
         // File is 25 days old, so 5 days remaining - within 7-day warning period
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to initialize database - check disk space and SQLite is functioning");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, &[dir], 30, 7)
             .await
-            .unwrap();
+            .expect("scan_and_persist failed - check file permissions and database connection");
 
         // Verify stats
-        let stats = db.get_stats().unwrap();
+        let stats = db.get_stats().expect(
+            "failed to query stats from database - connection may be lost or stats table corrupted",
+        );
         assert_eq!(stats.total_tracked_paths, 1);
         assert_eq!(
             stats.paths_within_warning, 1,
@@ -2099,23 +2297,28 @@ mod tests {
     async fn stats_update_handles_directories_without_mtime() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp directory for test - check disk space and system temp directory permissions");
         let root = temp_dir.path();
 
         // Create empty directory (no files, so no oldest_mtime)
         let empty_dir = root.join("empty");
-        fs::create_dir(&empty_dir).unwrap();
+        fs::create_dir(&empty_dir).expect(
+            "failed to create empty test directory - check disk space and write permissions",
+        );
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to initialize database - check disk space and SQLite is functioning");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, &[empty_dir], 90, 14)
             .await
-            .unwrap();
+            .expect("scan_and_persist failed on empty directory - check permissions and database connection");
 
         // Verify stats - directories without mtime should not be counted in warning/overdue
-        let stats = db.get_stats().unwrap();
+        let stats = db.get_stats().expect(
+            "failed to query stats from database - connection may be lost or stats table corrupted",
+        );
         // Note: empty directories don't get inserted by scan_and_persist
         // because scan_directory_tree only aggregates directories with files
         assert_eq!(stats.total_tracked_paths, 0);
@@ -2127,38 +2330,42 @@ mod tests {
     async fn stats_update_sets_last_scan_completed_timestamp() {
         use crate::db::Database;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp directory for test - check disk space and system temp directory permissions");
         let root = temp_dir.path();
 
         // Create a directory with a file
         let dir = root.join("test");
-        fs::create_dir(&dir).unwrap();
+        fs::create_dir(&dir)
+            .expect("failed to create test directory - check disk space and write permissions");
         File::create(dir.join("file.txt"))
-            .unwrap()
+            .expect("failed to create test file - check disk space and permissions")
             .write_all(&[0u8; 50])
-            .unwrap();
+            .expect("failed to write test data - disk may be full or readonly");
 
         // Record current time before scan
         let before_scan = jiff::Timestamp::now().as_second();
 
         // Create database and scan
         let db_path = root.join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path)
+            .expect("failed to initialize database - check disk space and SQLite is functioning");
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, &[dir], 90, 14)
             .await
-            .unwrap();
+            .expect("scan_and_persist failed - check file permissions and database connection");
 
         // Record current time after scan
         let after_scan = jiff::Timestamp::now().as_second();
 
         // Verify last_scan_completed was set and is within reasonable range
-        let stats = db.get_stats().unwrap();
+        let stats = db.get_stats().expect(
+            "failed to query stats from database - connection may be lost or stats table corrupted",
+        );
         assert!(
             stats.last_scan_completed.is_some(),
             "last_scan_completed should be set"
         );
-        let last_scan = stats.last_scan_completed.unwrap();
+        let last_scan = stats.last_scan_completed.expect("last_scan_completed should be Some after scan, but was None - check scan_and_persist updates stats correctly");
         assert!(
             last_scan >= before_scan && last_scan <= after_scan,
             "last_scan_completed ({last_scan}) should be between {before_scan} and {after_scan}"

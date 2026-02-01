@@ -1045,3 +1045,48 @@
 - All allows are properly justified following AGENTS.md policy
 - The remaining public API items with allows are documented as reserved for future use
 - No technical debt was introduced during cleanup
+
+## US-020: Deny unwrap_used and resolve all violations (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `clippy::unwrap_used = "deny"` to [lints.clippy] section in Cargo.toml
+- Replaced all `.unwrap()` calls with `.expect("message")` throughout the codebase
+- Converted unwraps in the following modules:
+  - src/audit/mod.rs: Test helper functions (temp directory, database, connection setup)
+  - src/config/mod.rs: Test helper functions (temp directory, file creation)
+  - src/removal/mod.rs: Test helper functions (database, directory, file operations)
+  - src/scanner/mod.rs: 22 test functions including stats_update and transition tests
+  - src/tui/input.rs: Test helper functions (database, directory, temp directory setup)
+  - tests/integration.rs: Integration test setup (temp directories, file creation, audit entry validation)
+- Each expect message follows the pattern: "what was attempted - what likely went wrong or what to check"
+- No module-level `#[allow(clippy::unwrap_used)]` attributes were added
+- Remaining unwraps (5 total) are only in doctest example code (```no_run blocks), which is acceptable
+
+**Example expect messages:**
+- "failed to create temp directory for test - check disk space and system temp directory permissions"
+- "failed to initialize database - check disk space and SQLite is functioning"
+- "failed to query stats from database - connection may be lost or stats table corrupted"
+- "last_scan_completed should be Some after scan, but was None - check scan_and_persist updates stats correctly"
+- "remove audit entry should have details field populated with bytes freed - check removal service records details correctly"
+
+**Agent reviews:**
+- @nick-isms: APPROVED ✅ - All checks pass. Verified no blanket allows exist at module or crate level. All remaining unwraps are in doctest example code which is acceptable. Expect messages follow excellent DX guidelines using the pattern "what was attempted - what likely went wrong or what to check". Messages are actionable and help developers understand test failures without reading source code. Minor note about repetitive messages in tui/input.rs is acceptable. Implementation respects AGENTS.md policy. Story can be marked complete.
+- @testing-guru: APPROVED ✅ - Expect messages are genuinely helpful for debugging test failures. A novice contributor will understand: (1) what operation was being attempted, (2) what likely went wrong, (3) what to check or investigate. The pattern works well for test maintainability. Shorter messages in config.rs (e.g., "create temp dir") could be expanded but are not blocking - they still identify the operation and test context makes cause obvious. Acceptance criteria met.
+- @semver-nag: APPROVED ✅ with observations - Adding unwrap_used to deny list is appropriate and well-timed for 0.1.0. Establishes strict lint policies early to prevent technical debt accumulation. Critical for a disk management tool where panics during removal could leave system in inconsistent state. No technical debt introduced - conversion done consistently with descriptive messages. The unwrap_or_else pattern in audit/mod.rs::current_user() is correct. Pattern scales well with lint enforced at crate level. No semver concerns - binary crate with explicitly unstable library API documented in lib.rs. Good defensive patterns already in place (#[non_exhaustive], private fields with getters, documented stability notes).
+
+**Final verification:**
+- All 282 tests pass ✓
+- No clippy warnings ✓
+- Docs build successfully ✓
+- `just check` passes ✓
+- All acceptance criteria met ✓
+
+**Notes for next agent:**
+- US-020 is now complete
+- The unwrap_used lint is now enforced project-wide
+- All existing code has been migrated to use expect() with helpful messages
+- The expect message style should be maintained for future code: "what was attempted - what likely went wrong or what to check"
+- Next story is US-021: Add CI workflow
+- US-021 will set up GitHub Actions CI to run `just check` on PRs and pushes to main
