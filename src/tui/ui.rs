@@ -101,20 +101,7 @@ fn render_directory_list(
         .collect();
 
     // Sort based on current sort mode
-    match app.sort_mode() {
-        SortMode::Expiration => {
-            // Ascending (most urgent first) - None sorts to beginning
-            dir_rows.sort_by(|a, b| a.1.cmp(&b.1));
-        }
-        SortMode::Size => {
-            // Descending (largest first)
-            dir_rows.sort_by(|a, b| b.0.size_bytes.cmp(&a.0.size_bytes));
-        }
-        SortMode::Name => {
-            // Alphabetical ascending
-            dir_rows.sort_by(|a, b| a.0.path.cmp(&b.0.path));
-        }
-    }
+    sort_directory_rows(&mut dir_rows, app.sort_mode());
 
     // Update list length for navigation
     app.list_len.set(dir_rows.len());
@@ -224,6 +211,30 @@ fn render_header(
         .style(Style::default());
 
     frame.render_widget(header, area);
+}
+
+/// Sort directory rows according to the specified sort mode.
+///
+/// # Sort Behaviors
+///
+/// - `SortMode::Expiration`: Ascending (most urgent first). Directories with no mtime (`None`) sort to the beginning.
+/// - `SortMode::Size`: Descending (largest first).
+/// - `SortMode::Name`: Alphabetical ascending.
+fn sort_directory_rows(rows: &mut [(crate::db::Directory, Option<i64>)], sort_mode: SortMode) {
+    match sort_mode {
+        SortMode::Expiration => {
+            // Ascending (most urgent first) - None sorts to beginning
+            rows.sort_by(|a, b| a.1.cmp(&b.1));
+        }
+        SortMode::Size => {
+            // Descending (largest first)
+            rows.sort_by(|a, b| b.0.size_bytes.cmp(&a.0.size_bytes));
+        }
+        SortMode::Name => {
+            // Alphabetical ascending
+            rows.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+        }
+    }
 }
 
 /// Determine row style based on status and expiration.
@@ -375,6 +386,176 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Helper to create a minimal Directory for testing
+    fn test_directory(path: &str, size_bytes: i64) -> crate::db::Directory {
+        let now = jiff::Timestamp::now().as_second();
+        crate::db::Directory {
+            id: 0,
+            path: path.to_string(),
+            size_bytes,
+            file_count: 0,
+            oldest_mtime: None,
+            last_scanned: Some(now),
+            status: "tracked".to_string(),
+            deferred_until: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // Tests for sort_directory_rows
+
+    #[test]
+    fn sort_by_expiration_most_urgent_first() {
+        let mut rows = vec![
+            (test_directory("/c", 100), Some(30)), // 30 days remaining
+            (test_directory("/a", 200), Some(5)),  // 5 days remaining (most urgent)
+            (test_directory("/b", 150), Some(15)), // 15 days remaining
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Expiration);
+
+        assert_eq!(rows[0].0.path, "/a", "Most urgent (5 days) should be first");
+        assert_eq!(
+            rows[1].0.path, "/b",
+            "Middle urgency (15 days) should be second"
+        );
+        assert_eq!(
+            rows[2].0.path, "/c",
+            "Least urgent (30 days) should be last"
+        );
+    }
+
+    #[test]
+    fn sort_by_expiration_none_sorts_to_beginning() {
+        let mut rows = vec![
+            (test_directory("/c", 100), Some(30)),
+            (test_directory("/a", 200), Some(5)),
+            (test_directory("/d", 50), None), // No mtime
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Expiration);
+
+        assert_eq!(
+            rows[0].0.path, "/d",
+            "Directory with no mtime (None) should sort to beginning"
+        );
+        assert_eq!(rows[1].0.path, "/a", "Most urgent should be second");
+        assert_eq!(rows[2].0.path, "/c", "Least urgent should be last");
+    }
+
+    #[test]
+    fn sort_by_expiration_handles_negative_values() {
+        let mut rows = vec![
+            (test_directory("/a", 100), Some(-10)), // Overdue by 10 days
+            (test_directory("/b", 100), Some(5)),   // 5 days remaining
+            (test_directory("/c", 100), Some(-30)), // Overdue by 30 days
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Expiration);
+
+        assert_eq!(
+            rows[0].0.path, "/c",
+            "Most overdue (-30) should be first (most urgent)"
+        );
+        assert_eq!(rows[1].0.path, "/a", "Less overdue (-10) should be second");
+        assert_eq!(rows[2].0.path, "/b", "Not overdue (5) should be last");
+    }
+
+    #[test]
+    fn sort_by_size_largest_first() {
+        let mut rows = vec![
+            (test_directory("/a", 100), Some(10)),
+            (test_directory("/b", 500), Some(10)),
+            (test_directory("/c", 250), Some(10)),
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Size);
+
+        assert_eq!(rows[0].0.path, "/b", "Largest (500) should be first");
+        assert_eq!(rows[1].0.path, "/c", "Middle (250) should be second");
+        assert_eq!(rows[2].0.path, "/a", "Smallest (100) should be last");
+    }
+
+    #[test]
+    fn sort_by_name_alphabetical() {
+        let mut rows = vec![
+            (test_directory("/zebra", 100), Some(10)),
+            (test_directory("/alpha", 100), Some(10)),
+            (test_directory("/mango", 100), Some(10)),
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Name);
+
+        assert_eq!(rows[0].0.path, "/alpha", "Alpha should be first");
+        assert_eq!(rows[1].0.path, "/mango", "Mango should be second");
+        assert_eq!(rows[2].0.path, "/zebra", "Zebra should be last");
+    }
+
+    #[test]
+    fn sort_empty_list_does_not_panic() {
+        let mut rows: Vec<(crate::db::Directory, Option<i64>)> = vec![];
+
+        // Should not panic for any sort mode
+        sort_directory_rows(&mut rows, SortMode::Expiration);
+        sort_directory_rows(&mut rows, SortMode::Size);
+        sort_directory_rows(&mut rows, SortMode::Name);
+
+        assert_eq!(rows.len(), 0, "Empty list should remain empty");
+    }
+
+    #[test]
+    fn sort_single_item_is_trivial() {
+        let mut rows = vec![(test_directory("/only", 100), Some(10))];
+
+        sort_directory_rows(&mut rows, SortMode::Expiration);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.path, "/only");
+
+        sort_directory_rows(&mut rows, SortMode::Size);
+        assert_eq!(rows[0].0.path, "/only");
+
+        sort_directory_rows(&mut rows, SortMode::Name);
+        assert_eq!(rows[0].0.path, "/only");
+    }
+
+    #[test]
+    fn sort_by_expiration_with_equal_values() {
+        let mut rows = vec![
+            (test_directory("/c", 100), Some(10)),
+            (test_directory("/a", 200), Some(10)),
+            (test_directory("/b", 150), Some(10)),
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Expiration);
+
+        // All have same expiration, so order is stable (depends on Rust's stable sort)
+        // Just verify they're all still present
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|(d, _)| d.path == "/a"));
+        assert!(rows.iter().any(|(d, _)| d.path == "/b"));
+        assert!(rows.iter().any(|(d, _)| d.path == "/c"));
+    }
+
+    #[test]
+    fn sort_by_size_with_equal_values() {
+        let mut rows = vec![
+            (test_directory("/c", 100), Some(10)),
+            (test_directory("/a", 100), Some(10)),
+            (test_directory("/b", 100), Some(10)),
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Size);
+
+        // All have same size, so order is stable
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|(d, _)| d.path == "/a"));
+        assert!(rows.iter().any(|(d, _)| d.path == "/b"));
+        assert!(rows.iter().any(|(d, _)| d.path == "/c"));
+    }
+
+    // Tests for determine_row_style
 
     #[test]
     fn determine_row_style_ignored_is_gray() {

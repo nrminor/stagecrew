@@ -211,3 +211,71 @@ impl Default for App {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sort_mode_default_is_expiration() {
+        let mode = SortMode::default();
+        assert_eq!(
+            mode,
+            SortMode::Expiration,
+            "Default sort mode should be Expiration"
+        );
+    }
+
+    #[test]
+    fn app_new_has_correct_defaults() {
+        let app = App::new();
+        assert!(!app.should_quit, "App should not start in quit state");
+        assert_eq!(
+            app.view,
+            View::DirectoryList,
+            "App should start in DirectoryList view"
+        );
+        assert_eq!(app.selected_index, 0, "App should start with index 0");
+        assert_eq!(
+            app.sort_mode,
+            SortMode::Expiration,
+            "App should start with Expiration sort mode"
+        );
+        assert_eq!(app.filter_days, None, "App should start with no filter");
+        assert_eq!(app.list_len.get(), 0, "App should start with list_len 0");
+    }
+
+    #[test]
+    fn app_select_last_with_empty_list() {
+        let mut app = App::new();
+        app.select_last(0);
+        assert_eq!(
+            app.selected_index, 0,
+            "Selecting last in empty list should set index to 0"
+        );
+    }
+
+    #[test]
+    fn app_select_last_with_nonempty_list() {
+        let mut app = App::new();
+        app.select_last(10);
+        assert_eq!(
+            app.selected_index, 9,
+            "Selecting last in list of 10 should set index to 9"
+        );
+    }
+
+    #[test]
+    fn app_getters_return_correct_values() {
+        let mut app = App::new();
+        app.view = View::Help;
+        app.selected_index = 5;
+        app.sort_mode = SortMode::Size;
+        app.filter_days = Some(30);
+
+        assert_eq!(app.view(), View::Help);
+        assert_eq!(app.selected_index(), 5);
+        assert_eq!(app.sort_mode(), SortMode::Size);
+        assert_eq!(app.filter_days(), Some(30));
+    }
+}

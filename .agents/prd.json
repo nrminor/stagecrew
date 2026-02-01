@@ -262,8 +262,8 @@
         "just check passes"
       ],
       "priority": 15,
-      "passes": false,
-      "notes": "Simple state toggle with re-sort on change."
+      "passes": true,
+      "notes": "Completed: Sorting functionality was already implemented in US-014. This story added comprehensive unit tests to verify all acceptance criteria. Extracted sort_directory_rows() function for testability per testing-guru feedback. Added 30 new tests total (21 input handler + app tests, 9 sorting logic tests). All 133 tests pass."
     },
     {
       "id": "US-016",

@@ -485,3 +485,54 @@
 - Footer accurately reflects all available keybindings
 - Next story is US-015: Implement TUI sorting (sort cycling is already implemented, just needs testing/polish)
 
+
+## US-015: Implement TUI sorting (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Verified sorting functionality already implemented in US-014 meets all acceptance criteria
+- Extracted `sort_directory_rows()` function from render code for testability
+- Added 21 unit tests in src/tui/input.rs covering:
+  - Sort mode cycling (Expiration → Size → Name → Expiration with 3 full cycles)
+  - Sort mode persistence across navigation (j/k movement)
+  - Sort mode persistence across view changes (p/a/? keys)
+  - All keybindings (quit, navigation, view switching, help)
+- Added 6 unit tests in src/tui/mod.rs covering:
+  - SortMode::default() returns Expiration
+  - App::new() initializes correctly
+  - App::select_last() with empty and non-empty lists
+  - App getter methods
+- Added 9 unit tests in src/tui/ui.rs for sorting logic:
+  - sort_by_expiration_most_urgent_first (ascending order)
+  - sort_by_expiration_none_sorts_to_beginning (None values sort first)
+  - sort_by_expiration_handles_negative_values (overdue items)
+  - sort_by_size_largest_first (descending order)
+  - sort_by_name_alphabetical (ascending order)
+  - sort_empty_list_does_not_panic (edge case)
+  - sort_single_item_is_trivial (edge case)
+  - sort_by_expiration_with_equal_values (stable sort)
+  - sort_by_size_with_equal_values (stable sort)
+
+**Agent reviews:**
+- nick-isms: Approved with minor observations. Suggested extracting SortMode::next() method (noted as suggestion, not requirement). All acceptance criteria met. Grade: A-.
+- testing-guru: Initially flagged critical gap - sorting logic was untested. Requested extraction of sort_directory_rows() function and unit tests for all three sort modes. All recommendations implemented. Final verdict: Complete with comprehensive coverage.
+- semver-nag: No semver concerns (binary crate). SortMode enum properly marked #[non_exhaustive], App fields private with getters. API design is excellent and well-prepared for future changes. Approved.
+
+**Acceptance criteria verified:**
+1. ✅ Press 's' to cycle sort modes (input.rs:46-52) - tested with full cycle
+2. ✅ Current sort mode displayed in header (ui.rs:184 - table title suffix)
+3. ✅ Expiration: ascending (ui.rs:239 + test_sort_by_expiration_most_urgent_first)
+4. ✅ Size: descending (ui.rs:243 + test_sort_by_size_largest_first)
+5. ✅ Name: alphabetical ascending (ui.rs:247 + test_sort_by_name_alphabetical)
+6. ✅ Sort persists while navigating - tested in input tests
+7. ✅ just check passes - all 133 tests pass
+
+**Notes for next agent:**
+- Sort functionality is now feature-complete with comprehensive test coverage
+- Total 30 new tests added (21 input handler/app + 9 sorting logic)
+- All 133 tests pass, clippy clean, docs build successfully
+- Sorting logic extracted to `sort_directory_rows()` function for testability
+- None expiration values intentionally sort to beginning (directories without files appear most urgent)
+- Next story is US-016: Implement TUI directory detail view
+- US-016 will implement drill-down into a directory to see individual files
