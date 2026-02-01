@@ -361,8 +361,8 @@
         "just check passes"
       ],
       "priority": 21,
-      "passes": false,
-      "notes": "Standard CI workflow. Keep it simple - just run the same checks developers run locally. Badge format: ![CI](https://github.com/nrminor/stagecrew/actions/workflows/ci.yml/badge.svg)"
+      "passes": true,
+      "notes": "Completed: Created .github/workflows/ci.yml with concurrency control, timeout (15min), pinned ubuntu-24.04 runner, and cache-on-failure. Installs dependencies (Rust stable, just, cargo-nextest) and runs `just check`. Added rust-toolchain.toml documenting stable channel. Updated .gitignore to allow .github/ and rust-toolchain.toml. CI badge was already present in README.md. Code reviews: nick-isms approved as-is (ready to commit), testing-guru recommended concurrency/timeout/cache improvements (all applied), semver-nag recommended pinning runner and using taiki-e/install-action@v2 with explicit tool input (all applied). All 282 tests pass."
     },
     {
       "id": "US-022",

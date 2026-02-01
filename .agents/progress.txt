@@ -1090,3 +1090,53 @@
 - The expect message style should be maintained for future code: "what was attempted - what likely went wrong or what to check"
 - Next story is US-021: Add CI workflow
 - US-021 will set up GitHub Actions CI to run `just check` on PRs and pushes to main
+
+## US-021: Add CI workflow (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Created `.github/workflows/ci.yml` with GitHub Actions workflow that:
+  - Triggers on push to main and pull requests
+  - Includes concurrency control (cancel-in-progress for same branch)
+  - Runs on pinned ubuntu-24.04 runner with 15-minute timeout
+  - Installs Rust stable toolchain via dtolnay/rust-toolchain
+  - Caches dependencies with Swatinem/rust-cache@v2 (with cache-on-failure: true)
+  - Installs just via extractions/setup-just@v2
+  - Installs cargo-nextest via taiki-e/install-action@v2 (with explicit tool: nextest)
+  - Runs `just check` (fmt, clippy, tests, docs)
+- Created `rust-toolchain.toml` documenting stable channel usage
+- Updated `.gitignore` to allow:
+  - `.github/` directory and workflow files
+  - `rust-toolchain.toml`
+- CI status badge already present in README.md line 3
+
+**Agent reviews:**
+- nick-isms: APPROVED ✅ - Workflow is clean, correct, and complete. All 9 acceptance criteria met. Good action choices (dtolnay/rust-toolchain, Swatinem/rust-cache, taiki-e/install-action). Correct ordering (checkout → toolchain → cache → tools → run). Single job is appropriate for project size. No unnecessary complexity. Matches local dev workflow. Self-documenting step names. Ready to commit with no changes required.
+- testing-guru: APPROVED ✅ with enhancements applied - Test execution strategy is sound. cargo-nextest installation handled correctly via taiki-e/install-action. All 282 tests complete in ~1.2s. Single platform (Ubuntu/stable) sufficient for HPC-focused MVP. No significant flakiness risks. Recommended enhancements all applied: concurrency limits, 15min timeout, cache-on-failure. Noted proptest declared but unused (code coverage concern, not CI issue). Suggested optional release build check (deferred to future). Testing strategy appropriate for US-021.
+- semver-nag: APPROVED ✅ with stability improvements applied - Workflow has moderate stability risk but now improved. Major version tags (@v4, @v2) are acceptable. Pinned ubuntu-24.04 instead of ubuntu-latest for stability. Used taiki-e/install-action@v2 with explicit tool input. Added rust-toolchain.toml documenting stable channel. Concurrency control and timeout added. For 0.1.0 binary crate, current approach is maintainable. Noted dtolnay/rust-toolchain@stable uses branch ref (acceptable for now, could pin to specific Rust version later). All recommended stability improvements applied.
+
+**Technical notes:**
+- Concurrency group `${{ github.workflow }}-${{ github.ref }}` with cancel-in-progress prevents redundant runs
+- Pinned runner to ubuntu-24.04 for stability (vs floating ubuntu-latest)
+- 15-minute timeout prevents hung jobs from consuming CI minutes
+- cache-on-failure helps when fixing CI issues (caches even on failed builds)
+- rust-toolchain.toml serves as documentation and can be used to pin version before 1.0
+
+**Notes for next agent:**
+- CI workflow is now feature-complete for US-021
+- All 282 tests pass, clippy clean, docs build successfully
+- All acceptance criteria met and verified
+- Workflow improvements applied based on code reviews:
+  1. Added concurrency control with cancel-in-progress
+  2. Pinned ubuntu-24.04 runner for stability
+  3. Added 15-minute timeout
+  4. Used taiki-e/install-action@v2 with explicit tool: nextest
+  5. Added cache-on-failure: true to rust-cache
+  6. Created rust-toolchain.toml documenting stable channel
+- Optional future enhancements noted by reviewers:
+  1. Add `cargo build --release` check to catch release-only issues (medium priority)
+  2. Consider platform matrix (macos-latest) when US-022 implements cross-platform binaries
+  3. Consider pinning to specific Rust version (e.g., @1.87.0) before 1.0 for MSRV guarantees
+- Next story is US-022: Add release workflow with cross-platform binaries
+- US-022 will create .github/workflows/release.yml for building and publishing binaries

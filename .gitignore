@@ -12,12 +12,18 @@
 !/opencode.json
 !/README.md
 !/LICENSE
+!/rust-toolchain.toml
 
 # === Allowed: Agent configuration ===
 !/.agents
 !/.agents/prd.json
 !/.agents/progress.txt
 !/.agents/PROMPT.md
+
+# === Allowed: GitHub workflows ===
+!/.github
+!/.github/workflows
+!/.github/workflows/ci.yml
 
 # === Allowed: Source code ===
 !/src
