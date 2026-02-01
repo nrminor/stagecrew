@@ -64,8 +64,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Status => {
-            // TODO: Query stats and print summary for shell hook
-            println!("stagecrew status: not yet implemented");
+            handle_status(&db)?;
         }
 
         Command::Scan { path } => {
@@ -165,6 +164,85 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
     Ok(())
 }
 
+/// Handle the status subcommand.
+///
+/// Queries the stats table and prints a fast, human-readable summary for use in shell hooks.
+/// Output format varies based on urgency:
+/// - If paths are overdue or pending: shows warning with counts
+/// - If nothing urgent: shows "All clear" message
+///
+/// Note: Output format is unstable and may change between versions.
+fn handle_status(db: &Database) -> Result<()> {
+    let stats = db.get_stats().context("Failed to query stats")?;
+
+    // Verify invariants
+    debug_assert!(
+        stats.total_tracked_paths >= 0,
+        "total_tracked_paths cannot be negative"
+    );
+    debug_assert!(
+        stats.total_size_bytes >= 0,
+        "total_size_bytes cannot be negative"
+    );
+    debug_assert!(stats.paths_overdue >= 0, "paths_overdue cannot be negative");
+    debug_assert!(
+        stats.paths_pending_approval >= 0,
+        "paths_pending_approval cannot be negative"
+    );
+    debug_assert!(
+        stats.paths_within_warning >= 0,
+        "paths_within_warning cannot be negative"
+    );
+
+    println!("{}", format_status_output(&stats));
+    Ok(())
+}
+
+/// Format status output based on urgency metrics.
+///
+/// Returns a human-readable status line for shell hook display.
+/// The output follows a priority hierarchy: overdue > pending > warning > all clear.
+fn format_status_output(stats: &db::Stats) -> String {
+    let paths_overdue = stats.paths_overdue;
+    let paths_pending = stats.paths_pending_approval;
+    let paths_within_warning = stats.paths_within_warning;
+
+    if paths_overdue > 0 {
+        // Most urgent: paths are overdue
+        if paths_pending > 0 {
+            format!("stagecrew: {paths_overdue} paths overdue, {paths_pending} pending approval")
+        } else {
+            format!("stagecrew: {paths_overdue} paths overdue")
+        }
+    } else if paths_pending > 0 {
+        // Urgent: paths need approval
+        if paths_within_warning > 0 {
+            format!(
+                "stagecrew: {paths_pending} paths pending approval, {paths_within_warning} within warning period"
+            )
+        } else {
+            format!("stagecrew: {paths_pending} paths pending approval")
+        }
+    } else if paths_within_warning > 0 {
+        // Warning: paths approaching expiration
+        format!("stagecrew: {paths_within_warning} paths within warning period")
+    } else {
+        // All clear
+        let formatted_size = format_bytes(
+            // Allow: Converting i64 to u64 for format_bytes. Stats table
+            // constraints ensure total_size_bytes is non-negative.
+            #[allow(clippy::cast_sign_loss)]
+            {
+                stats.total_size_bytes as u64
+            },
+        );
+        format!(
+            "stagecrew: All clear. {} paths tracked, {formatted_size}",
+            stats.total_tracked_paths
+        )
+    }
+}
+
 /// Format byte count as human-readable string.
 fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
@@ -247,5 +325,109 @@ mod tests {
         assert!(!result.is_empty());
         // Should show in PB since that's our largest unit
         assert!(result.contains("PB"));
+    }
+
+    // === Status Output Formatting Tests ===
+
+    #[test]
+    fn format_status_output_overdue_with_pending() {
+        let stats = db::Stats {
+            total_tracked_paths: 10,
+            total_size_bytes: 1_000_000,
+            paths_within_warning: 1,
+            paths_pending_approval: 2,
+            paths_overdue: 3,
+        };
+        assert_eq!(
+            format_status_output(&stats),
+            "stagecrew: 3 paths overdue, 2 pending approval"
+        );
+    }
+
+    #[test]
+    fn format_status_output_overdue_only() {
+        let stats = db::Stats {
+            total_tracked_paths: 10,
+            total_size_bytes: 1_000_000,
+            paths_within_warning: 1,
+            paths_pending_approval: 0,
+            paths_overdue: 3,
+        };
+        assert_eq!(format_status_output(&stats), "stagecrew: 3 paths overdue");
+    }
+
+    #[test]
+    fn format_status_output_pending_with_warning() {
+        let stats = db::Stats {
+            total_tracked_paths: 10,
+            total_size_bytes: 1_000_000,
+            paths_within_warning: 4,
+            paths_pending_approval: 2,
+            paths_overdue: 0,
+        };
+        assert_eq!(
+            format_status_output(&stats),
+            "stagecrew: 2 paths pending approval, 4 within warning period"
+        );
+    }
+
+    #[test]
+    fn format_status_output_pending_only() {
+        let stats = db::Stats {
+            total_tracked_paths: 10,
+            total_size_bytes: 1_000_000,
+            paths_within_warning: 0,
+            paths_pending_approval: 2,
+            paths_overdue: 0,
+        };
+        assert_eq!(
+            format_status_output(&stats),
+            "stagecrew: 2 paths pending approval"
+        );
+    }
+
+    #[test]
+    fn format_status_output_warning_only() {
+        let stats = db::Stats {
+            total_tracked_paths: 10,
+            total_size_bytes: 1_000_000,
+            paths_within_warning: 5,
+            paths_pending_approval: 0,
+            paths_overdue: 0,
+        };
+        assert_eq!(
+            format_status_output(&stats),
+            "stagecrew: 5 paths within warning period"
+        );
+    }
+
+    #[test]
+    fn format_status_output_all_clear() {
+        let stats = db::Stats {
+            total_tracked_paths: 10,
+            total_size_bytes: 1_234_567_890,
+            paths_within_warning: 0,
+            paths_pending_approval: 0,
+            paths_overdue: 0,
+        };
+        assert_eq!(
+            format_status_output(&stats),
+            "stagecrew: All clear. 10 paths tracked, 1.2 GB"
+        );
+    }
+
+    #[test]
+    fn format_status_output_all_clear_empty_database() {
+        let stats = db::Stats {
+            total_tracked_paths: 0,
+            total_size_bytes: 0,
+            paths_within_warning: 0,
+            paths_pending_approval: 0,
+            paths_overdue: 0,
+        };
+        assert_eq!(
+            format_status_output(&stats),
+            "stagecrew: All clear. 0 paths tracked, 0 B"
+        );
     }
 }

@@ -22,6 +22,9 @@ pub enum Command {
     Daemon,
 
     /// Show current status (used by shell hook)
+    ///
+    /// Note: The output format is intended for human consumption and may change
+    /// between versions. For scripting, consider parsing the database directly.
     Status,
 
     /// Trigger a manual scan of tracked paths

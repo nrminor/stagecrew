@@ -209,8 +209,8 @@
         "just check passes"
       ],
       "priority": 12,
-      "passes": false,
-      "notes": "Must be fast for shell hook. Uses pre-computed stats."
+      "passes": true,
+      "notes": "Completed: Implemented handle_status() function that queries stats table via new Database::get_stats() method. Added Stats struct to db module. Extracted format_status_output() as pure function for testability. Added 7 unit tests covering all 6 urgency scenarios plus empty database edge case. Added debug assertions for stats invariants. Added stability note to CLI Status help text. Code review feedback addressed from nick-isms (added get_stats method, assertions, pure function), testing-guru (comprehensive test coverage), and semver-nag (stability documentation). All 98 tests pass."
     },
     {
       "id": "US-013",

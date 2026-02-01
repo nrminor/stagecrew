@@ -60,6 +60,23 @@ pub struct File {
     pub created_at: i64,
 }
 
+/// Pre-computed statistics for shell hooks and status display.
+///
+/// Stored in the singleton `stats` table row, updated after each scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    /// Total number of tracked directories.
+    pub total_tracked_paths: i64,
+    /// Total size of all tracked files in bytes.
+    pub total_size_bytes: i64,
+    /// Number of paths within the warning period.
+    pub paths_within_warning: i64,
+    /// Number of paths pending approval for removal.
+    pub paths_pending_approval: i64,
+    /// Number of paths that are overdue (past expiration).
+    pub paths_overdue: i64,
+}
+
 /// Database handle for stagecrew state.
 ///
 /// Manages the `SQLite` database that stores tracked directories, files,
@@ -384,6 +401,34 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// Retrieve pre-computed statistics.
+    ///
+    /// Returns the singleton stats row, which is guaranteed to exist
+    /// after database initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stats table cannot be queried or the row is missing.
+    pub fn get_stats(&self) -> Result<Stats> {
+        self.conn
+            .query_row(
+                "SELECT total_tracked_paths, total_size_bytes, paths_within_warning,
+                        paths_pending_approval, paths_overdue
+                 FROM stats WHERE id = 1",
+                [],
+                |row| {
+                    Ok(Stats {
+                        total_tracked_paths: row.get(0)?,
+                        total_size_bytes: row.get(1)?,
+                        paths_within_warning: row.get(2)?,
+                        paths_pending_approval: row.get(3)?,
+                        paths_overdue: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 }
 

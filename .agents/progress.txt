@@ -377,4 +377,40 @@
 - Next story is US-012: Implement CLI status subcommand
 - US-012 will query the stats table and print a fast summary for use in shell hooks
 
+## US-012: Implement CLI status subcommand (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `Stats` struct to db module with fields: total_tracked_paths, total_size_bytes, paths_within_warning, paths_pending_approval, paths_overdue
+- Added `Database::get_stats()` method that queries the singleton stats row
+- Implemented `handle_status()` function in main.rs that uses get_stats() and prints formatted output
+- Extracted `format_status_output()` as pure function for testability (takes &Stats, returns String)
+- Implemented urgency-based output hierarchy: overdue > pending > warning > all clear
+- Added 5 debug assertions in handle_status() for stats invariants (all values must be non-negative)
+- Added stability note to CLI Status help text documenting that output format may change
+- Added 7 unit tests covering all 6 urgency scenarios plus empty database edge case:
+  - format_status_output_overdue_with_pending
+  - format_status_output_overdue_only
+  - format_status_output_pending_with_warning
+  - format_status_output_pending_only
+  - format_status_output_warning_only
+  - format_status_output_all_clear
+  - format_status_output_all_clear_empty_database
+
+**Agent reviews:**
+- nick-isms: Initial implementation had raw SQL in main.rs (design smell). Requested Database::get_stats() method with Stats struct (added), debug assertions (added 5), and noted nested if-else could be cleaner (acceptable as-is). Approved final implementation after refactoring.
+- testing-guru: Recommended extracting pure function for testability and adding tests for 6 urgency scenarios (done). Confirmed deferring CLI integration tests to US-026. All recommendations implemented.
+- semver-nag: Requested stability note in CLI help text (added to Status variant doc comment). Noted i64 to u64 cast is safe with justification. Approved API design for binary crate.
+
+**Notes for next agent:**
+- Status command is now feature-complete for US-012
+- All acceptance criteria met: queries stats table (single query), urgency-based output, fast execution
+- All 98 tests pass (91 existing + 7 new format_status_output tests)
+- Stats struct added to db module provides type-safe access to pre-computed stats
+- format_status_output() is pure function, fully testable without database
+- Note: stats table values will be all zeros until US-025 (stats update after scan) is implemented, but status command handles this correctly (shows "All clear")
+- Next story is US-013: Implement TUI framework and main loop
+- US-013 will set up ratatui with terminal management, event loop, and quit handling
+
 
