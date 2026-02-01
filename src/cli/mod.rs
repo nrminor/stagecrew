@@ -25,6 +25,9 @@ pub enum Command {
     Status,
 
     /// Trigger a manual scan of tracked paths
+    ///
+    /// Note: The output format is intended for human consumption and may change
+    /// between versions. For scripting, consider parsing the database directly.
     Scan {
         /// Specific path to scan (defaults to all configured paths)
         #[arg(short, long)]

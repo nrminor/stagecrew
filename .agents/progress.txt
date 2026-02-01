@@ -327,15 +327,9 @@
 **Date:** 2026-02-01
 
 **Changes made:**
-- Refactored `main()` to handle init command separately before loading config (since config might not exist yet)
-- Created `handle_init()` function that:
-  - Checks if config file already exists at `~/.config/stagecrew/config.toml`
-  - If exists: prints message and loads without overwriting
-  - If not exists: creates default config with `Config::default()` and saves
-  - Opens/creates database (idempotent via `Database::open()`)
-  - Checks if database was created or already existed
-  - Prints appropriate messages for each scenario
-- Improved user messaging by removing redundant "Loading existing configuration..." message
+- Refactored main() to handle init separately before loading config (since config might not exist yet)
+- Created handle_init() function that checks if config exists, creates default if missing, loads existing otherwise, initializes database (idempotent), and prints appropriate messages
+- All acceptance criteria met
 
 **Agent reviews:**
 - nick-isms: Good implementation (B+ grade). Clean separation of concerns, proper error handling with context, idiomatic Rust. Suggested minor messaging improvement (addressed). Noted potential race condition between db_path.exists() check and open (theoretical, not worth fixing). Overall ready to merge.
@@ -352,4 +346,35 @@
 - CLI output format is not structured/machine-readable (documented as fine for 0.1.0)
 - Next story is US-011: Implement CLI scan subcommand
 - US-011 will need to use Scanner::scan() and scan_and_persist() to manually trigger scans
+
+## US-011: Implement CLI scan subcommand (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Implemented handle_scan() function in main.rs that orchestrates scanning
+- Function determines paths to scan: uses --path if provided, otherwise uses config.tracked_paths, errors if neither
+- Prints appropriate progress message before scanning (single message for N paths, or specific path for 1 path)
+- Calls existing scan_and_persist() function to perform scan and persist results
+- Prints human-readable summary: "Scan complete: N directories, M files, X" with formatted bytes
+- Added format_bytes() helper function to format byte counts as human-readable strings (KB, MB, GB, etc.)
+- Added 8 unit tests for format_bytes() covering all edge cases
+- Moved scanner imports to top-level imports (no local imports)
+- Documented CLI output format as unstable in clap help text per semver-nag recommendation
+
+**Agent reviews:**
+- nick-isms: Solid implementation. Flagged local imports (fixed), missing format_bytes tests (added 8 tests), misleading format string (fixed), progress message timing (improved to single message), redundant type annotation (removed). Error handling is excellent with clear, actionable messages. Code follows project conventions well.
+- testing-guru: Comprehensive coverage at core logic level (scan_and_persist has 6 integration tests). format_bytes needed unit tests (added 8 tests covering zero, boundaries, all ranges, u64::MAX). Recommended deferring CLI integration tests to US-026 since handle_scan is thin orchestration wrapper. Coverage is now complete for US-011.
+- semver-nag: Implementation is well-designed for 0.1.0. Private functions (not part of public API), #[non_exhaustive] on types, human-readable output all show good semver awareness. Recommended documenting output format as unstable (added to CLI help text). CLI argument design is stable and extensible.
+
+**Notes for next agent:**
+- Scan command is now feature-complete for US-011
+- All acceptance criteria met: scans tracked paths OR --path, prints progress and summary, errors on empty config
+- All 91 tests pass (83 existing + 8 new format_bytes tests)
+- format_bytes uses SI units (1000-based) with labels KB/MB/GB/TB/PB - this is intentional for now
+- CLI output format documented as unstable and may change between versions
+- CLI integration tests deferred to US-026 (full workflow integration test story)
+- Next story is US-012: Implement CLI status subcommand
+- US-012 will query the stats table and print a fast summary for use in shell hooks
+
 

@@ -193,8 +193,8 @@
         "just check passes"
       ],
       "priority": 11,
-      "passes": false,
-      "notes": "Useful for testing and manual updates."
+      "passes": true,
+      "notes": "Completed: Implemented handle_scan() function that orchestrates scanning tracked paths or a specific --path. Uses existing scan_and_persist() from scanner module. Prints progress messages before scanning (single message for N paths) and human-readable summary after completion. Exits with error if no tracked paths configured and no --path given. Added format_bytes() helper with 8 unit tests covering all edge cases (zero, boundaries, ranges, u64::MAX). All code review feedback addressed: moved local imports to top-level, fixed format string, improved progress messages, documented CLI output format as unstable per semver-nag review. All 91 tests pass (83 existing + 8 new)."
     },
     {
       "id": "US-012",
