@@ -2,10 +2,12 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::ui::sort_file_rows;
 use super::{App, FocusPanel, SortMode, View};
 use crate::audit::{AuditAction, AuditService};
 use crate::config::Config;
 use crate::db::Database;
+use crate::scanner::calculate_expiration;
 
 /// Handles keyboard input with vim-style bindings.
 pub(crate) struct InputHandler;
@@ -123,7 +125,7 @@ impl InputHandler {
 
             // Selection mode (only when main panel is focused)
             KeyCode::Char(' ') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::toggle_file_selection(app, db);
+                Self::toggle_file_selection(app, config, db);
             }
             KeyCode::Char('v') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::enter_visual_mode(app, db);
@@ -134,16 +136,16 @@ impl InputHandler {
 
             // File-level actions (only when main panel is focused)
             KeyCode::Char('d') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::initiate_file_delete(app, db);
+                Self::initiate_file_delete(app, config, db);
             }
             KeyCode::Char('r') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::initiate_file_defer(app, config, db);
             }
             KeyCode::Char('i') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::initiate_file_ignore(app, db);
+                Self::initiate_file_ignore(app, config, db);
             }
             KeyCode::Char('x') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::initiate_file_approve(app, db);
+                Self::initiate_file_approve(app, config, db);
             }
 
             // Views
@@ -164,7 +166,7 @@ impl InputHandler {
     }
 
     /// Toggle selection of the currently focused file.
-    fn toggle_file_selection(app: &mut App, db: &Database) {
+    fn toggle_file_selection(app: &mut App, config: &Config, db: &Database) {
         // Get the currently selected directory ID
         let Some(directory_id) = app.current_directory_id.get() else {
             tracing::warn!("Cannot toggle selection: no directory selected");
@@ -180,8 +182,18 @@ impl InputHandler {
             }
         };
 
+        // Sort files the same way the UI does so indices match
+        let mut file_rows: Vec<_> = files
+            .into_iter()
+            .map(|file| {
+                let days_remaining = calculate_expiration(file.mtime, config.expiration_days);
+                (file, days_remaining)
+            })
+            .collect();
+        sort_file_rows(&mut file_rows, app.sort_mode());
+
         // Get the selected file based on file_selected_index
-        let Some(file) = files.get(app.file_selected_index) else {
+        let Some((file, _)) = file_rows.get(app.file_selected_index) else {
             tracing::warn!("No file selected (index out of bounds)");
             return;
         };
@@ -415,7 +427,7 @@ impl InputHandler {
     ///
     /// If files are selected via multi-select, delete all selected files.
     /// Otherwise, delete the currently focused file.
-    fn initiate_file_delete(app: &mut App, db: &Database) {
+    fn initiate_file_delete(app: &mut App, config: &Config, db: &Database) {
         // Get the currently selected directory ID
         let Some(directory_id) = app.current_directory_id.get() else {
             tracing::warn!("Cannot delete file: no directory selected");
@@ -431,21 +443,31 @@ impl InputHandler {
             }
         };
 
+        // Sort files the same way the UI does so indices match
+        let mut file_rows: Vec<_> = files
+            .into_iter()
+            .map(|file| {
+                let days_remaining = calculate_expiration(file.mtime, config.expiration_days);
+                (file, days_remaining)
+            })
+            .collect();
+        sort_file_rows(&mut file_rows, app.sort_mode());
+
         // Determine which files to delete
         let files_to_delete: Vec<(i64, String)> = if app.selected_files.is_empty() {
             // No selection - use currently focused file
-            if let Some(file) = files.get(app.file_selected_index) {
+            if let Some((file, _)) = file_rows.get(app.file_selected_index) {
                 vec![(file.id, file.path.clone())]
             } else {
                 tracing::warn!("No file selected (index out of bounds)");
                 return;
             }
         } else {
-            // Use selected files
-            files
+            // Use selected files (selection is by ID, so sorting doesn't matter here)
+            file_rows
                 .into_iter()
-                .filter(|f| app.selected_files.contains(&f.id))
-                .map(|f| (f.id, f.path.clone()))
+                .filter(|(f, _)| app.selected_files.contains(&f.id))
+                .map(|(f, _)| (f.id, f.path.clone()))
                 .collect()
         };
 
@@ -522,21 +544,31 @@ impl InputHandler {
             }
         };
 
+        // Sort files the same way the UI does so indices match
+        let mut file_rows: Vec<_> = files
+            .into_iter()
+            .map(|file| {
+                let days_remaining = calculate_expiration(file.mtime, config.expiration_days);
+                (file, days_remaining)
+            })
+            .collect();
+        sort_file_rows(&mut file_rows, app.sort_mode());
+
         // Determine which files to defer
         let files_to_defer: Vec<i64> = if app.selected_files.is_empty() {
             // No selection - use currently focused file
-            if let Some(file) = files.get(app.file_selected_index) {
+            if let Some((file, _)) = file_rows.get(app.file_selected_index) {
                 vec![file.id]
             } else {
                 tracing::warn!("No file selected (index out of bounds)");
                 return;
             }
         } else {
-            // Use selected files
-            files
+            // Use selected files (selection is by ID, so sorting doesn't matter here)
+            file_rows
                 .iter()
-                .filter(|f| app.selected_files.contains(&f.id))
-                .map(|f| f.id)
+                .filter(|(f, _)| app.selected_files.contains(&f.id))
+                .map(|(f, _)| f.id)
                 .collect()
         };
 
@@ -546,10 +578,10 @@ impl InputHandler {
         }
 
         // Get first file path for display in modal
-        let first_file_path = files
+        let first_file_path = file_rows
             .iter()
-            .find(|f| files_to_defer.contains(&f.id))
-            .map_or_else(|| "unknown".to_string(), |f| f.path.clone());
+            .find(|(f, _)| files_to_defer.contains(&f.id))
+            .map_or_else(|| "unknown".to_string(), |(f, _)| f.path.clone());
 
         // Set pending deferral state (using first file_id in directory_id field, rest in additional_file_ids)
         app.pending_file_deferral = Some(super::PendingDeferral {
@@ -648,7 +680,7 @@ impl InputHandler {
     ///
     /// If files are selected via multi-select, ignore all selected files.
     /// Otherwise, ignore the currently focused file.
-    fn initiate_file_ignore(app: &mut App, db: &Database) {
+    fn initiate_file_ignore(app: &mut App, config: &Config, db: &Database) {
         // Get the currently selected directory ID
         let Some(directory_id) = app.current_directory_id.get() else {
             tracing::warn!("Cannot ignore file: no directory selected");
@@ -664,21 +696,31 @@ impl InputHandler {
             }
         };
 
+        // Sort files the same way the UI does so indices match
+        let mut file_rows: Vec<_> = files
+            .into_iter()
+            .map(|file| {
+                let days_remaining = calculate_expiration(file.mtime, config.expiration_days);
+                (file, days_remaining)
+            })
+            .collect();
+        sort_file_rows(&mut file_rows, app.sort_mode());
+
         // Determine which files to ignore
         let files_to_ignore: Vec<(i64, String)> = if app.selected_files.is_empty() {
             // No selection - use currently focused file
-            if let Some(file) = files.get(app.file_selected_index) {
+            if let Some((file, _)) = file_rows.get(app.file_selected_index) {
                 vec![(file.id, file.path.clone())]
             } else {
                 tracing::warn!("No file selected (index out of bounds)");
                 return;
             }
         } else {
-            // Use selected files
-            files
+            // Use selected files (selection is by ID, so sorting doesn't matter here)
+            file_rows
                 .into_iter()
-                .filter(|f| app.selected_files.contains(&f.id))
-                .map(|f| (f.id, f.path.clone()))
+                .filter(|(f, _)| app.selected_files.contains(&f.id))
+                .map(|(f, _)| (f.id, f.path.clone()))
                 .collect()
         };
 
@@ -735,7 +777,7 @@ impl InputHandler {
     ///
     /// If files are selected via multi-select, approve all selected files.
     /// Otherwise, approve the currently focused file.
-    fn initiate_file_approve(app: &mut App, db: &Database) {
+    fn initiate_file_approve(app: &mut App, config: &Config, db: &Database) {
         // Get the currently selected directory ID
         let Some(directory_id) = app.current_directory_id.get() else {
             tracing::warn!("Cannot approve file: no directory selected");
@@ -751,21 +793,31 @@ impl InputHandler {
             }
         };
 
+        // Sort files the same way the UI does so indices match
+        let mut file_rows: Vec<_> = files
+            .into_iter()
+            .map(|file| {
+                let days_remaining = calculate_expiration(file.mtime, config.expiration_days);
+                (file, days_remaining)
+            })
+            .collect();
+        sort_file_rows(&mut file_rows, app.sort_mode());
+
         // Determine which files to approve
         let files_to_approve: Vec<(i64, String)> = if app.selected_files.is_empty() {
             // No selection - use currently focused file
-            if let Some(file) = files.get(app.file_selected_index) {
+            if let Some((file, _)) = file_rows.get(app.file_selected_index) {
                 vec![(file.id, file.path.clone())]
             } else {
                 tracing::warn!("No file selected (index out of bounds)");
                 return;
             }
         } else {
-            // Use selected files
-            files
+            // Use selected files (selection is by ID, so sorting doesn't matter here)
+            file_rows
                 .into_iter()
-                .filter(|f| app.selected_files.contains(&f.id))
-                .map(|f| (f.id, f.path.clone()))
+                .filter(|(f, _)| app.selected_files.contains(&f.id))
+                .map(|(f, _)| (f.id, f.path.clone()))
                 .collect()
         };
 

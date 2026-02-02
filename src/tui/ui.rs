@@ -465,7 +465,7 @@ fn render_main_file_panel(
 }
 
 /// Sort file rows according to the specified sort mode.
-fn sort_file_rows(rows: &mut [(crate::db::File, i64)], sort_mode: SortMode) {
+pub(super) fn sort_file_rows(rows: &mut [(crate::db::File, i64)], sort_mode: SortMode) {
     match sort_mode {
         SortMode::Expiration => {
             // Ascending (most urgent first)
