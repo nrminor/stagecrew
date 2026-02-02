@@ -63,14 +63,31 @@ impl InputHandler {
                 app.should_quit = true;
             }
 
+            // Toggle sidebar visibility
+            KeyCode::Char('B') => {
+                app.sidebar_visible = !app.sidebar_visible;
+                // If hiding sidebar while it's focused, switch to main panel
+                if !app.sidebar_visible && app.focus_panel == FocusPanel::Sidebar {
+                    app.focus_panel = FocusPanel::MainPanel;
+                }
+            }
+
             // Switch focus between sidebar and main panel
             KeyCode::Tab | KeyCode::Char('\t') => {
-                app.focus_panel = match app.focus_panel {
-                    FocusPanel::Sidebar => FocusPanel::MainPanel,
-                    FocusPanel::MainPanel => FocusPanel::Sidebar,
-                };
+                if app.sidebar_visible {
+                    app.focus_panel = match app.focus_panel {
+                        FocusPanel::Sidebar => FocusPanel::MainPanel,
+                        FocusPanel::MainPanel => FocusPanel::Sidebar,
+                    };
+                } else {
+                    // Show sidebar and focus it
+                    app.sidebar_visible = true;
+                    app.focus_panel = FocusPanel::Sidebar;
+                }
             }
             KeyCode::Char('h') => {
+                // Show sidebar if hidden, then focus it
+                app.sidebar_visible = true;
                 app.focus_panel = FocusPanel::Sidebar;
             }
             KeyCode::Char('l') => {
@@ -1047,16 +1064,16 @@ mod tests {
         let mut app = App::new();
         let config = test_config();
 
-        // Start with sidebar focused
-        assert_eq!(app.focus_panel, FocusPanel::Sidebar);
-
-        // Tab to main panel
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Tab));
+        // Start with main panel focused (default for immediate file interaction)
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
 
-        // Tab back to sidebar
+        // Tab to sidebar
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Tab));
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
+
+        // Tab back to main panel
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Tab));
+        assert_eq!(app.focus_panel, FocusPanel::MainPanel);
     }
 
     #[test]

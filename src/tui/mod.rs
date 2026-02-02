@@ -113,6 +113,9 @@ pub struct App {
     /// Pending remove path confirmation state.
     /// Contains the path awaiting user confirmation for removal from config.
     pub(crate) pending_remove_path: Option<String>,
+
+    /// Whether the sidebar is visible.
+    pub(crate) sidebar_visible: bool,
 }
 
 impl App {
@@ -201,6 +204,11 @@ impl App {
     /// Get the pending remove path confirmation state.
     pub fn pending_remove_path(&self) -> Option<&str> {
         self.pending_remove_path.as_deref()
+    }
+
+    /// Check if the sidebar is visible.
+    pub fn sidebar_visible(&self) -> bool {
+        self.sidebar_visible
     }
 
     /// Clear all file selections.
@@ -295,10 +303,10 @@ pub enum View {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FocusPanel {
     /// Sidebar panel with tracked directories.
-    #[default]
     Sidebar,
 
     /// Main panel with file list.
+    #[default]
     MainPanel,
 }
 
@@ -344,6 +352,7 @@ impl App {
             selected_files: HashSet::new(),
             pending_add_path: None,
             pending_remove_path: None,
+            sidebar_visible: true,
         }
     }
 
@@ -424,8 +433,8 @@ mod tests {
         );
         assert_eq!(
             app.focus_panel,
-            FocusPanel::Sidebar,
-            "App should start with sidebar focused"
+            FocusPanel::MainPanel,
+            "App should start with main panel focused for immediate file interaction"
         );
         assert_eq!(
             app.sidebar_selected_index, 0,

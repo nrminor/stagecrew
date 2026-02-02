@@ -135,23 +135,28 @@ fn render_file_list_view(
         ])
         .split(area);
 
-    // Split content area horizontally: sidebar | main panel
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(20), // Sidebar for directories
-            Constraint::Percentage(80), // Main panel for files
-        ])
-        .split(v_chunks[1]);
-
     // Render header with stats
     render_file_view_header(config, db, frame, v_chunks[0]);
 
-    // Render sidebar with tracked directories
-    render_sidebar(app, db, frame, h_chunks[0]);
+    if app.sidebar_visible() {
+        // Split content area horizontally: sidebar | main panel
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(20), // Sidebar for directories
+                Constraint::Percentage(80), // Main panel for files
+            ])
+            .split(v_chunks[1]);
 
-    // Render main panel with files from selected directory
-    render_main_file_panel(app, config, db, frame, h_chunks[1]);
+        // Render sidebar with tracked directories
+        render_sidebar(app, db, frame, h_chunks[0]);
+
+        // Render main panel with files from selected directory
+        render_main_file_panel(app, config, db, frame, h_chunks[1]);
+    } else {
+        // Sidebar hidden - main panel takes full width
+        render_main_file_panel(app, config, db, frame, v_chunks[1]);
+    }
 }
 
 /// Render the header showing stats for the current file view.
@@ -392,8 +397,8 @@ fn render_main_file_panel(
 
             // Highlight selected row and show focus
             let style = if is_selected {
-                // Selected files get magenta background
-                row_style.bg(Color::Magenta).add_modifier(Modifier::BOLD)
+                // Selected files get dark gray background for contrast with all text colors
+                row_style.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
             } else if idx == selected_idx {
                 // Currently focused file
                 if app.focus_panel() == FocusPanel::MainPanel {
@@ -1075,8 +1080,9 @@ Navigation:
   g           Jump to top of focused panel
   G           Jump to bottom of focused panel
   Tab         Switch focus between sidebar and main panel
-  h           Switch focus to sidebar
+  h           Switch focus to sidebar (shows sidebar if hidden)
   l           Switch focus to main panel
+  B           Toggle sidebar visibility
   
 Selection (main panel only):
   Space       Toggle selection on current file
