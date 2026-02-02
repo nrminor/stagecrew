@@ -355,6 +355,7 @@ fn render_main_file_panel(
         SortMode::Expiration => " (by expiration)",
         SortMode::Size => " (by size)",
         SortMode::Name => " (by name)",
+        SortMode::Modified => " (by modified)",
     };
 
     let table = Table::new(rows, widths)
@@ -407,6 +408,10 @@ fn sort_file_rows(rows: &mut [(crate::db::File, i64)], sort_mode: SortMode) {
                 name_a.cmp(name_b)
             });
         }
+        SortMode::Modified => {
+            // Descending (most recent first = highest mtime first)
+            rows.sort_by(|a, b| b.0.mtime.cmp(&a.0.mtime));
+        }
     }
 }
 
@@ -454,6 +459,18 @@ fn sort_directory_rows(rows: &mut [(crate::db::Directory, Option<i64>)], sort_mo
         SortMode::Name => {
             // Alphabetical ascending
             rows.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+        }
+        SortMode::Modified => {
+            // Descending (most recent first = highest oldest_mtime first)
+            // Note: oldest_mtime represents the oldest file in each directory
+            rows.sort_by(|a, b| {
+                match (a.0.oldest_mtime, b.0.oldest_mtime) {
+                    (Some(mtime_a), Some(mtime_b)) => mtime_b.cmp(&mtime_a), // Descending
+                    (Some(_), None) => std::cmp::Ordering::Less,             // Some before None
+                    (None, Some(_)) => std::cmp::Ordering::Greater,          // None after Some
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
         }
     }
 }
@@ -794,6 +811,7 @@ fn render_pending_approvals(
         SortMode::Expiration => " (by expiration)",
         SortMode::Size => " (by size)",
         SortMode::Name => " (by name)",
+        SortMode::Modified => " (by modified)",
     };
 
     let table = Table::new(rows, widths)
@@ -958,7 +976,7 @@ Actions (Directory List & Pending Approvals):
   x           Approve directory for removal
   d           Defer directory expiration (reset clock)
   i           Permanently ignore directory
-  s           Cycle sort mode (Expiration → Size → Name)
+  s           Cycle sort mode (Expiration → Size → Name → Modified)
   
 Other:
   q           Quit application
@@ -1145,6 +1163,27 @@ mod tests {
         }
     }
 
+    // Helper to create a Directory with custom oldest_mtime for testing
+    fn test_directory_with_mtime(
+        path: &str,
+        size_bytes: i64,
+        oldest_mtime: Option<i64>,
+    ) -> crate::db::Directory {
+        let now = jiff::Timestamp::now().as_second();
+        crate::db::Directory {
+            id: 0,
+            path: path.to_string(),
+            size_bytes,
+            file_count: 0,
+            oldest_mtime,
+            last_scanned: Some(now),
+            status: "tracked".to_string(),
+            deferred_until: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     // Tests for sort_directory_rows
 
     #[test]
@@ -1242,6 +1281,7 @@ mod tests {
         sort_directory_rows(&mut rows, SortMode::Expiration);
         sort_directory_rows(&mut rows, SortMode::Size);
         sort_directory_rows(&mut rows, SortMode::Name);
+        sort_directory_rows(&mut rows, SortMode::Modified);
 
         assert_eq!(rows.len(), 0, "Empty list should remain empty");
     }
@@ -1258,6 +1298,9 @@ mod tests {
         assert_eq!(rows[0].0.path, "/only");
 
         sort_directory_rows(&mut rows, SortMode::Name);
+        assert_eq!(rows[0].0.path, "/only");
+
+        sort_directory_rows(&mut rows, SortMode::Modified);
         assert_eq!(rows[0].0.path, "/only");
     }
 
@@ -1294,6 +1337,192 @@ mod tests {
         assert!(rows.iter().any(|(d, _)| d.path == "/a"));
         assert!(rows.iter().any(|(d, _)| d.path == "/b"));
         assert!(rows.iter().any(|(d, _)| d.path == "/c"));
+    }
+
+    #[test]
+    fn sort_directory_by_modified_most_recent_first() {
+        let mut rows = vec![
+            (test_directory_with_mtime("/a", 100, Some(1000)), Some(10)), // Oldest
+            (test_directory_with_mtime("/b", 100, Some(5000)), Some(10)), // Most recent
+            (test_directory_with_mtime("/c", 100, Some(3000)), Some(10)), // Middle
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Modified);
+
+        assert_eq!(rows[0].0.path, "/b", "Most recent (5000) should be first");
+        assert_eq!(rows[1].0.path, "/c", "Middle (3000) should be second");
+        assert_eq!(rows[2].0.path, "/a", "Oldest (1000) should be last");
+    }
+
+    #[test]
+    fn sort_directory_by_modified_none_sorts_to_end() {
+        let mut rows = vec![
+            (test_directory_with_mtime("/a", 100, Some(1000)), Some(10)),
+            (test_directory_with_mtime("/b", 100, None), Some(10)), // No mtime
+            (test_directory_with_mtime("/c", 100, Some(3000)), Some(10)),
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Modified);
+
+        assert_eq!(rows[0].0.path, "/c", "Most recent should be first");
+        assert_eq!(rows[1].0.path, "/a", "Older should be second");
+        assert_eq!(rows[2].0.path, "/b", "None should sort to end");
+    }
+
+    #[test]
+    fn sort_directory_by_modified_with_equal_values() {
+        let mut rows = vec![
+            (test_directory_with_mtime("/c", 100, Some(1000)), Some(10)),
+            (test_directory_with_mtime("/a", 200, Some(1000)), Some(10)),
+            (test_directory_with_mtime("/b", 150, Some(1000)), Some(10)),
+        ];
+
+        sort_directory_rows(&mut rows, SortMode::Modified);
+
+        // All have same oldest_mtime, so order is stable
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|(d, _)| d.path == "/a"));
+        assert!(rows.iter().any(|(d, _)| d.path == "/b"));
+        assert!(rows.iter().any(|(d, _)| d.path == "/c"));
+    }
+
+    // Tests for sort_file_rows (file-centric view)
+
+    // Helper to create a minimal File for testing
+    fn test_file(path: &str, size_bytes: i64, mtime: i64) -> crate::db::File {
+        let now = jiff::Timestamp::now().as_second();
+        crate::db::File {
+            id: 0,
+            directory_id: 1,
+            path: path.to_string(),
+            size_bytes,
+            mtime,
+            tracked_since: Some(now),
+            created_at: now,
+        }
+    }
+
+    #[test]
+    fn sort_files_by_expiration_most_urgent_first() {
+        // Test file sorting by expiration (ascending, most urgent first)
+        let mut rows = vec![
+            (test_file("/file_c.txt", 100, 1000), 30), // 30 days remaining
+            (test_file("/file_a.txt", 200, 5000), 5),  // 5 days remaining (most urgent)
+            (test_file("/file_b.txt", 150, 3000), 15), // 15 days remaining
+        ];
+
+        sort_file_rows(&mut rows, SortMode::Expiration);
+
+        assert_eq!(
+            rows[0].0.path, "/file_a.txt",
+            "Most urgent (5 days) should be first"
+        );
+        assert_eq!(
+            rows[1].0.path, "/file_b.txt",
+            "Middle urgency (15 days) should be second"
+        );
+        assert_eq!(
+            rows[2].0.path, "/file_c.txt",
+            "Least urgent (30 days) should be last"
+        );
+    }
+
+    #[test]
+    fn sort_files_by_size_largest_first() {
+        // Test file sorting by size (descending, largest first)
+        let mut rows = vec![
+            (test_file("/file_a.txt", 100, 1000), 10),
+            (test_file("/file_b.txt", 500, 1000), 10),
+            (test_file("/file_c.txt", 250, 1000), 10),
+        ];
+
+        sort_file_rows(&mut rows, SortMode::Size);
+
+        assert_eq!(
+            rows[0].0.path, "/file_b.txt",
+            "Largest (500) should be first"
+        );
+        assert_eq!(
+            rows[1].0.path, "/file_c.txt",
+            "Middle (250) should be second"
+        );
+        assert_eq!(
+            rows[2].0.path, "/file_a.txt",
+            "Smallest (100) should be last"
+        );
+    }
+
+    #[test]
+    fn sort_files_by_name_alphabetical() {
+        // Test file sorting by name (alphabetical ascending)
+        let mut rows = vec![
+            (test_file("/dir/zebra.txt", 100, 1000), 10),
+            (test_file("/dir/alpha.txt", 100, 1000), 10),
+            (test_file("/dir/mango.txt", 100, 1000), 10),
+        ];
+
+        sort_file_rows(&mut rows, SortMode::Name);
+
+        assert_eq!(rows[0].0.path, "/dir/alpha.txt", "Alpha should be first");
+        assert_eq!(rows[1].0.path, "/dir/mango.txt", "Mango should be second");
+        assert_eq!(rows[2].0.path, "/dir/zebra.txt", "Zebra should be last");
+    }
+
+    #[test]
+    fn sort_files_by_modified_most_recent_first() {
+        // Test file sorting by modification time (descending, most recent first)
+        // mtime is Unix timestamp, so higher value = more recent
+        let mut rows = vec![
+            (test_file("/file_a.txt", 100, 1000), 10), // Oldest
+            (test_file("/file_b.txt", 100, 5000), 10), // Most recent
+            (test_file("/file_c.txt", 100, 3000), 10), // Middle
+        ];
+
+        sort_file_rows(&mut rows, SortMode::Modified);
+
+        assert_eq!(
+            rows[0].0.path, "/file_b.txt",
+            "Most recent (5000) should be first"
+        );
+        assert_eq!(
+            rows[1].0.path, "/file_c.txt",
+            "Middle (3000) should be second"
+        );
+        assert_eq!(
+            rows[2].0.path, "/file_a.txt",
+            "Oldest (1000) should be last"
+        );
+    }
+
+    #[test]
+    fn sort_files_empty_list_does_not_panic() {
+        let mut rows: Vec<(crate::db::File, i64)> = vec![];
+
+        // Should not panic for any sort mode
+        sort_file_rows(&mut rows, SortMode::Expiration);
+        sort_file_rows(&mut rows, SortMode::Size);
+        sort_file_rows(&mut rows, SortMode::Name);
+        sort_file_rows(&mut rows, SortMode::Modified);
+
+        assert_eq!(rows.len(), 0, "Empty list should remain empty");
+    }
+
+    #[test]
+    fn sort_files_by_modified_with_equal_values() {
+        // Test file sorting by modification time with equal mtime values
+        let mut rows = vec![
+            (test_file("/file_c.txt", 100, 1000), 10),
+            (test_file("/file_a.txt", 200, 1000), 10),
+            (test_file("/file_b.txt", 150, 1000), 10),
+        ];
+
+        sort_file_rows(&mut rows, SortMode::Modified);
+
+        // All have same mtime, so order is stable (verify all present)
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|(f, _)| f.path == "/file_a.txt"));
+        assert!(rows.iter().any(|(f, _)| f.path == "/file_b.txt"));
+        assert!(rows.iter().any(|(f, _)| f.path == "/file_c.txt"));
     }
 
     // Tests for determine_row_style

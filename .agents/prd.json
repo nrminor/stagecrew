@@ -488,8 +488,8 @@
         "just check passes"
       ],
       "priority": 28,
-      "passes": false,
-      "notes": "Extends the old directory sorting to work with the new file-centric view."
+      "passes": true,
+      "notes": "Completed: Added Modified variant to SortMode enum, updated sort cycling logic to include all 4 modes (Expiration → Size → Name → Modified → Expiration). Implemented sorting by mtime descending (most recent first) for both file and directory sorting. Updated help text to document new sort cycle. Added comprehensive test coverage including 4 new tests for directory Modified sorting (basic, None handling, equal values) and 1 test for file Modified sorting with equal values. All 274 tests pass. Code reviews from nick-isms (found and fixed help text bug), testing-guru (comprehensive coverage with all gaps addressed), and semver-nag (no concerns, well-designed with #[non_exhaustive])."
     },
     {
       "id": "US-029",

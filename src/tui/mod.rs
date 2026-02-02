@@ -236,6 +236,9 @@ pub enum SortMode {
 
     /// Sort by path name.
     Name,
+
+    /// Sort by modification time (most recent first).
+    Modified,
 }
 
 impl App {

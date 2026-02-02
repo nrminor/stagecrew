@@ -86,7 +86,8 @@ impl InputHandler {
                 app.sort_mode = match app.sort_mode {
                     SortMode::Expiration => SortMode::Size,
                     SortMode::Size => SortMode::Name,
-                    SortMode::Name => SortMode::Expiration,
+                    SortMode::Name => SortMode::Modified,
+                    SortMode::Modified => SortMode::Expiration,
                 };
             }
 
@@ -465,6 +466,9 @@ mod tests {
 
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(app.sort_mode, SortMode::Name);
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
+        assert_eq!(app.sort_mode, SortMode::Modified);
 
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
         assert_eq!(app.sort_mode, SortMode::Expiration);

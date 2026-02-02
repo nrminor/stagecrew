@@ -1468,3 +1468,43 @@ All old TUI tests reference removed View variants and App fields:
 - File-level actions (approve, defer, ignore, delete) will be implemented in US-030
 - Multi-select and visual expiration indicators are US-031 and US-029 respectively
 
+
+## US-028: Add file sorting in TUI (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `Modified` variant to `SortMode` enum in src/tui/mod.rs
+- Updated sort cycling logic in src/tui/input.rs to cycle through all 4 modes: Expiration → Size → Name → Modified → Expiration
+- Implemented sorting by modification time (descending, most recent first) in `sort_file_rows()` function
+- Updated legacy `sort_directory_rows()` function to handle Modified variant (sorts by oldest_mtime descending with explicit None handling)
+- Updated sort indicator display in all relevant render functions to show " (by modified)"
+- Fixed help text to document the new sort cycle including Modified mode
+- Added 4 new unit tests for directory sorting by Modified (274 total tests now):
+  - sort_directory_by_modified_most_recent_first
+  - sort_directory_by_modified_none_sorts_to_end
+  - sort_directory_by_modified_with_equal_values
+  - sort_files_by_modified_with_equal_values
+- Updated existing tests (sort_empty_list_does_not_panic, sort_single_item_is_trivial) to include Modified mode
+- Updated existing sort mode cycling test to verify all 4 modes
+
+**Agent reviews:**
+- nick-isms: Found critical documentation bug in help text (fixed - updated sort cycle description to include Modified), approved implementation with minor suggestions about SortMode::next() method (tracked as future improvement)
+- testing-guru: Identified gaps in test coverage for directory Modified sorting (all addressed - added 4 comprehensive tests covering basic case, None handling, and equal values)
+- semver-nag: No semver concerns, #[non_exhaustive] on SortMode enum makes adding variants safe, well-prepared for library extraction
+
+**Notes for next agent:**
+- All acceptance criteria met and verified:
+  1. ✓ Press 's' cycles through Expiration → Size → Name → Modified → Expiration
+  2. ✓ Current sort mode displayed in header (table title shows " (by modified)")
+  3. ✓ Expiration: ascending (most urgent first)
+  4. ✓ Size: descending (largest first)
+  5. ✓ Name: alphabetical ascending
+  6. ✓ Modified: descending (most recent first) ← NEW
+  7. ✓ Sort persists while navigating
+  8. ✓ just check passes - all 274 tests pass
+- Implementation covers both file-level sorting (new file-centric view) and directory-level sorting (legacy code paths)
+- Help text now correctly documents all 4 sort modes
+- Test coverage is comprehensive with no identified gaps
+- Next story is US-029: Add visual expiration indicator in TUI
+- Requires implementing color gradients or progress bars for expiration status
