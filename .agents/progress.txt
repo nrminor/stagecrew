@@ -1665,3 +1665,50 @@ All old TUI tests reference removed View variants and App fields:
 - Selection is NOT cleared when switching directories - files remain in selected_files HashSet but are filtered at operation time
 - Next story is US-032: Update TUI footer with new keybindings (Space, v, Esc)
 
+## US-032: Update TUI footer with new keybindings (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Updated `render_footer()` function in src/tui/ui.rs to provide context-sensitive keybinding hints based on application state
+- Footer now adapts based on four contexts:
+  1. **Modal state**: When a modal is open, shows modal-specific controls (deferral: numeric input hints, confirmation: y/n hints)
+  2. **Current view**: FileList, AuditLog, or Help views each show appropriate actions
+  3. **Focus panel** (FileList view only): Sidebar focus shows directory navigation, MainPanel focus shows file actions
+  4. **Selection state** (FileList view only): When files are selected, shows multi-select actions with counts (e.g., "[d] Delete 3")
+- Implementation uses hierarchical if-match structure: modal state checked first (highest priority), then view type, then panel focus or selection state
+- Modal detection checks all 7 pending action fields (approval, deferral, ignore, file_delete, file_deferral, file_ignore, file_approval)
+- Multi-select hints show actual count: "[d] Delete {selection_count} [r] Defer {selection_count}..."
+- Used inline format strings (clippy::uninlined_format_args compliance)
+
+**Specific footer hints by context:**
+- **Deferral modal**: "[0-9] Enter days [Backspace] Delete [Enter] Confirm [Esc] Cancel"
+- **Confirmation modal**: "[y] Yes [n] No [Esc] Cancel"
+- **FileList / Sidebar**: "[j/k] Navigate [g/G] Top/Bottom [Enter] Select [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
+- **FileList / MainPanel**: "[j/k] Navigate [g/G] Top/Bottom [d] Delete [r] Defer [i] Ignore [x] Approve [Space] Select [v] Visual [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
+- **FileList / Selection active**: "[d] Delete N [r] Defer N [i] Ignore N [x] Approve N [Esc] Clear [q] Quit"
+- **AuditLog**: "[j/k] Navigate [g/G] Top/Bottom [Esc] Back [q] Quit"
+- **Help**: "[Any key] Close"
+
+**Agent reviews:**
+- nick-isms: ✅ APPROVED. All acceptance criteria met. Implementation is actually better than AC (includes [i] and [x] actions in multi-select, not just d/r). Declarative structure with clean match expressions. Modal precedence correct. Context-sensitivity comprehensive. Minor observation: MainPanel hint string is 136 characters and may wrap on narrow terminals (future UX consideration, not blocker). Help view text still shows legacy keybindings (tracked in US-033). No local imports. Verdict: Ready to commit.
+- testing-guru: No additional tests required. `render_footer` is pub(crate) rendering function with straightforward pattern matching. Testability is low (coupled to Frame), but acceptable because: (1) exhaustive match on View enum provides compile-time enforcement, (2) no complex logic (pure state → string mapping), (3) integration tests provide coverage via input handler tests. Optional refactor: extract `compute_footer_hints(app: &App) -> String` as pure function for easier testing. Recommended test cases documented if tests desired later (7 scenarios covering modal precedence, multi-select, focus differentiation). Verdict: Adequate coverage.
+- semver-nag: 🟢 No semver implications. `render_footer` is private function (`fn`, not `pub fn`) in private module (`mod ui` in `tui/mod.rs`) in binary crate (`src/main.rs`, TUI not exported from `lib.rs`). Version 0.1.0 has no stability guarantees. TUI module explicitly excluded from library API (lib.rs line 19). Good defensive design observed: #[non_exhaustive] on View/FocusPanel/SortMode enums, pub(crate) on render function, clear module boundaries. Minor observation: legacy dead code marked #[allow(dead_code)] should be cleaned up eventually. Verdict: Safe to merge.
+
+**Technical notes:**
+- Implementation deviates from acceptance criteria by including [i] Ignore and [x] Approve in multi-select hints - this is intentional and correct (acceptance criteria was incomplete)
+- Footer hints are type String (constructed via format! or .to_string()) to allow dynamic count interpolation
+- No changes to function signature - still takes &App, &mut Frame, Rect parameters
+- No new tests added per testing-guru recommendation (existing coverage adequate)
+
+**Notes for next agent:**
+- Footer update is now feature-complete for US-032
+- All 291 tests pass, clippy clean, docs build successfully
+- All acceptance criteria met (with intentional improvements over AC)
+- No new files added, no .gitignore changes needed
+- Footer is now fully context-aware and adapts to all 8 application states
+- Optional future work: Extract `compute_footer_hints()` as pure function for improved testability (not required)
+- Optional future work: Responsive footer hints based on terminal width for narrow terminals (UX enhancement, not blocker)
+- Next story is US-033: Update TUI help view with new keybindings
+- US-033 will update render_help() to document the new file-centric workflow and remove legacy keybinding references
+

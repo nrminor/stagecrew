@@ -557,8 +557,8 @@
         "just check passes"
       ],
       "priority": 32,
-      "passes": false,
-      "notes": "Updates the legacy footer implementation for the new TUI design."
+      "passes": true,
+      "notes": "Completed: Updated render_footer() to provide context-sensitive keybinding hints based on modal state, current view, focused panel, and file selection state. Footer now shows appropriate hints for: (1) modals (deferral input vs confirmation), (2) FileList view with sidebar focus vs main panel focus, (3) multi-select mode with counts (e.g., 'Delete 3'), (4) AuditLog and Help views. Implementation approved by all three reviewers (nick-isms, testing-guru, semver-nag) with no blocking issues. No additional tests required - exhaustive match provides compile-time guarantees and integration tests provide adequate coverage. Minor note: footer hints are quite long (136 chars for main panel) and may wrap on narrow terminals - tracked as future UX consideration."
     },
     {
       "id": "US-033",

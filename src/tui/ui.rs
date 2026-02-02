@@ -1081,12 +1081,49 @@ Press any key to close this help screen";
 
 /// Render the footer with context-sensitive keybinding hints.
 fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let hints = match app.view() {
-        View::FileList => {
-            "[j/k] Navigate [g/G] Top/Bottom [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
+    // Check if any modal is open (takes precedence over normal view hints)
+    let modal_open = app.pending_approval().is_some()
+        || app.pending_deferral().is_some()
+        || app.pending_ignore().is_some()
+        || app.pending_file_delete().is_some()
+        || app.pending_file_deferral().is_some()
+        || app.pending_file_ignore().is_some()
+        || app.pending_file_approval().is_some();
+
+    let hints = if modal_open {
+        // When a modal is open, show appropriate modal controls
+        if app.pending_deferral().is_some() || app.pending_file_deferral().is_some() {
+            "[0-9] Enter days [Backspace] Delete [Enter] Confirm [Esc] Cancel".to_string()
+        } else {
+            "[y] Yes [n] No [Esc] Cancel".to_string()
         }
-        View::AuditLog => "[j/k] Navigate [g/G] Top/Bottom [Esc] Back [q] Quit",
-        View::Help => "[Any key] Close",
+    } else {
+        // Show context-sensitive hints based on current view and state
+        match app.view() {
+            View::FileList => {
+                let selection_count = app.selected_files().len();
+
+                if selection_count > 0 {
+                    // When files are selected, show multi-select action hints
+                    format!(
+                        "[d] Delete {selection_count} [r] Defer {selection_count} [i] Ignore {selection_count} [x] Approve {selection_count} [Esc] Clear [q] Quit"
+                    )
+                } else {
+                    // Show hints based on which panel is focused
+                    match app.focus_panel() {
+                        FocusPanel::Sidebar => {
+                            "[j/k] Navigate [g/G] Top/Bottom [Enter] Select [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
+                        }
+                        FocusPanel::MainPanel => {
+                            "[j/k] Navigate [g/G] Top/Bottom [d] Delete [r] Defer [i] Ignore [x] Approve [Space] Select [v] Visual [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
+                        }
+                    }
+                    .to_string()
+                }
+            }
+            View::AuditLog => "[j/k] Navigate [g/G] Top/Bottom [Esc] Back [q] Quit".to_string(),
+            View::Help => "[Any key] Close".to_string(),
+        }
     };
 
     let footer = Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(Color::Gray));
