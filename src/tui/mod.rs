@@ -8,7 +8,9 @@ use std::collections::HashSet;
 use std::io::{self, Stdout};
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -477,8 +479,14 @@ impl App {
             tokio::select! {
                 // Handle keyboard/mouse events
                 maybe_event = event_stream.next() => {
-                    if let Some(Ok(Event::Key(key))) = maybe_event {
-                        InputHandler::handle(self, config, db, key);
+                    match maybe_event {
+                        Some(Ok(Event::Key(key))) => {
+                            InputHandler::handle(self, config, db, key);
+                        }
+                        Some(Ok(Event::Mouse(mouse))) => {
+                            Self::handle_mouse_event(self, mouse);
+                        }
+                        _ => {}
                     }
                 }
 
@@ -513,6 +521,37 @@ impl App {
 
         // Terminal cleanup happens automatically via Drop
         Ok(())
+    }
+
+    /// Handle mouse events (scroll wheel navigation).
+    fn handle_mouse_event(&mut self, event: MouseEvent) {
+        match event.kind {
+            MouseEventKind::ScrollDown => {
+                // Scroll down = move selection down (same as 'j')
+                match self.focus_panel {
+                    FocusPanel::Sidebar => {
+                        self.sidebar_selected_index = self.sidebar_selected_index.saturating_add(1);
+                    }
+                    FocusPanel::MainPanel => {
+                        self.file_selected_index = self.file_selected_index.saturating_add(1);
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                // Scroll up = move selection up (same as 'k')
+                match self.focus_panel {
+                    FocusPanel::Sidebar => {
+                        self.sidebar_selected_index = self.sidebar_selected_index.saturating_sub(1);
+                    }
+                    FocusPanel::MainPanel => {
+                        self.file_selected_index = self.file_selected_index.saturating_sub(1);
+                    }
+                }
+            }
+            _ => {
+                // Ignore other mouse events (clicks, drags, etc.)
+            }
+        }
     }
 }
 
