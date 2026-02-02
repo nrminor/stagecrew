@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
 use crate::audit::AuditService;
 use crate::config::Config;
@@ -1197,12 +1197,8 @@ fn render_confirmation_modal(frame: &mut Frame, path: &str) {
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    // Clear the area behind the modal (create a simple background)
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-
-    frame.render_widget(background, modal_area);
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
     frame.render_widget(modal, modal_area);
 }
 
@@ -1264,12 +1260,8 @@ fn render_deferral_modal(
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    // Clear the area behind the modal (create a simple background)
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-
-    frame.render_widget(background, modal_area);
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
     frame.render_widget(modal, modal_area);
 }
 
@@ -1308,12 +1300,8 @@ fn render_file_delete_modal(frame: &mut Frame, path: &str) {
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    // Clear the area behind the modal (create a simple background)
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-
-    frame.render_widget(background, modal_area);
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
     frame.render_widget(modal, modal_area);
 }
 
@@ -1352,12 +1340,8 @@ fn render_ignore_modal(frame: &mut Frame, path: &str) {
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    // Clear the area behind the modal (create a simple background)
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-
-    frame.render_widget(background, modal_area);
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
     frame.render_widget(modal, modal_area);
 }
 
@@ -1391,11 +1375,8 @@ fn render_ignore_modal_multi(frame: &mut Frame, count: usize) {
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-
-    frame.render_widget(background, modal_area);
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
     frame.render_widget(modal, modal_area);
 }
 
@@ -1429,11 +1410,8 @@ fn render_confirmation_modal_multi(frame: &mut Frame, count: usize) {
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-
-    frame.render_widget(background, modal_area);
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
     frame.render_widget(modal, modal_area);
 }
 
@@ -1467,11 +1445,8 @@ fn render_file_delete_modal_multi(frame: &mut Frame, count: usize) {
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-
-    frame.render_widget(background, modal_area);
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
     frame.render_widget(modal, modal_area);
 }
 
@@ -1512,11 +1487,8 @@ fn render_add_path_modal(frame: &mut Frame, input: &str) {
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-
-    frame.render_widget(background, modal_area);
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
     frame.render_widget(modal, modal_area);
 }
 
@@ -1553,11 +1525,8 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-
-    frame.render_widget(background, modal_area);
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
     frame.render_widget(modal, modal_area);
 }
 
