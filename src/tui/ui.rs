@@ -136,7 +136,7 @@ fn render_file_list_view(
         .split(area);
 
     // Render header with stats
-    render_file_view_header(config, db, frame, v_chunks[0]);
+    render_file_view_header(app, config, db, frame, v_chunks[0]);
 
     if app.sidebar_visible() {
         // Split content area horizontally: sidebar | main panel
@@ -161,6 +161,7 @@ fn render_file_list_view(
 
 /// Render the header showing stats for the current file view.
 fn render_file_view_header(
+    app: &App,
     _config: &Config,
     db: &Database,
     frame: &mut Frame,
@@ -186,14 +187,27 @@ fn render_file_view_header(
     #[allow(clippy::cast_sign_loss)]
     let total_size_str = format_bytes(stats.total_size_bytes as u64);
 
-    let header_text = format!(
-        "Total: {} paths, {} | Pending: {} | Within warning: {} | Overdue: {}",
-        stats.total_tracked_paths,
-        total_size_str,
-        stats.paths_pending_approval,
-        stats.paths_within_warning,
-        stats.paths_overdue
-    );
+    // Build header text, including status message if present
+    let header_text = if let Some(status) = app.status_message.as_ref() {
+        format!(
+            "Total: {} paths, {} | Pending: {} | Within warning: {} | Overdue: {} | {}",
+            stats.total_tracked_paths,
+            total_size_str,
+            stats.paths_pending_approval,
+            stats.paths_within_warning,
+            stats.paths_overdue,
+            status
+        )
+    } else {
+        format!(
+            "Total: {} paths, {} | Pending: {} | Within warning: {} | Overdue: {}",
+            stats.total_tracked_paths,
+            total_size_str,
+            stats.paths_pending_approval,
+            stats.paths_within_warning,
+            stats.paths_overdue
+        )
+    };
 
     let header = Paragraph::new(header_text)
         .block(Block::default().borders(Borders::ALL).title("Overview"))
@@ -1103,6 +1117,7 @@ Sorting:
   s           Cycle sort mode (Expiration → Size → Name → Modified)
   
 Other:
+  R           Rescan tracked paths (refresh)
   q           Quit application
   Ctrl+C      Quit application
 

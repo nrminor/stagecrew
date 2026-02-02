@@ -169,6 +169,13 @@ impl InputHandler {
             KeyCode::Char('a') => app.view = View::AuditLog,
             KeyCode::Char('?') => app.view = View::Help,
 
+            // Refresh/rescan (R = rescan tracked paths)
+            KeyCode::Char('R') => {
+                if !app.scan_in_progress {
+                    app.scan_requested = true;
+                }
+            }
+
             // Path management (A = add, X = remove from sidebar)
             KeyCode::Char('A') => {
                 // Initiate add path modal

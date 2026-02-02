@@ -6,19 +6,20 @@ mod ui;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::{self, Stdout};
-use std::time::Duration;
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::config::Config;
 use crate::db::Database;
 use crate::error::Result;
+use crate::scanner::{Scanner, scan_and_persist};
 
 use input::InputHandler;
 
@@ -42,6 +43,9 @@ pub(crate) struct PendingDeferral {
 }
 
 /// Main TUI application state.
+// Allow: The bools represent independent flags (quit, sidebar visibility, scan state)
+// that don't naturally form a state machine. Each has distinct semantics.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     /// Whether the app should quit.
     pub(crate) should_quit: bool,
@@ -116,6 +120,18 @@ pub struct App {
 
     /// Whether the sidebar is visible.
     pub(crate) sidebar_visible: bool,
+
+    /// Whether a scan has been requested (set by R keybind, cleared by main loop).
+    pub(crate) scan_requested: bool,
+
+    /// Whether a scan is currently in progress.
+    pub(crate) scan_in_progress: bool,
+
+    /// Status message to display (e.g., "Scanning...", "Scan complete").
+    pub(crate) status_message: Option<String>,
+
+    /// When the status message was set (for auto-clearing after timeout).
+    pub(crate) status_message_time: Option<std::time::Instant>,
 }
 
 impl App {
@@ -353,14 +369,18 @@ impl App {
             pending_add_path: None,
             pending_remove_path: None,
             sidebar_visible: true,
+            scan_requested: false,
+            scan_in_progress: false,
+            status_message: None,
+            status_message_time: None,
         }
     }
 
     /// Run the TUI main loop.
     ///
     /// This sets up the terminal in raw mode with an alternate screen, then enters
-    /// the main event loop. The loop polls for keyboard/mouse events with a timeout,
-    /// processes input through the `InputHandler`, and renders the UI via `ui::render`.
+    /// the main event loop. The loop uses `tokio::select!` to handle both keyboard
+    /// events and background task completion without blocking.
     ///
     /// The terminal is guaranteed to be restored to its original state on exit,
     /// even if a panic occurs, through the `TerminalManager`'s Drop implementation.
@@ -368,33 +388,127 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if terminal setup fails or if rendering encounters an I/O error.
-    ///
-    /// # Note on async signature
-    ///
-    /// This function is async for future compatibility when async database queries
-    /// are integrated. Currently the event loop is synchronous but maintaining the
-    /// async signature allows smooth transition to async operations without breaking
-    /// the API.
-    // Allow: Async signature maintained for future compatibility when async database
-    // queries are integrated. This prevents a breaking API change later.
-    #[allow(clippy::unused_async)]
-    pub async fn run(&mut self, config: &Config, db: &Database) -> Result<()> {
+    pub async fn run(
+        &mut self,
+        config: &Config,
+        db: &Database,
+        db_path: &std::path::Path,
+    ) -> Result<()> {
         let mut terminal_manager = TerminalManager::setup().map_err(crate::error::Error::Io)?;
+        let mut event_stream = EventStream::new();
+
+        // Channel for receiving scan completion results
+        let (scan_tx, mut scan_rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<(), String>>(1);
+
+        // Track the scan task handle so we can await it properly
+        let mut scan_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         // Main event loop
-        while !self.should_quit {
+        loop {
             // Render the current state
             terminal_manager
                 .terminal_mut()
                 .draw(|frame| ui::render(self, config, db, frame))
                 .map_err(crate::error::Error::Io)?;
 
-            // Poll for events with a timeout to limit frame rate
-            if event::poll(Duration::from_millis(100)).map_err(crate::error::Error::Io)?
-                && let Event::Key(key) = event::read().map_err(crate::error::Error::Io)?
-            {
-                InputHandler::handle(self, config, db, key);
+            // Check if we should quit (after rendering final state)
+            if self.should_quit {
+                break;
             }
+
+            // Clear status message after 3 seconds
+            if let Some(time) = self.status_message_time
+                && time.elapsed() > std::time::Duration::from_secs(3)
+            {
+                self.status_message = None;
+                self.status_message_time = None;
+            }
+
+            // Check if a scan was requested and none is in progress
+            if self.scan_requested && !self.scan_in_progress {
+                self.scan_requested = false;
+                self.scan_in_progress = true;
+                self.status_message = Some("Scanning...".to_string());
+                // Don't set timestamp for "Scanning..." - we want it to persist until done
+
+                // Clone what we need for the background task
+                let scanner = Scanner::new();
+                let tracked_paths = config.tracked_paths.clone();
+                let expiration_days = config.expiration_days;
+                let warning_days = config.warning_days;
+                let task_db_path = db_path.to_path_buf();
+                let tx = scan_tx.clone();
+
+                // Spawn the scan as a background task
+                // We use a separate tokio task that runs the scan. The scan internally
+                // uses spawn_blocking for filesystem operations, so this is safe.
+                scan_handle = Some(tokio::spawn(async move {
+                    // Run the scan in a way that's compatible with the non-Send Database.
+                    // We create a new runtime context for the blocking database operations.
+                    let scan_result = tokio::task::spawn_blocking(move || {
+                        // Create a new runtime for the async scan operation
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(async {
+                            match Database::open(&task_db_path) {
+                                Ok(task_db) => scan_and_persist(
+                                    &task_db,
+                                    &scanner,
+                                    &tracked_paths,
+                                    expiration_days,
+                                    warning_days,
+                                )
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string()),
+                                Err(e) => Err(format!("Failed to open database: {e}")),
+                            }
+                        })
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Scan task panicked: {e}")));
+
+                    // Send result back (ignore send errors if receiver dropped)
+                    let _ = tx.send(scan_result).await;
+                }));
+            }
+
+            // Use select! to handle events and scan completion concurrently
+            tokio::select! {
+                // Handle keyboard/mouse events
+                maybe_event = event_stream.next() => {
+                    if let Some(Ok(Event::Key(key))) = maybe_event {
+                        InputHandler::handle(self, config, db, key);
+                    }
+                }
+
+                // Handle scan completion
+                Some(result) = scan_rx.recv() => {
+                    self.scan_in_progress = false;
+                    scan_handle = None;
+                    self.status_message_time = Some(std::time::Instant::now());
+                    match result {
+                        Ok(()) => {
+                            self.status_message = Some("Scan complete".to_string());
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Scan failed: {e}"));
+                        }
+                    }
+                }
+
+                // Timeout to ensure we re-render periodically even without events
+                // This clears status messages after a delay and keeps UI responsive
+                () = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                    // Clear status message after showing it for a bit
+                    // (A more sophisticated approach would track message age)
+                }
+            }
+        }
+
+        // Clean up any running scan task
+        if let Some(handle) = scan_handle {
+            handle.abort();
         }
 
         // Terminal cleanup happens automatically via Drop

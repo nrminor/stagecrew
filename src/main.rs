@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     match command {
         Command::Tui => {
             let mut app = tui::App::new();
-            app.run(&config, &db).await?;
+            app.run(&config, &db, &db_path).await?;
         }
 
         Command::Daemon => {
