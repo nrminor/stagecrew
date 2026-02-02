@@ -99,6 +99,16 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
             render_confirmation_modal_multi(frame, count);
         }
     }
+
+    // Render add path input modal if pending add path
+    if let Some(input) = app.pending_add_path() {
+        render_add_path_modal(frame, input);
+    }
+
+    // Render remove path confirmation modal if pending remove path
+    if let Some(path) = app.pending_remove_path() {
+        render_remove_path_modal(frame, path);
+    }
 }
 
 /// Render the file list view with sidebar.
@@ -1106,12 +1116,16 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         || app.pending_file_delete().is_some()
         || app.pending_file_deferral().is_some()
         || app.pending_file_ignore().is_some()
-        || app.pending_file_approval().is_some();
+        || app.pending_file_approval().is_some()
+        || app.pending_add_path().is_some()
+        || app.pending_remove_path().is_some();
 
     let hints = if modal_open {
         // When a modal is open, show appropriate modal controls
         if app.pending_deferral().is_some() || app.pending_file_deferral().is_some() {
             "[0-9] Enter days [Backspace] Delete [Enter] Confirm [Esc] Cancel".to_string()
+        } else if app.pending_add_path().is_some() {
+            "[Type path] (supports ~) [Backspace] Delete [Enter] Add [Esc] Cancel".to_string()
         } else {
             "[y] Yes [n] No [Esc] Cancel".to_string()
         }
@@ -1130,10 +1144,10 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
                     // Show hints based on which panel is focused
                     match app.focus_panel() {
                         FocusPanel::Sidebar => {
-                            "[j/k] Navigate [g/G] Top/Bottom [Enter] Select [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
+                            "[j/k] Navigate [g/G] Top/Bottom [X] Remove [A] Add [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
                         }
                         FocusPanel::MainPanel => {
-                            "[j/k] Navigate [g/G] Top/Bottom [d] Delete [r] Defer [i] Ignore [x] Approve [Space] Select [v] Visual [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
+                            "[j/k] Navigate [g/G] Top/Bottom [d] Delete [r] Defer [i] Ignore [x] Approve [Space] Select [v] Visual [A] Add path [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
                         }
                     }
                     .to_string()
@@ -1447,6 +1461,92 @@ fn render_file_delete_modal_multi(frame: &mut Frame, count: usize) {
         .block(
             Block::default()
                 .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    let background = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+
+    frame.render_widget(background, modal_area);
+    frame.render_widget(modal, modal_area);
+}
+
+/// Render add path text input modal.
+///
+/// Displays a centered modal prompting the user to enter a path to add to `tracked_paths`.
+/// Supports tilde expansion (~).
+fn render_add_path_modal(frame: &mut Frame, input: &str) {
+    use ratatui::layout::{Alignment, Rect};
+
+    // Calculate centered rectangle for modal (60% width, 7 lines height)
+    let area = frame.area();
+    let modal_width = (area.width * 3) / 5;
+    let modal_height = 7;
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    // Create the modal content
+    let display_input = if input.is_empty() { "_" } else { input };
+    let message = format!(
+        "Add tracked path:\n\n{display_input}\n\n(Supports ~) (Enter to add, Esc to cancel)"
+    );
+
+    let modal = Paragraph::new(message)
+        .block(
+            Block::default()
+                .title("Add Tracked Path")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    let background = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+
+    frame.render_widget(background, modal_area);
+    frame.render_widget(modal, modal_area);
+}
+
+/// Render remove path confirmation modal.
+///
+/// Displays a centered modal prompting the user to confirm removal of a tracked path.
+fn render_remove_path_modal(frame: &mut Frame, path: &str) {
+    use ratatui::layout::{Alignment, Rect};
+
+    // Calculate centered rectangle for modal (50% width, 7 lines height)
+    let area = frame.area();
+    let modal_width = area.width / 2;
+    let modal_height = 7;
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    // Create the modal content
+    let message = format!("Remove tracked path:\n{path}\n\n(y/n)");
+
+    let modal = Paragraph::new(message)
+        .block(
+            Block::default()
+                .title("Remove Tracked Path")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red)),
         )

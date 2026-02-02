@@ -105,6 +105,14 @@ pub struct App {
 
     /// Set of selected file IDs for multi-select operations.
     pub(crate) selected_files: HashSet<i64>,
+
+    /// Pending add path text input state.
+    /// Contains the accumulated input buffer for the new path to add.
+    pub(crate) pending_add_path: Option<String>,
+
+    /// Pending remove path confirmation state.
+    /// Contains the path awaiting user confirmation for removal from config.
+    pub(crate) pending_remove_path: Option<String>,
 }
 
 impl App {
@@ -183,6 +191,16 @@ impl App {
     /// Get the set of selected file IDs.
     pub fn selected_files(&self) -> &HashSet<i64> {
         &self.selected_files
+    }
+
+    /// Get the pending add path input state.
+    pub fn pending_add_path(&self) -> Option<&str> {
+        self.pending_add_path.as_deref()
+    }
+
+    /// Get the pending remove path confirmation state.
+    pub fn pending_remove_path(&self) -> Option<&str> {
+        self.pending_remove_path.as_deref()
     }
 
     /// Clear all file selections.
@@ -324,6 +342,8 @@ impl App {
             pending_file_ignore: None,
             pending_file_approval: None,
             selected_files: HashSet::new(),
+            pending_add_path: None,
+            pending_remove_path: None,
         }
     }
 
@@ -467,6 +487,14 @@ mod tests {
         assert!(
             app.selected_files.is_empty(),
             "App should start with no selected files"
+        );
+        assert_eq!(
+            app.pending_add_path, None,
+            "App should start with no pending add path"
+        );
+        assert_eq!(
+            app.pending_remove_path, None,
+            "App should start with no pending remove path"
         );
     }
 

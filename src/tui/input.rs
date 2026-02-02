@@ -23,8 +23,20 @@ impl InputHandler {
         }
     }
 
+    // Allow: This function coordinates input handling for the file list view, including
+    // modal dispatch, focus management, navigation, actions, and view switching. Breaking
+    // it into smaller functions would obscure the input handling flow.
+    #[allow(clippy::too_many_lines)]
     fn handle_file_list(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
         // Check for pending confirmations/inputs first
+        if app.pending_add_path.is_some() {
+            Self::handle_add_path_input(app, config, db, key);
+            return;
+        }
+        if app.pending_remove_path.is_some() {
+            Self::handle_remove_path_confirmation(app, config, key);
+            return;
+        }
         if app.pending_file_delete.is_some() {
             Self::handle_file_delete_confirmation(app, db, key);
             return;
@@ -137,6 +149,15 @@ impl InputHandler {
             // Views
             KeyCode::Char('a') => app.view = View::AuditLog,
             KeyCode::Char('?') => app.view = View::Help,
+
+            // Path management (A = add, X = remove from sidebar)
+            KeyCode::Char('A') => {
+                // Initiate add path modal
+                app.pending_add_path = Some(String::new());
+            }
+            KeyCode::Char('X') if app.focus_panel == FocusPanel::Sidebar => {
+                Self::initiate_remove_path(app, config, db);
+            }
 
             _ => {}
         }
@@ -790,6 +811,147 @@ impl InputHandler {
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel approval
                 app.pending_file_approval = None;
+            }
+            _ => {
+                // Ignore other keys during confirmation
+            }
+        }
+    }
+
+    /// Handle add path text input (characters/backspace/enter/esc).
+    fn handle_add_path_input(app: &mut App, config: &Config, _db: &Database, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) if !c.is_control() => {
+                // Append character to input buffer
+                if let Some(ref mut input) = app.pending_add_path {
+                    input.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                // Remove last character from input buffer
+                if let Some(ref mut input) = app.pending_add_path {
+                    input.pop();
+                }
+            }
+            KeyCode::Enter => {
+                // User confirmed - add the path
+                if let Some(input) = &app.pending_add_path {
+                    if input.trim().is_empty() {
+                        tracing::warn!("Cannot add empty path");
+                        app.pending_add_path = None;
+                        return;
+                    }
+
+                    // Expand tilde
+                    let expanded_path = shellexpand::tilde(input.trim());
+                    let path = std::path::PathBuf::from(expanded_path.as_ref());
+
+                    // Validate path exists and is a directory
+                    if !path.exists() {
+                        tracing::warn!("Path does not exist: {}", path.display());
+                        app.pending_add_path = None;
+                        return;
+                    }
+
+                    if !path.is_dir() {
+                        tracing::warn!("Path is not a directory: {}", path.display());
+                        app.pending_add_path = None;
+                        return;
+                    }
+
+                    // Canonicalize to prevent duplicates
+                    let canonical_path = match path.canonicalize() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!("Failed to canonicalize path {}: {}", path.display(), e);
+                            app.pending_add_path = None;
+                            return;
+                        }
+                    };
+
+                    // Check if already tracked
+                    if config.tracked_paths.contains(&canonical_path) {
+                        tracing::warn!("Path already tracked: {}", canonical_path.display());
+                        app.pending_add_path = None;
+                        return;
+                    }
+
+                    // Add to config
+                    let mut new_config = config.clone();
+                    new_config.tracked_paths.push(canonical_path.clone());
+
+                    // Save config
+                    let paths = crate::config::AppPaths::new();
+                    if let Err(e) = new_config.save(&paths) {
+                        tracing::warn!("Failed to save config: {}", e);
+                        app.pending_add_path = None;
+                        return;
+                    }
+
+                    tracing::info!(
+                        "Added tracked path: {} (will be scanned on next daemon cycle or manual scan)",
+                        canonical_path.display()
+                    );
+                }
+
+                // Clear pending add path
+                app.pending_add_path = None;
+            }
+            KeyCode::Esc => {
+                // Cancel add path input
+                app.pending_add_path = None;
+            }
+            _ => {
+                // Ignore other keys during input
+            }
+        }
+    }
+
+    /// Initiate path removal by querying config for the selected sidebar directory.
+    fn initiate_remove_path(app: &mut App, _config: &Config, db: &Database) {
+        // Get list of tracked directories from database
+        let directories = match db.list_directories(None) {
+            Ok(dirs) => dirs,
+            Err(e) => {
+                tracing::warn!("Failed to query directories: {}", e);
+                return;
+            }
+        };
+
+        // Get the selected directory path
+        if let Some(dir) = directories.get(app.sidebar_selected_index) {
+            app.pending_remove_path = Some(dir.path.clone());
+        } else {
+            tracing::warn!("No directory selected for removal");
+        }
+    }
+
+    /// Handle remove path confirmation (y/n/Esc).
+    fn handle_remove_path_confirmation(app: &mut App, config: &Config, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                // User confirmed - remove the path
+                if let Some(path_to_remove) = &app.pending_remove_path {
+                    let mut new_config = config.clone();
+
+                    // Remove from tracked_paths
+                    new_config.tracked_paths.retain(|p| p != path_to_remove);
+
+                    // Save config
+                    let paths = crate::config::AppPaths::new();
+                    if let Err(e) = new_config.save(&paths) {
+                        tracing::warn!("Failed to save config: {}", e);
+                    } else {
+                        tracing::info!("Removed tracked path: {}", path_to_remove);
+                    }
+                }
+
+                // Clear pending remove path
+                app.pending_remove_path = None;
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                // Cancel removal
+                app.pending_remove_path = None;
             }
             _ => {
                 // Ignore other keys during confirmation
