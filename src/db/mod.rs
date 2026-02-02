@@ -354,7 +354,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, directory_id, path, size_bytes, mtime, tracked_since, status, deferred_until, created_at, updated_at
              FROM files
-             WHERE directory_id = ?1
+             WHERE directory_id = ?1 AND status != 'removed'
              ORDER BY path",
         )?;
 

@@ -515,10 +515,18 @@ impl InputHandler {
                     let user = AuditService::current_user();
                     let dir_id = app.current_directory_id.get();
 
+                    let mut success_count = 0;
+                    let mut fail_count = 0;
+                    let total = files.len();
+
                     for (file_id, path) in files {
                         if let Err(e) = db.delete_file(*file_id, path) {
                             tracing::warn!("Failed to delete file {}: {}", path, e);
+                            app.status_message = Some(format!("Delete failed: {e}"));
+                            app.status_message_time = Some(std::time::Instant::now());
+                            fail_count += 1;
                         } else {
+                            success_count += 1;
                             // Record audit entry for each file
                             if let Err(e) = audit.record(
                                 &user,
@@ -534,6 +542,21 @@ impl InputHandler {
                             }
                         }
                     }
+
+                    // Show result in status bar
+                    if fail_count == 0 && success_count > 0 {
+                        app.status_message = Some(format!("Deleted {success_count} file(s)"));
+                        app.status_message_time = Some(std::time::Instant::now());
+                    } else if fail_count > 0 && success_count > 0 {
+                        app.status_message = Some(format!(
+                            "Deleted {success_count}/{total}, {fail_count} failed"
+                        ));
+                        app.status_message_time = Some(std::time::Instant::now());
+                    }
+                    // If all failed, the last error message is already set
+                } else {
+                    app.status_message = Some("No files pending delete".to_string());
+                    app.status_message_time = Some(std::time::Instant::now());
                 }
                 // Clear pending deletion and selection
                 app.pending_file_delete = None;
@@ -1408,15 +1431,24 @@ mod tests {
             "pending_file_delete should be cleared"
         );
 
-        // File should be marked as removed in database
+        // File should be marked as removed in database (query directly since
+        // list_files_by_directory filters out removed files)
+        let status: String = db
+            .conn()
+            .query_row("SELECT status FROM files WHERE id = ?1", [file_id], |row| {
+                row.get(0)
+            })
+            .expect("File should still exist in DB");
+        assert_eq!(status, "removed", "File status should be 'removed'");
+
+        // File should no longer appear in the active file list
         let files = db
             .list_files_by_directory(dir_id)
             .expect("Failed to list files");
-        let file = files
-            .iter()
-            .find(|f| f.id == file_id)
-            .expect("File should still exist in DB");
-        assert_eq!(file.status, "removed", "File status should be 'removed'");
+        assert!(
+            !files.iter().any(|f| f.id == file_id),
+            "Removed file should not appear in list_files_by_directory"
+        );
 
         // File should be deleted from filesystem
         assert!(
