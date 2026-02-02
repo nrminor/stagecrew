@@ -470,8 +470,8 @@
         "just check passes"
       ],
       "priority": 27,
-      "passes": false,
-      "notes": "This is a significant rewrite of the TUI. The old directory-centric design was wrong - file-level granularity is what users actually need. Existing TUI code in src/tui/ will need substantial changes."
+      "passes": true,
+      "notes": "Completed: Fixed test suite after TUI redesign. Deleted 58 obsolete tests (1800+ lines) that referenced old View enum variants and App fields. Wrote 16 fresh tests covering all US-027 acceptance criteria: focus panel switching (Tab/h/l), navigation in focused panel (j/k/g/G), sort mode cycling (s), view switching (a/?), quit behavior (q/Ctrl+C). All 265 tests pass. Code reviews: nick-isms approved as solid and ready to merge, testing-guru confirmed approach was sound, semver-nag confirmed no concerns. Technical notes: Test count dropped from 282 to 265 (net -17). Legacy render functions (render_directory_detail, render_pending_approvals) remain marked as dead_code for now - should be cleaned up in future story. Help text still references old keybindings (p for pending, Enter for detail) - should be updated in US-032."
     },
     {
       "id": "US-028",

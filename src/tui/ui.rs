@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::scanner::calculate_expiration;
 
-use super::{App, SortMode, View};
+use super::{App, FocusPanel, SortMode, View};
 
 /// Render the current application state to the terminal.
 ///
@@ -28,9 +28,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
 
     // Render the current view in the main area
     match app.view() {
-        View::DirectoryList => render_directory_list(app, config, db, frame, chunks[0]),
-        View::DirectoryDetail => render_directory_detail(app, config, db, frame, chunks[0]),
-        View::PendingApprovals => render_pending_approvals(app, config, db, frame, chunks[0]),
+        View::FileList => render_file_list_view(app, config, db, frame, chunks[0]),
         View::AuditLog => render_audit_log(app, db, frame, chunks[0]),
         View::Help => render_help(app, frame, chunks[0]),
     }
@@ -59,39 +57,56 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     }
 }
 
-/// Render the directory list view.
+/// Render the file list view with sidebar.
 ///
-/// Displays all tracked directories with aggregate stats in header and sortable table.
-// Allow: This function orchestrates rendering and needs to handle multiple concerns:
-// fetching data, sorting, styling, and building the table. Extracting helpers would
-// make the code less readable as the rendering logic is inherently sequential.
+/// Displays tracked directories in left sidebar (20% width) and files from selected
+/// directory in main panel (80% width). Shows header with stats for current view.
+// Allow: This function orchestrates the two-panel layout and needs to handle
+// sidebar, main panel, and header rendering. Breaking it up would make the layout
+// coordination less clear.
 #[allow(clippy::too_many_lines)]
-fn render_directory_list(
+fn render_file_list_view(
     app: &App,
     config: &Config,
     db: &Database,
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
-    // Split into header area and table area
-    let chunks = Layout::default()
+    // Split vertically: header | content area
+    let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Header with stats
-            Constraint::Min(0),    // Table
+            Constraint::Min(0),    // Content area (sidebar + main panel)
         ])
         .split(area);
 
-    // Fetch directories from database
-    let Ok(directories) = db.list_directories(None) else {
-        // Error handling: show error message
-        let error_text = Paragraph::new("Error loading directories from database")
-            .block(Block::default().borders(Borders::ALL).title("Error"))
-            .style(Style::default().fg(Color::Red));
-        frame.render_widget(error_text, area);
-        return;
-    };
+    // Split content area horizontally: sidebar | main panel
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(20), // Sidebar for directories
+            Constraint::Percentage(80), // Main panel for files
+        ])
+        .split(v_chunks[1]);
 
+    // Render header with stats
+    render_file_view_header(config, db, frame, v_chunks[0]);
+
+    // Render sidebar with tracked directories
+    render_sidebar(app, db, frame, h_chunks[0]);
+
+    // Render main panel with files from selected directory
+    render_main_file_panel(app, config, db, frame, h_chunks[1]);
+}
+
+/// Render the header showing stats for the current file view.
+fn render_file_view_header(
+    _config: &Config,
+    db: &Database,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+) {
     // Fetch stats from database
     let stats = match db.get_stats() {
         Ok(s) => s,
@@ -108,83 +123,232 @@ fn render_directory_list(
         }
     };
 
-    // Render header with stats
-    render_header(&stats, config, app, frame, chunks[0]);
+    // Allow: size values are guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
+    #[allow(clippy::cast_sign_loss)]
+    let total_size_str = format_bytes(stats.total_size_bytes as u64);
 
-    // Prepare directory rows with calculated expiration
-    let mut dir_rows: Vec<_> = directories
+    let header_text = format!(
+        "Total: {} paths, {} | Pending: {} | Within warning: {} | Overdue: {}",
+        stats.total_tracked_paths,
+        total_size_str,
+        stats.paths_pending_approval,
+        stats.paths_within_warning,
+        stats.paths_overdue
+    );
+
+    let header = Paragraph::new(header_text)
+        .block(Block::default().borders(Borders::ALL).title("Overview"))
+        .style(Style::default());
+
+    frame.render_widget(header, area);
+}
+
+/// Render the sidebar showing tracked directories.
+fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
+    // Fetch directories from database
+    let Ok(directories) = db.list_directories(None) else {
+        let error_text = Paragraph::new("Error loading directories")
+            .block(Block::default().borders(Borders::ALL).title("Directories"))
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(error_text, area);
+        return;
+    };
+
+    // Update sidebar list length for navigation
+    app.sidebar_len.set(directories.len());
+
+    // Clamp selected index
+    let selected_idx = if directories.is_empty() {
+        0
+    } else {
+        app.sidebar_selected_index().min(directories.len() - 1)
+    };
+
+    // Set current directory ID based on selection
+    if let Some(dir) = directories.get(selected_idx) {
+        app.current_directory_id.set(Some(dir.id));
+    }
+
+    // Build sidebar rows
+    let rows: Vec<Row> = directories
+        .iter()
+        .enumerate()
+        .map(|(idx, dir)| {
+            // Extract just the directory name from full path
+            let dir_name = std::path::Path::new(&dir.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&dir.path);
+
+            let cell = Cell::from(dir_name);
+
+            // Highlight selected row and show focus
+            let style = if idx == selected_idx {
+                if app.focus_panel() == FocusPanel::Sidebar {
+                    Style::default()
+                        .add_modifier(Modifier::REVERSED)
+                        .fg(Color::Cyan)
+                } else {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                }
+            } else {
+                Style::default()
+            };
+
+            Row::new(vec![cell]).style(style)
+        })
+        .collect();
+
+    // Empty state
+    if rows.is_empty() {
+        let empty_text = Paragraph::new("No tracked paths.\n\nRun 'stagecrew add PATH'")
+            .block(Block::default().borders(Borders::ALL).title("Directories"))
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty_text, area);
+        return;
+    }
+
+    let table = Table::new(rows, [Constraint::Percentage(100)]).block(
+        Block::default()
+            .title("Directories")
+            .borders(Borders::ALL)
+            .border_style(if app.focus_panel() == FocusPanel::Sidebar {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            }),
+    );
+
+    frame.render_widget(table, area);
+}
+
+/// Render the main panel showing files from the selected directory.
+// Allow: This function handles file loading, sorting, and table rendering which are
+// sequential operations that form a cohesive rendering pipeline.
+#[allow(clippy::too_many_lines)]
+fn render_main_file_panel(
+    app: &App,
+    config: &Config,
+    db: &Database,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+) {
+    // Get the current directory ID from sidebar selection
+    let Some(directory_id) = app.current_directory_id() else {
+        let message = Paragraph::new(
+            "Select a directory from the sidebar\n\n(Use j/k to navigate, Tab to switch panels)",
+        )
+        .block(Block::default().borders(Borders::ALL).title("Files"))
+        .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(message, area);
+        return;
+    };
+
+    // Fetch files for this directory
+    let Ok(files) = db.list_files_by_directory(directory_id) else {
+        let error_text = Paragraph::new("Error loading files from database")
+            .block(Block::default().borders(Borders::ALL).title("Files"))
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(error_text, area);
+        return;
+    };
+
+    // Empty state
+    if files.is_empty() {
+        let empty_text = Paragraph::new("No files in this directory")
+            .block(Block::default().borders(Borders::ALL).title("Files"))
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty_text, area);
+        return;
+    }
+
+    // Sort files by expiration (most urgent first) by default
+    let mut file_rows: Vec<_> = files
         .into_iter()
-        .map(|dir| {
-            let days_remaining = dir
-                .oldest_mtime
-                .map(|mtime| calculate_expiration(mtime, config.expiration_days));
-            (dir, days_remaining)
+        .map(|file| {
+            let days_remaining = calculate_expiration(file.mtime, config.expiration_days);
+            (file, days_remaining)
         })
         .collect();
 
     // Sort based on current sort mode
-    sort_directory_rows(&mut dir_rows, app.sort_mode());
+    sort_file_rows(&mut file_rows, app.sort_mode());
 
-    // Update list length for navigation
-    app.list_len.set(dir_rows.len());
+    // Update file list length for navigation
+    app.file_list_len.set(file_rows.len());
 
-    // Clamp selected index to valid range
-    let selected_idx = if dir_rows.is_empty() {
+    // Clamp selected index
+    let selected_idx = if file_rows.is_empty() {
         0
     } else {
-        app.selected_index().min(dir_rows.len() - 1)
+        app.file_selected_index().min(file_rows.len() - 1)
     };
 
-    // Set current directory ID for potential detail view navigation
-    // This allows the detail view to know which directory to display
-    if let Some((dir, _)) = dir_rows.get(selected_idx) {
-        app.current_directory_id.set(Some(dir.id));
-    }
-
-    // Build table rows
-    let rows: Vec<Row> = dir_rows
+    // Build file table rows
+    let rows: Vec<Row> = file_rows
         .iter()
         .enumerate()
-        .map(|(idx, (dir, days_remaining))| {
-            let path_cell = Cell::from(dir.path.as_str());
+        .map(|(idx, (file, days_remaining))| {
+            // Extract filename from path
+            let filename = std::path::Path::new(&file.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&file.path);
+            let filename_cell = Cell::from(filename);
+
+            // Format size
             // Allow: size_bytes is guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
             #[allow(clippy::cast_sign_loss)]
-            let size_cell = Cell::from(format_bytes(dir.size_bytes as u64));
+            let size_cell = Cell::from(format_bytes(file.size_bytes as u64));
 
-            let expires_str = days_remaining.map_or_else(
-                || "N/A".to_string(),
-                |days| {
-                    if days >= 0 {
-                        format!("{days} days")
-                    } else {
-                        format!("{} days ago", -days)
-                    }
-                },
-            );
+            // Format expiration
+            let expires_str = if *days_remaining >= 0 {
+                format!("{days_remaining} days")
+            } else {
+                format!("{} days ago", -days_remaining)
+            };
             let expires_cell = Cell::from(expires_str);
 
-            let status_cell = Cell::from(dir.status.as_str());
+            // Status (files don't have individual status yet, so show based on expiration)
+            let status_str = if *days_remaining <= 0 {
+                "overdue"
+            } else if *days_remaining <= i64::from(config.warning_days) {
+                "warning"
+            } else {
+                "tracked"
+            };
+            let status_cell = Cell::from(status_str);
 
-            // Determine row color based on status and expiration
-            let row_style = determine_row_style(&dir.status, *days_remaining, config.warning_days);
+            // Determine row color based on expiration
+            let row_style = if *days_remaining <= 0 {
+                Style::default().fg(Color::Red)
+            } else if *days_remaining <= i64::from(config.warning_days) {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
 
-            // Highlight selected row
+            // Highlight selected row and show focus
             let style = if idx == selected_idx {
-                row_style.add_modifier(Modifier::REVERSED)
+                if app.focus_panel() == FocusPanel::MainPanel {
+                    row_style.add_modifier(Modifier::REVERSED).fg(Color::Cyan)
+                } else {
+                    row_style.add_modifier(Modifier::REVERSED)
+                }
             } else {
                 row_style
             };
 
-            Row::new(vec![path_cell, size_cell, expires_cell, status_cell]).style(style)
+            Row::new(vec![filename_cell, size_cell, expires_cell, status_cell]).style(style)
         })
         .collect();
 
     // Build table
     let widths = [
-        Constraint::Percentage(50), // Path
+        Constraint::Percentage(45), // Filename
         Constraint::Percentage(15), // Size
         Constraint::Percentage(20), // Expires
-        Constraint::Percentage(15), // Status
+        Constraint::Percentage(20), // Status
     ];
 
     let sort_indicator = match app.sort_mode() {
@@ -196,12 +360,17 @@ fn render_directory_list(
     let table = Table::new(rows, widths)
         .block(
             Block::default()
-                .title(format!("Directories{sort_indicator}"))
-                .borders(Borders::ALL),
+                .title(format!("Files{sort_indicator}"))
+                .borders(Borders::ALL)
+                .border_style(if app.focus_panel() == FocusPanel::MainPanel {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                }),
         )
         .header(
             Row::new(vec![
-                Cell::from("Path"),
+                Cell::from("Filename"),
                 Cell::from("Size"),
                 Cell::from("Expires"),
                 Cell::from("Status"),
@@ -210,10 +379,39 @@ fn render_directory_list(
             .bottom_margin(1),
         );
 
-    frame.render_widget(table, chunks[1]);
+    frame.render_widget(table, area);
 }
 
-/// Render the header with aggregate statistics.
+/// Sort file rows according to the specified sort mode.
+fn sort_file_rows(rows: &mut [(crate::db::File, i64)], sort_mode: SortMode) {
+    match sort_mode {
+        SortMode::Expiration => {
+            // Ascending (most urgent first)
+            rows.sort_by(|a, b| a.1.cmp(&b.1));
+        }
+        SortMode::Size => {
+            // Descending (largest first)
+            rows.sort_by(|a, b| b.0.size_bytes.cmp(&a.0.size_bytes));
+        }
+        SortMode::Name => {
+            // Alphabetical ascending by filename
+            rows.sort_by(|a, b| {
+                let name_a = std::path::Path::new(&a.0.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&a.0.path);
+                let name_b = std::path::Path::new(&b.0.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&b.0.path);
+                name_a.cmp(name_b)
+            });
+        }
+    }
+}
+
+/// LEGACY: Old header function - superseded by `render_file_view_header` in US-027.
+#[allow(dead_code)]
 fn render_header(
     stats: &crate::db::Stats,
     _config: &Config,
@@ -241,13 +439,8 @@ fn render_header(
     frame.render_widget(header, area);
 }
 
-/// Sort directory rows according to the specified sort mode.
-///
-/// # Sort Behaviors
-///
-/// - `SortMode::Expiration`: Ascending (most urgent first). Directories with no mtime (`None`) sort to the beginning.
-/// - `SortMode::Size`: Descending (largest first).
-/// - `SortMode::Name`: Alphabetical ascending.
+/// LEGACY: Old directory sorting function - superseded by `sort_file_rows` in US-027.
+#[allow(dead_code)]
 fn sort_directory_rows(rows: &mut [(crate::db::Directory, Option<i64>)], sort_mode: SortMode) {
     match sort_mode {
         SortMode::Expiration => {
@@ -317,15 +510,9 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Render the directory detail view.
-///
-/// Displays all files within the currently selected directory, sorted by size descending.
-/// Shows a breadcrumb header with the directory path and a table of files with columns:
-/// Filename, Size, Modified (date).
-// Allow: This function orchestrates the detail view rendering with file loading, sorting,
-// breadcrumb display, and table construction. Breaking it up would make the rendering flow
-// less clear, as all these operations are inherently sequential steps in displaying a single view.
-#[allow(clippy::too_many_lines)]
+/// LEGACY: Old directory detail view - superseded by file-centric layout in US-027.
+// Allow: Function kept for reference during transition. Will be removed in cleanup pass.
+#[allow(dead_code, clippy::too_many_lines)]
 fn render_directory_detail(
     app: &App,
     _config: &Config,
@@ -396,13 +583,13 @@ fn render_directory_detail(
     sorted_files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
     // Update list length for navigation
-    app.list_len.set(sorted_files.len());
+    app.file_list_len.set(sorted_files.len());
 
     // Clamp selected index to valid range
     let selected_idx = if sorted_files.is_empty() {
         0
     } else {
-        app.selected_index().min(sorted_files.len() - 1)
+        app.file_selected_index().min(sorted_files.len() - 1)
     };
 
     // Build table rows
@@ -485,14 +672,9 @@ fn render_directory_detail(
     frame.render_widget(table, chunks[1]);
 }
 
-/// Render the pending approvals view.
-///
-/// Displays only directories with status='pending', using the same table format
-/// as the main directory list. Users can approve (x), defer (d), or ignore (i) from this view.
-// Allow: This function is similar to render_directory_list but filters for pending directories.
-// The duplication is acceptable for now as both views have distinct purposes and may diverge
-// in future iterations. Extracting common logic would add indirection without clear benefit.
-#[allow(clippy::too_many_lines)]
+/// LEGACY: Old pending approvals view - superseded by file-centric layout in US-027.
+// Allow: Function kept for reference during transition. Will be removed in cleanup pass.
+#[allow(dead_code, clippy::too_many_lines)]
 fn render_pending_approvals(
     app: &App,
     config: &Config,
@@ -552,10 +734,10 @@ fn render_pending_approvals(
     sort_directory_rows(&mut dir_rows, app.sort_mode());
 
     // Update list length for navigation
-    app.list_len.set(dir_rows.len());
+    app.sidebar_len.set(dir_rows.len());
 
     // Clamp selected index to valid range
-    let selected_idx = app.selected_index().min(dir_rows.len() - 1);
+    let selected_idx = app.sidebar_selected_index().min(dir_rows.len() - 1);
 
     // Set current directory ID for potential actions
     if let Some((dir, _)) = dir_rows.get(selected_idx) {
@@ -634,7 +816,8 @@ fn render_pending_approvals(
     frame.render_widget(table, chunks[1]);
 }
 
-/// Render the header for pending approvals view showing pending count.
+/// LEGACY: Header for old pending approvals view - no longer used.
+#[allow(dead_code)]
 fn render_pending_header(pending_count: usize, frame: &mut Frame, area: ratatui::layout::Rect) {
     let header_text = format!("Pending directories awaiting approval: {pending_count}");
 
@@ -662,13 +845,13 @@ fn render_audit_log(app: &App, db: &Database, frame: &mut Frame, area: ratatui::
     };
 
     // Update list length for navigation
-    app.list_len.set(entries.len());
+    app.sidebar_len.set(entries.len());
 
     // Clamp selected index to valid range
     let selected_idx = if entries.is_empty() {
         0
     } else {
-        app.selected_index().min(entries.len() - 1)
+        app.sidebar_selected_index().min(entries.len() - 1)
     };
 
     // Handle empty state
@@ -791,12 +974,8 @@ Press any key to close this help screen";
 /// Render the footer with context-sensitive keybinding hints.
 fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let hints = match app.view() {
-        View::DirectoryList => {
-            "[j/k] Navigate [g/G] Top/Bottom [s] Sort [Enter] Details [d] Defer [i] Ignore [x] Approve [p] Pending [a] Audit [?] Help [q] Quit"
-        }
-        View::DirectoryDetail => "[j/k] Navigate [g/G] Top/Bottom [h/Esc] Back [q] Quit",
-        View::PendingApprovals => {
-            "[j/k] Navigate [g/G] Top/Bottom [x] Approve [d] Defer [i] Ignore [s] Sort [Esc] Back [q] Quit"
+        View::FileList => {
+            "[j/k] Navigate [g/G] Top/Bottom [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
         }
         View::AuditLog => "[j/k] Navigate [g/G] Top/Bottom [Esc] Back [q] Quit",
         View::Help => "[Any key] Close",

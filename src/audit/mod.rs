@@ -9,8 +9,14 @@ use crate::error::Result;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuditAction {
+    // Allow: Will be used for file-level actions in US-030.
+    #[allow(dead_code)]
     Approve,
+    // Allow: Will be used for file-level actions in US-030.
+    #[allow(dead_code)]
     Defer,
+    // Allow: Will be used for file-level actions in US-030.
+    #[allow(dead_code)]
     Ignore,
     Remove,
     Scan,
