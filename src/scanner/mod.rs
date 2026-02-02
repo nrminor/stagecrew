@@ -2228,7 +2228,7 @@ mod tests {
         let _summary = scan_and_persist(
             &db,
             &scanner,
-            &[safe_dir, warning_dir.clone(), overdue_dir],
+            &[safe_dir, warning_dir.clone(), overdue_dir.clone()],
             90,
             14,
         )
@@ -2236,6 +2236,23 @@ mod tests {
         .expect(
             "failed to scan and persist directories - check permissions and database connection",
         );
+
+        // Backdate tracked_since for the overdue directory's files to simulate
+        // files that have been tracked for 100 days (not just discovered today).
+        // Without this, the max(mtime, tracked_since) logic would use today's
+        // tracked_since, making the files appear fresh.
+        let overdue_dir_record = db
+            .get_directory_by_path(&overdue_dir.to_string_lossy())
+            .expect("failed to query directory")
+            .expect("overdue directory should exist");
+        db.conn()
+            .execute(
+                "UPDATE files SET tracked_since = ?1 WHERE directory_id = ?2",
+                (hundred_days_ago.as_second(), overdue_dir_record.id),
+            )
+            .expect("failed to backdate tracked_since");
+        recalculate_directory_oldest_mtime(&db, overdue_dir_record.id)
+            .expect("failed to recalculate oldest_mtime");
 
         // Mark warning_dir as 'pending'
         let dir = db

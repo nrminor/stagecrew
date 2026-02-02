@@ -197,7 +197,15 @@ impl Database {
                  updated_at = strftime('%s', 'now')",
             (path, size_bytes, file_count, oldest_mtime, last_scanned),
         )?;
-        Ok(self.conn.last_insert_rowid())
+
+        // Query for the actual ID since last_insert_rowid() returns 0 when
+        // UPSERT results in an UPDATE rather than an INSERT.
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM directories WHERE path = ?1",
+            [path],
+            |row| row.get(0),
+        )?;
+        Ok(id)
     }
 
     /// Insert or update a file in the database.
