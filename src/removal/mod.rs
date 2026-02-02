@@ -70,11 +70,11 @@ pub enum RemovalOutcome {
     DryRun,
 }
 
-/// Process all approved directories for removal.
+/// Process all approved entries for removal.
 ///
-/// Queries the database for directories with status='approved', attempts to
+/// Queries the database for entries with status='approved', attempts to
 /// remove each one, and updates the database with the outcome. On success,
-/// the directory status is set to 'removed'. On error (permission denied or
+/// the entry status is set to 'removed'. On error (permission denied or
 /// other filesystem failure), the status is set to 'blocked' with details
 /// logged in the audit trail.
 ///
@@ -83,8 +83,8 @@ pub enum RemovalOutcome {
 ///
 /// # Returns
 ///
-/// A summary containing the number of successfully removed directories,
-/// blocked directories (due to errors), and total bytes freed.
+/// A summary containing the number of successfully removed entries,
+/// blocked entries (due to errors), and total bytes freed.
 ///
 /// # Errors
 ///
@@ -95,70 +95,70 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
     let user = AuditService::current_user();
     let service = RemovalService::new(false);
 
-    // Query all approved directories
-    let approved_dirs = db.list_directories(Some("approved"))?;
+    // Query all approved entries
+    let approved_entries = db.list_entries(Some("approved"))?;
 
     let mut removed_count = 0;
     let mut blocked_count = 0;
     let mut total_bytes_freed = 0i64;
 
-    for dir in approved_dirs {
-        let path = std::path::PathBuf::from(&dir.path);
+    for entry in approved_entries {
+        let path = std::path::PathBuf::from(&entry.path);
 
-        tracing::info!(path = ?dir.path, "Processing approved directory for removal");
+        tracing::info!(path = ?entry.path, is_dir = entry.is_dir, "Processing approved entry for removal");
 
         match service.remove(&path) {
             Ok(RemovalOutcome::Removed) => {
                 // Success: Update status to removed
-                db.update_directory_status(dir.id, "removed")?;
+                db.update_entry_status(entry.id, "removed")?;
                 removed_count += 1;
-                total_bytes_freed += dir.size_bytes;
+                total_bytes_freed += entry.size_bytes;
 
-                tracing::info!(path = ?dir.path, bytes = dir.size_bytes, "Directory removed successfully");
+                tracing::info!(path = ?entry.path, bytes = entry.size_bytes, "Entry removed successfully");
 
                 // Record audit entry
                 audit.record(
                     &user,
                     AuditAction::Remove,
-                    Some(&dir.path),
-                    Some(&format!("Removed {} bytes", dir.size_bytes)),
-                    Some(dir.id),
+                    Some(&entry.path),
+                    Some(&format!("Removed {} bytes", entry.size_bytes)),
+                    Some(entry.id),
                 )?;
             }
             Ok(RemovalOutcome::DryRun) => {
                 // This shouldn't happen in production (dry_run=false above)
-                tracing::warn!(path = ?dir.path, "Unexpected dry run outcome");
+                tracing::warn!(path = ?entry.path, "Unexpected dry run outcome");
             }
             Err(Error::PermissionDenied(_)) => {
                 // Permission error: Update status to blocked
-                db.update_directory_status(dir.id, "blocked")?;
+                db.update_entry_status(entry.id, "blocked")?;
                 blocked_count += 1;
 
-                tracing::warn!(path = ?dir.path, "Removal blocked: permission denied");
+                tracing::warn!(path = ?entry.path, "Removal blocked: permission denied");
 
                 // Record audit entry with error details
                 audit.record(
                     &user,
                     AuditAction::Remove,
-                    Some(&dir.path),
+                    Some(&entry.path),
                     Some("Blocked: permission denied"),
-                    Some(dir.id),
+                    Some(entry.id),
                 )?;
             }
             Err(e) => {
                 // Other error: Update status to blocked
-                db.update_directory_status(dir.id, "blocked")?;
+                db.update_entry_status(entry.id, "blocked")?;
                 blocked_count += 1;
 
-                tracing::warn!(path = ?dir.path, error = %e, "Removal blocked: filesystem error");
+                tracing::warn!(path = ?entry.path, error = %e, "Removal blocked: filesystem error");
 
                 // Record audit entry with error details
                 audit.record(
                     &user,
                     AuditAction::Remove,
-                    Some(&dir.path),
+                    Some(&entry.path),
                     Some(&format!("Blocked: {e}")),
-                    Some(dir.id),
+                    Some(entry.id),
                 )?;
             }
         }
@@ -186,13 +186,13 @@ pub struct RemovalSummary {
 }
 
 impl RemovalSummary {
-    /// Number of directories successfully removed.
+    /// Number of entries successfully removed.
     #[must_use]
     pub const fn removed_count(&self) -> usize {
         self.removed_count
     }
 
-    /// Number of directories that could not be removed (blocked).
+    /// Number of entries that could not be removed (blocked).
     #[must_use]
     pub const fn blocked_count(&self) -> usize {
         self.blocked_count
@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_approved_processes_approved_directories() {
+    fn remove_approved_processes_approved_entries() {
         let (db, _temp_dir) = temp_database();
         let test_root = TempDir::with_prefix("stagecrew-removal-files-").expect(
             "failed to create temp directory for removal test - check disk space and permissions",
@@ -273,40 +273,57 @@ mod tests {
         let (dir1_path, dir1_size) = create_test_directory(test_root.path(), "dir1", 3);
         let (dir2_path, dir2_size) = create_test_directory(test_root.path(), "dir2", 2);
 
-        // Insert directories into database
+        // Insert root and entries into database
+        let test_root_str = test_root
+            .path()
+            .to_str()
+            .expect("temp directory path should be valid UTF-8");
+        let root_id = db
+            .insert_root(test_root_str)
+            .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
-        let dir1_id = db
-            .insert_or_update_directory(&dir1_path, dir1_size, 3, Some(now), now)
-            .expect("failed to insert test directory - database connection may be lost");
-        let dir2_id = db
-            .insert_or_update_directory(&dir2_path, dir2_size, 2, Some(now), now)
-            .expect("failed to insert test directory - database connection may be lost");
+        let entry1_id = db
+            .upsert_entry(
+                root_id,
+                &dir1_path,
+                test_root_str,
+                true,
+                dir1_size,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+        let entry2_id = db
+            .upsert_entry(
+                root_id,
+                &dir2_path,
+                test_root_str,
+                true,
+                dir2_size,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
 
-        // Approve both directories
-        db.update_directory_status(dir1_id, "approved")
-            .expect("failed to update directory status - database connection may be lost");
-        db.update_directory_status(dir2_id, "approved")
-            .expect("failed to update directory status - database connection may be lost");
+        // Approve both entries
+        db.update_entry_status(entry1_id, "approved")
+            .expect("failed to update entry status - database connection may be lost");
+        db.update_entry_status(entry2_id, "approved")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Verify directories exist
         assert!(std::path::Path::new(&dir1_path).exists());
         assert!(std::path::Path::new(&dir2_path).exists());
 
-        // Remove approved directories
+        // Remove approved entries
         let summary = remove_approved(&db)
-            .expect("failed to remove approved directories - check permissions and disk space");
+            .expect("failed to remove approved entries - check permissions and disk space");
 
         // Verify summary
-        assert_eq!(summary.removed_count(), 2, "Expected 2 directories removed");
-        assert_eq!(
-            summary.blocked_count(),
-            0,
-            "Expected no blocked directories"
-        );
+        assert_eq!(summary.removed_count(), 2, "Expected 2 entries removed");
+        assert_eq!(summary.blocked_count(), 0, "Expected no blocked entries");
         assert_eq!(
             summary.total_bytes_freed(),
             dir1_size + dir2_size,
-            "Expected total bytes freed to match sum of directory sizes"
+            "Expected total bytes freed to match sum of entry sizes"
         );
 
         // Verify directories are gone
@@ -320,21 +337,17 @@ mod tests {
         );
 
         // Verify database status updated
-        let dir1 = db
-            .get_directory_by_path(&dir1_path)
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after insertion - verify test database is working",
-            );
-        assert_eq!(dir1.status, "removed", "Status should be 'removed'");
+        let entry1 = db
+            .get_entry_by_path(&dir1_path)
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after insertion - verify test database is working");
+        assert_eq!(entry1.status, "removed", "Status should be 'removed'");
 
-        let dir2 = db
-            .get_directory_by_path(&dir2_path)
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after insertion - verify test database is working",
-            );
-        assert_eq!(dir2.status, "removed", "Status should be 'removed'");
+        let entry2 = db
+            .get_entry_by_path(&dir2_path)
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after insertion - verify test database is working");
+        assert_eq!(entry2.status, "removed", "Status should be 'removed'");
 
         // Verify audit entries
         let audit = AuditService::new(&db);
@@ -375,38 +388,39 @@ mod tests {
         fs::set_permissions(path, perms)
             .expect("failed to set file permissions for test - check filesystem support");
 
-        // Insert directory into database and approve
+        // Insert root and entry into database and approve
+        let test_root_str = test_root
+            .path()
+            .to_str()
+            .expect("temp directory path should be valid UTF-8");
+        let root_id = db
+            .insert_root(test_root_str)
+            .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
-        let dir_id = db
-            .insert_or_update_directory(&dir_path, dir_size, 2, Some(now), now)
-            .expect("failed to insert test directory - database connection may be lost");
-        db.update_directory_status(dir_id, "approved")
-            .expect("failed to update directory status - database connection may be lost");
+        let entry_id = db
+            .upsert_entry(root_id, &dir_path, test_root_str, true, dir_size, Some(now))
+            .expect("failed to insert test entry - database connection may be lost");
+        db.update_entry_status(entry_id, "approved")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Attempt removal
         let summary = remove_approved(&db)
-            .expect("failed to remove approved directories - check permissions and disk space");
+            .expect("failed to remove approved entries - check permissions and disk space");
 
         // Verify summary
-        assert_eq!(
-            summary.removed_count(),
-            0,
-            "Expected no directories removed"
-        );
-        assert_eq!(summary.blocked_count(), 1, "Expected 1 blocked directory");
+        assert_eq!(summary.removed_count(), 0, "Expected no entries removed");
+        assert_eq!(summary.blocked_count(), 1, "Expected 1 blocked entry");
         assert_eq!(summary.total_bytes_freed(), 0, "Expected no bytes freed");
 
         // Verify directory still exists
         assert!(path.exists(), "Directory should still exist");
 
         // Verify database status updated to blocked
-        let dir = db
-            .get_directory_by_path(&dir_path)
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after insertion - verify test database is working",
-            );
-        assert_eq!(dir.status, "blocked", "Status should be 'blocked'");
+        let entry = db
+            .get_entry_by_path(&dir_path)
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after insertion - verify test database is working");
+        assert_eq!(entry.status, "blocked", "Status should be 'blocked'");
 
         // Verify audit entry
         let audit = AuditService::new(&db);
@@ -436,36 +450,40 @@ mod tests {
     fn remove_approved_handles_nonexistent_path() {
         let (db, _temp_dir) = temp_database();
 
-        // Insert directory that doesn't exist on filesystem
-        let dir_path = "/nonexistent/path/to/directory";
+        // Insert root and entry that doesn't exist on filesystem
+        let root_id = db
+            .insert_root("/nonexistent")
+            .expect("failed to insert root - database connection may be lost");
+        let entry_path = "/nonexistent/path/to/directory";
         let now = jiff::Timestamp::now().as_second();
-        let dir_id = db
-            .insert_or_update_directory(dir_path, 1024, 5, Some(now), now)
-            .expect("failed to insert test directory - database connection may be lost");
-        db.update_directory_status(dir_id, "approved")
-            .expect("failed to update directory status - database connection may be lost");
+        let entry_id = db
+            .upsert_entry(
+                root_id,
+                entry_path,
+                "/nonexistent/path/to",
+                true,
+                1024,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+        db.update_entry_status(entry_id, "approved")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Attempt removal
         let summary = remove_approved(&db)
-            .expect("failed to remove approved directories - check permissions and disk space");
+            .expect("failed to remove approved entries - check permissions and disk space");
 
         // Verify summary
-        assert_eq!(
-            summary.removed_count(),
-            0,
-            "Expected no directories removed"
-        );
-        assert_eq!(summary.blocked_count(), 1, "Expected 1 blocked directory");
+        assert_eq!(summary.removed_count(), 0, "Expected no entries removed");
+        assert_eq!(summary.blocked_count(), 1, "Expected 1 blocked entry");
         assert_eq!(summary.total_bytes_freed(), 0, "Expected no bytes freed");
 
         // Verify database status updated to blocked
-        let dir = db
-            .get_directory_by_path(dir_path)
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after insertion - verify test database is working",
-            );
-        assert_eq!(dir.status, "blocked", "Status should be 'blocked'");
+        let entry = db
+            .get_entry_by_path(entry_path)
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after insertion - verify test database is working");
+        assert_eq!(entry.status, "blocked", "Status should be 'blocked'");
 
         // Verify audit entry
         let audit = AuditService::new(&db);
@@ -497,26 +515,47 @@ mod tests {
         fs::set_permissions(path2, perms)
             .expect("failed to set file permissions for test - check filesystem support");
 
-        // Insert and approve both directories
+        // Insert root and approve both entries
+        let test_root_str = test_root
+            .path()
+            .to_str()
+            .expect("temp directory path should be valid UTF-8");
+        let root_id = db
+            .insert_root(test_root_str)
+            .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
-        let dir1_id = db
-            .insert_or_update_directory(&dir1_path, dir1_size, 2, Some(now), now)
-            .expect("failed to insert test directory - database connection may be lost");
-        let dir2_id = db
-            .insert_or_update_directory(&dir2_path, dir2_size, 2, Some(now), now)
-            .expect("failed to insert test directory - database connection may be lost");
-        db.update_directory_status(dir1_id, "approved")
-            .expect("failed to update directory status - database connection may be lost");
-        db.update_directory_status(dir2_id, "approved")
-            .expect("failed to update directory status - database connection may be lost");
+        let entry1_id = db
+            .upsert_entry(
+                root_id,
+                &dir1_path,
+                test_root_str,
+                true,
+                dir1_size,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+        let entry2_id = db
+            .upsert_entry(
+                root_id,
+                &dir2_path,
+                test_root_str,
+                true,
+                dir2_size,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+        db.update_entry_status(entry1_id, "approved")
+            .expect("failed to update entry status - database connection may be lost");
+        db.update_entry_status(entry2_id, "approved")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Attempt removal
         let summary = remove_approved(&db)
-            .expect("failed to remove approved directories - check permissions and disk space");
+            .expect("failed to remove approved entries - check permissions and disk space");
 
         // Verify summary
-        assert_eq!(summary.removed_count(), 1, "Expected 1 directory removed");
-        assert_eq!(summary.blocked_count(), 1, "Expected 1 blocked directory");
+        assert_eq!(summary.removed_count(), 1, "Expected 1 entry removed");
+        assert_eq!(summary.blocked_count(), 1, "Expected 1 blocked entry");
         assert_eq!(
             summary.total_bytes_freed(),
             dir1_size,
@@ -528,21 +567,17 @@ mod tests {
         assert!(path2.exists());
 
         // Verify database statuses
-        let dir1 = db
-            .get_directory_by_path(&dir1_path)
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after insertion - verify test database is working",
-            );
-        assert_eq!(dir1.status, "removed");
+        let entry1 = db
+            .get_entry_by_path(&dir1_path)
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after insertion - verify test database is working");
+        assert_eq!(entry1.status, "removed");
 
-        let dir2 = db
-            .get_directory_by_path(&dir2_path)
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after insertion - verify test database is working",
-            );
-        assert_eq!(dir2.status, "blocked");
+        let entry2 = db
+            .get_entry_by_path(&dir2_path)
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after insertion - verify test database is working");
+        assert_eq!(entry2.status, "blocked");
 
         // Cleanup
         let mut perms = fs::metadata(path2)
@@ -557,23 +592,26 @@ mod tests {
     fn remove_approved_returns_empty_summary_when_no_approved() {
         let (db, _temp_dir) = temp_database();
 
-        // Insert directories with non-approved statuses
+        // Insert root and entries with non-approved statuses
+        let root_id = db
+            .insert_root("/data")
+            .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
-        let dir1_id = db
-            .insert_or_update_directory("/path1", 1024, 5, Some(now), now)
-            .expect("failed to insert test directory - database connection may be lost");
-        let dir2_id = db
-            .insert_or_update_directory("/path2", 2048, 10, Some(now), now)
-            .expect("failed to insert test directory - database connection may be lost");
+        let entry1_id = db
+            .upsert_entry(root_id, "/data/path1", "/data", false, 1024, Some(now))
+            .expect("failed to insert test entry - database connection may be lost");
+        let entry2_id = db
+            .upsert_entry(root_id, "/data/path2", "/data", false, 2048, Some(now))
+            .expect("failed to insert test entry - database connection may be lost");
 
-        db.update_directory_status(dir1_id, "tracked")
-            .expect("failed to update directory status - database connection may be lost");
-        db.update_directory_status(dir2_id, "pending")
-            .expect("failed to update directory status - database connection may be lost");
+        db.update_entry_status(entry1_id, "tracked")
+            .expect("failed to update entry status - database connection may be lost");
+        db.update_entry_status(entry2_id, "pending")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Attempt removal
         let summary = remove_approved(&db)
-            .expect("failed to remove approved directories - check permissions and disk space");
+            .expect("failed to remove approved entries - check permissions and disk space");
 
         // Verify empty summary
         assert_eq!(summary.removed_count(), 0);
@@ -589,30 +627,37 @@ mod tests {
     }
 
     #[test]
-    fn remove_approved_records_audit_entries_with_directory_id() {
+    fn remove_approved_records_audit_entries_with_entry_id() {
         let (db, _temp_dir) = temp_database();
         let test_root = TempDir::with_prefix("stagecrew-removal-files-").expect(
             "failed to create temp directory for removal test - check disk space and permissions",
         );
 
         let (dir_path, dir_size) = create_test_directory(test_root.path(), "dir", 2);
+        let test_root_str = test_root
+            .path()
+            .to_str()
+            .expect("temp directory path should be valid UTF-8");
+        let root_id = db
+            .insert_root(test_root_str)
+            .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
-        let dir_id = db
-            .insert_or_update_directory(&dir_path, dir_size, 2, Some(now), now)
-            .expect("failed to insert test directory - database connection may be lost");
-        db.update_directory_status(dir_id, "approved")
-            .expect("failed to update directory status - database connection may be lost");
+        let entry_id = db
+            .upsert_entry(root_id, &dir_path, test_root_str, true, dir_size, Some(now))
+            .expect("failed to insert test entry - database connection may be lost");
+        db.update_entry_status(entry_id, "approved")
+            .expect("failed to update entry status - database connection may be lost");
 
         let _summary = remove_approved(&db)
-            .expect("failed to remove approved directories - check permissions and disk space");
+            .expect("failed to remove approved entries - check permissions and disk space");
 
-        // Verify audit entry has directory_id
+        // Verify audit entry has entry_id
         let audit = AuditService::new(&db);
         let entries = audit
             .list_recent(10)
             .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].directory_id, Some(dir_id));
+        assert_eq!(entries[0].entry_id, Some(entry_id));
         assert_eq!(entries[0].target_path, Some(dir_path));
     }
 }

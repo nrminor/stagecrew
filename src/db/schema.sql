@@ -5,32 +5,27 @@
 -- via pragma_update() for reliability. execute_batch() does not guarantee
 -- PRAGMA execution order or persistence.
 
--- Tracked directories (primary tracking unit)
-CREATE TABLE IF NOT EXISTS directories (
+-- User-configured tracked roots (what appears in sidebar)
+CREATE TABLE IF NOT EXISTS roots (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,
-    size_bytes INTEGER NOT NULL DEFAULT 0,
-    file_count INTEGER NOT NULL DEFAULT 0,
-    oldest_mtime INTEGER,  -- Unix timestamp of oldest file
-    last_scanned INTEGER,  -- Unix timestamp
-    status TEXT NOT NULL DEFAULT 'tracked'
-        CHECK (status IN ('tracked', 'pending', 'approved', 'deferred', 'ignored', 'removed', 'blocked')),
-    deferred_until INTEGER,  -- Unix timestamp, NULL if not deferred
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+    added_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    last_scanned INTEGER
 );
 
--- Individual files within tracked directories
-CREATE TABLE IF NOT EXISTS files (
+-- Unified entries table (files and directories discovered during scan)
+CREATE TABLE IF NOT EXISTS entries (
     id INTEGER PRIMARY KEY,
-    directory_id INTEGER NOT NULL REFERENCES directories(id) ON DELETE CASCADE,
+    root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
     path TEXT NOT NULL UNIQUE,
-    size_bytes INTEGER NOT NULL,
-    mtime INTEGER NOT NULL,  -- Unix timestamp
-    tracked_since INTEGER,  -- Unix timestamp when first added, NULL for legacy files
+    parent_path TEXT NOT NULL,
+    is_dir INTEGER NOT NULL DEFAULT 0,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    mtime INTEGER,
+    tracked_since INTEGER,
     status TEXT NOT NULL DEFAULT 'tracked'
         CHECK (status IN ('tracked', 'pending', 'approved', 'deferred', 'ignored', 'removed', 'blocked')),
-    deferred_until INTEGER,  -- Unix timestamp, NULL if not deferred
+    deferred_until INTEGER,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
 );
@@ -43,27 +38,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action TEXT NOT NULL
         CHECK (action IN ('approve', 'defer', 'ignore', 'unignore', 'remove', 'scan', 'config_change')),
     target_path TEXT,
-    details TEXT,  -- JSON for additional context
-    directory_id INTEGER REFERENCES directories(id) ON DELETE SET NULL
+    details TEXT,
+    entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL
 );
 
 -- Indexes for common queries
-CREATE INDEX IF NOT EXISTS idx_directories_status ON directories(status);
-CREATE INDEX IF NOT EXISTS idx_directories_oldest_mtime ON directories(oldest_mtime);
-CREATE INDEX IF NOT EXISTS idx_files_directory_id ON files(directory_id);
-CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
+CREATE INDEX IF NOT EXISTS idx_entries_root_id ON entries(root_id);
+CREATE INDEX IF NOT EXISTS idx_entries_parent_path ON entries(parent_path);
+CREATE INDEX IF NOT EXISTS idx_entries_status ON entries(status);
+CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
-CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user);
 CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
 
 -- Pre-computed stats for shell hook (updated by scanner)
 CREATE TABLE IF NOT EXISTS stats (
-    id INTEGER PRIMARY KEY CHECK (id = 1),  -- Singleton row
-    total_tracked_paths INTEGER NOT NULL DEFAULT 0,
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    total_files INTEGER NOT NULL DEFAULT 0,
     total_size_bytes INTEGER NOT NULL DEFAULT 0,
-    paths_within_warning INTEGER NOT NULL DEFAULT 0,
-    paths_pending_approval INTEGER NOT NULL DEFAULT 0,
-    paths_overdue INTEGER NOT NULL DEFAULT 0,
+    files_within_warning INTEGER NOT NULL DEFAULT 0,
+    files_pending_approval INTEGER NOT NULL DEFAULT 0,
+    files_overdue INTEGER NOT NULL DEFAULT 0,
     last_scan_completed INTEGER,
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
 );

@@ -67,12 +67,12 @@ impl<'a> AuditService<'a> {
         action: AuditAction,
         target_path: Option<&str>,
         details: Option<&str>,
-        directory_id: Option<i64>,
+        entry_id: Option<i64>,
     ) -> Result<()> {
         self.db.conn().execute(
-            "INSERT INTO audit_log (user, action, target_path, details, directory_id)
+            "INSERT INTO audit_log (user, action, target_path, details, entry_id)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![user, action.as_str(), target_path, details, directory_id],
+            params![user, action.as_str(), target_path, details, entry_id],
         )?;
         Ok(())
     }
@@ -98,7 +98,7 @@ impl<'a> AuditService<'a> {
     /// Returns an error if the database query fails.
     pub fn list_recent(&self, limit: usize) -> Result<Vec<AuditEntry>> {
         let mut stmt = self.db.conn().prepare(
-            "SELECT id, timestamp, user, action, target_path, details, directory_id
+            "SELECT id, timestamp, user, action, target_path, details, entry_id
              FROM audit_log
              ORDER BY timestamp DESC
              LIMIT ?1",
@@ -116,7 +116,7 @@ impl<'a> AuditService<'a> {
                     action: row.get(3)?,
                     target_path: row.get(4)?,
                     details: row.get(5)?,
-                    directory_id: row.get(6)?,
+                    entry_id: row.get(6)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -128,7 +128,7 @@ impl<'a> AuditService<'a> {
     ///
     /// Returns all audit entries where `target_path` matches the given path,
     /// ordered by timestamp descending. Useful for viewing the history of
-    /// actions performed on a particular directory.
+    /// actions performed on a particular entry.
     ///
     /// # Errors
     ///
@@ -138,7 +138,7 @@ impl<'a> AuditService<'a> {
     #[allow(dead_code)]
     pub fn list_by_path(&self, path: &str) -> Result<Vec<AuditEntry>> {
         let mut stmt = self.db.conn().prepare(
-            "SELECT id, timestamp, user, action, target_path, details, directory_id
+            "SELECT id, timestamp, user, action, target_path, details, entry_id
              FROM audit_log
              WHERE target_path = ?1
              ORDER BY timestamp DESC",
@@ -153,7 +153,7 @@ impl<'a> AuditService<'a> {
                     action: row.get(3)?,
                     target_path: row.get(4)?,
                     details: row.get(5)?,
-                    directory_id: row.get(6)?,
+                    entry_id: row.get(6)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -170,7 +170,7 @@ impl<'a> AuditService<'a> {
 #[derive(Debug)]
 #[non_exhaustive]
 // Allow: Public struct fields are part of the API. Fields like `id`, `details`, and
-// `directory_id` are not directly accessed in the current codebase but are available
+// `entry_id` are not directly accessed in the current codebase but are available
 // for external consumers and future TUI enhancements.
 #[allow(dead_code)]
 pub struct AuditEntry {
@@ -180,7 +180,7 @@ pub struct AuditEntry {
     pub action: String,
     pub target_path: Option<String>,
     pub details: Option<String>,
-    pub directory_id: Option<i64>,
+    pub entry_id: Option<i64>,
 }
 
 #[cfg(test)]
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(entries[0].action, "approve");
         assert_eq!(entries[0].target_path, Some("/data/test".to_string()));
         assert!(entries[0].details.is_none());
-        assert!(entries[0].directory_id.is_none());
+        assert!(entries[0].entry_id.is_none());
     }
 
     #[test]
@@ -268,17 +268,20 @@ mod tests {
         let (db, _temp_dir) = temp_database();
         let audit = AuditService::new(&db);
 
-        // Create a directory first so we have a valid foreign key
-        db.insert_or_update_directory("/data/important", 1024, 5, Some(1000), 1_700_000_000)
-            .expect(
-                "failed to insert test directory to database - connection may be lost or disk full",
-            );
-        let dir = db
-            .get_directory_by_path("/data/important")
-            .expect("failed to query directory by path - database connection may be lost")
-            .expect(
-                "expected directory to exist after insertion - verify test database is working",
-            );
+        // Create a root and entry first so we have a valid foreign key
+        let root_id = db
+            .insert_root("/data")
+            .expect("failed to insert root to database - connection may be lost or disk full");
+        let entry_id = db
+            .upsert_entry(
+                root_id,
+                "/data/important",
+                "/data",
+                false,
+                1024,
+                Some(1_700_000_000),
+            )
+            .expect("failed to insert entry to database - connection may be lost or disk full");
 
         audit
             .record(
@@ -286,7 +289,7 @@ mod tests {
                 AuditAction::Defer,
                 Some("/data/important"),
                 Some("Deferred for 30 days"),
-                Some(dir.id),
+                Some(entry_id),
             )
             .expect(
                 "failed to record audit entry to database - connection may be lost or disk full",
@@ -300,7 +303,7 @@ mod tests {
         assert_eq!(entries[0].action, "defer");
         assert_eq!(entries[0].target_path, Some("/data/important".to_string()));
         assert_eq!(entries[0].details, Some("Deferred for 30 days".to_string()));
-        assert_eq!(entries[0].directory_id, Some(dir.id));
+        assert_eq!(entries[0].entry_id, Some(entry_id));
     }
 
     #[test]

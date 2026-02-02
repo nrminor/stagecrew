@@ -15,18 +15,16 @@ use stagecrew::audit::{AuditAction, AuditService};
 use stagecrew::config::Config;
 use stagecrew::db::Database;
 use stagecrew::removal::remove_approved;
-use stagecrew::scanner::{
-    Scanner, recalculate_directory_oldest_mtime, scan_and_persist, transition_expired_paths,
-};
+use stagecrew::scanner::{Scanner, scan_and_persist, transition_expired_paths};
 
 /// Test the complete workflow: initialize, scan, transition, approve, remove, audit.
 ///
 /// This test verifies:
 /// 1. Database initialization with schema
 /// 2. Scanning directory trees with files of varying ages
-/// 3. Directories and files are correctly stored in the database
+/// 3. Roots and entries are correctly stored in the database
 /// 4. Expiration calculation identifies old files
-/// 5. State transitions move expired paths to pending
+/// 5. State transitions move expired entries to pending
 /// 6. Manual approval changes status to approved
 /// 7. Removal actually deletes files from filesystem
 /// 8. Audit log records all actions
@@ -42,25 +40,17 @@ async fn test_full_workflow() {
     fs::create_dir_all(&tracked_dir).expect("failed to create staging directory for integration test - check disk space and write permissions");
 
     // Create files with varying ages
-    // - old_dir: 95 days old (will expire with 90 day policy)
-    // - recent_dir: 10 days old (safe)
-    // - middle_dir: 80 days old (within warning period)
-    let old_dir = tracked_dir.join("old_data");
-    let recent_dir = tracked_dir.join("recent_data");
-    let middle_dir = tracked_dir.join("middle_data");
-
-    fs::create_dir_all(&old_dir)
-        .expect("failed to create old_data test directory - check disk space and permissions");
-    fs::create_dir_all(&recent_dir)
-        .expect("failed to create recent_data test directory - check disk space and permissions");
-    fs::create_dir_all(&middle_dir)
-        .expect("failed to create middle_data test directory - check disk space and permissions");
+    // - old_file: 95 days old (will expire with 90 day policy)
+    // - recent_file: 10 days old (safe)
+    // - middle_file: 80 days old (within warning period)
+    let old_file = tracked_dir.join("old_data.txt");
+    let recent_file = tracked_dir.join("recent_data.txt");
+    let middle_file = tracked_dir.join("middle_data.txt");
 
     // Create files and set their modification times
-    create_file_with_age(&old_dir.join("file1.txt"), 95, 1024);
-    create_file_with_age(&old_dir.join("file2.txt"), 95, 2048);
-    create_file_with_age(&recent_dir.join("file3.txt"), 10, 512);
-    create_file_with_age(&middle_dir.join("file4.txt"), 80, 4096);
+    create_file_with_age(&old_file, 95, 1024);
+    create_file_with_age(&recent_file, 10, 512);
+    create_file_with_age(&middle_file, 80, 4096);
 
     // 2. Initialize database and config
     let db = Database::open(&db_path).expect("database should initialize");
@@ -85,154 +75,131 @@ async fn test_full_workflow() {
 
     // Verify scan results
     assert_eq!(
-        scan_summary.total_directories, 3,
-        "should scan 3 directories"
+        scan_summary.total_directories, 1,
+        "should scan 1 directory (the tracked root)"
     );
-    assert_eq!(scan_summary.total_files, 4, "should scan 4 files");
-    let expected_total_bytes = 1024 + 2048 + 512 + 4096;
+    assert_eq!(scan_summary.total_files, 3, "should scan 3 files");
+    let expected_total_bytes = 1024 + 512 + 4096;
     assert_eq!(
         scan_summary.total_size_bytes, expected_total_bytes,
         "should count all bytes"
     );
 
-    // 4. Verify directories are in database
-    let all_dirs = db.list_directories(None).expect("should list directories");
-    assert_eq!(all_dirs.len(), 3, "should have 3 directories in database");
+    // 4. Verify root is in database
+    let roots = db.list_roots().expect("should list roots");
+    assert_eq!(roots.len(), 1, "should have 1 root in database");
+    assert_eq!(
+        roots[0].path,
+        tracked_dir.to_string_lossy(),
+        "root path should match"
+    );
 
-    // All directories should initially be 'tracked'
-    for dir in &all_dirs {
+    // 5. Verify entries are in database
+    let all_entries = db
+        .list_entries_by_parent(&tracked_dir.to_string_lossy())
+        .expect("should list entries");
+    assert_eq!(
+        all_entries.len(),
+        3,
+        "should have 3 file entries in database"
+    );
+
+    // All entries should initially be 'tracked'
+    for entry in &all_entries {
         assert_eq!(
-            dir.status, "tracked",
-            "directories should start with tracked status"
+            entry.status, "tracked",
+            "entries should start with tracked status"
         );
     }
 
-    // Find the old directory in database
-    let old_dir_path = old_dir.to_string_lossy().to_string();
-    let old_dir_record = all_dirs
+    // Find the old file entry in database
+    let old_file_path = old_file.to_string_lossy().to_string();
+    let old_file_entry = all_entries
         .iter()
-        .find(|d| d.path == old_dir_path)
-        .expect("old_dir should be in database");
+        .find(|e| e.path == old_file_path)
+        .expect("old_file should be in database");
 
-    // Verify old directory has correct metadata
-    assert_eq!(old_dir_record.file_count, 2, "old_dir should have 2 files");
+    // Verify old file entry has correct metadata
     assert_eq!(
-        old_dir_record.size_bytes,
-        1024 + 2048,
-        "old_dir should have correct size"
+        old_file_entry.size_bytes, 1024,
+        "old_file should have correct size"
     );
-    assert!(
-        old_dir_record.oldest_mtime.is_some(),
-        "old_dir should have oldest_mtime"
-    );
+    assert!(old_file_entry.mtime.is_some(), "old_file should have mtime");
 
-    // 5. Verify files are in database
-    let old_dir_files = db
-        .list_files_by_directory(old_dir_record.id)
-        .expect("should list files");
-    assert_eq!(
-        old_dir_files.len(),
-        2,
-        "old_dir should have 2 files in database"
-    );
-
-    // 5b. Manually backdate tracked_since for old files to simulate long-tracked files
-    // With the new tracked_since logic, newly-scanned old files get tracked_since = now,
+    // 5b. Manually backdate tracked_since for old file to simulate long-tracked file
+    // With the tracked_since logic, newly-scanned old files get tracked_since = now,
     // giving them a full expiration period. To test expiration, we need to backdate tracked_since.
     let now = jiff::Timestamp::now();
     let ninetyfive_days_ago = now
         .checked_sub(jiff::SignedDuration::from_secs(95 * 86400))
         .expect("timestamp arithmetic");
-    let eighty_days_ago = now
-        .checked_sub(jiff::SignedDuration::from_secs(80 * 86400))
-        .expect("timestamp arithmetic");
-    // Update tracked_since for old_dir files (to 95 days ago)
-    db.conn()
-        .execute(
-            "UPDATE files SET tracked_since = ?1 WHERE directory_id = ?2",
-            (ninetyfive_days_ago.as_second(), old_dir_record.id),
-        )
-        .expect("failed to backdate tracked_since for old_dir files");
-    // Update tracked_since for middle_dir files (to 80 days ago)
-    let middle_dir_path = middle_dir.to_string_lossy().to_string();
-    let middle_dir_record = db
-        .get_directory_by_path(&middle_dir_path)
-        .expect("should query middle_dir")
-        .expect("middle_dir should exist");
-    db.conn()
-        .execute(
-            "UPDATE files SET tracked_since = ?1 WHERE directory_id = ?2",
-            (eighty_days_ago.as_second(), middle_dir_record.id),
-        )
-        .expect("failed to backdate tracked_since for middle_dir files");
-    // Recalculate oldest_mtime for affected directories
-    recalculate_directory_oldest_mtime(&db, old_dir_record.id)
-        .expect("failed to recalculate old_dir oldest_mtime");
-    recalculate_directory_oldest_mtime(&db, middle_dir_record.id)
-        .expect("failed to recalculate middle_dir oldest_mtime");
 
-    // 6. Transition expired paths (should move old_dir to pending)
+    // Update tracked_since for old_file
+    db.conn()
+        .execute(
+            "UPDATE entries SET tracked_since = ?1 WHERE path = ?2",
+            (ninetyfive_days_ago.as_second(), &old_file_path),
+        )
+        .expect("failed to backdate tracked_since for old_file");
+
+    // 6. Transition expired paths (should move old_file to pending)
     let transition_summary = transition_expired_paths(&db, config.expiration_days, false)
         .expect("transition should succeed");
 
     assert_eq!(
         transition_summary.expired_to_pending, 1,
-        "should transition 1 path to pending"
+        "should transition 1 entry to pending"
     );
     assert_eq!(
         transition_summary.expired_to_approved, 0,
         "should not auto-approve (auto_remove=false)"
     );
 
-    // Verify old_dir is now pending
-    let pending_dirs = db
-        .list_directories(Some("pending"))
-        .expect("should list pending directories");
+    // Verify old_file is now pending
+    let pending_entries = db
+        .list_entries(Some("pending"))
+        .expect("should list pending entries");
     assert_eq!(
-        pending_dirs.len(),
+        pending_entries.len(),
         1,
-        "should have 1 pending directory after transition"
+        "should have 1 pending entry after transition"
     );
     assert_eq!(
-        pending_dirs[0].path, old_dir_path,
-        "old_dir should be pending"
+        pending_entries[0].path, old_file_path,
+        "old_file should be pending"
     );
 
-    // 7. Manually approve the old directory for removal
+    // 7. Manually approve the old file for removal
     let audit = AuditService::new(&db);
     let user = AuditService::current_user();
 
-    db.update_directory_status(old_dir_record.id, "approved")
+    db.update_entry_status(old_file_entry.id, "approved")
         .expect("should update status to approved");
 
     audit
         .record(
             &user,
             AuditAction::Approve,
-            Some(&old_dir_path),
+            Some(&old_file_path),
             Some("Manual approval for removal"),
-            Some(old_dir_record.id),
+            Some(old_file_entry.id),
         )
         .expect("should record approval in audit log");
 
     // Verify status change
-    let approved_dirs = db
-        .list_directories(Some("approved"))
-        .expect("should list approved directories");
-    assert_eq!(approved_dirs.len(), 1, "should have 1 approved directory");
+    let approved_entries = db
+        .list_entries(Some("approved"))
+        .expect("should list approved entries");
+    assert_eq!(approved_entries.len(), 1, "should have 1 approved entry");
     assert_eq!(
-        approved_dirs[0].path, old_dir_path,
-        "old_dir should be approved"
+        approved_entries[0].path, old_file_path,
+        "old_file should be approved"
     );
 
     // 8. Perform removal
     let removal_summary = remove_approved(&db).expect("removal should succeed");
 
-    assert_eq!(
-        removal_summary.removed_count(),
-        1,
-        "should remove 1 directory"
-    );
+    assert_eq!(removal_summary.removed_count(), 1, "should remove 1 entry");
     assert_eq!(
         removal_summary.blocked_count(),
         0,
@@ -240,28 +207,28 @@ async fn test_full_workflow() {
     );
     assert_eq!(
         removal_summary.total_bytes_freed(),
-        1024 + 2048,
+        1024,
         "should free correct number of bytes"
     );
 
-    // Verify directory was actually deleted from filesystem
+    // Verify file was actually deleted from filesystem
     assert!(
-        !old_dir.exists(),
-        "old_dir should no longer exist on filesystem"
+        !old_file.exists(),
+        "old_file should no longer exist on filesystem"
     );
 
     // Verify database shows removed status
-    let removed_dirs = db
-        .list_directories(Some("removed"))
-        .expect("should list removed directories");
+    let removed_entries = db
+        .list_entries(Some("removed"))
+        .expect("should list removed entries");
     assert_eq!(
-        removed_dirs.len(),
+        removed_entries.len(),
         1,
-        "should have 1 removed directory in database"
+        "should have 1 removed entry in database"
     );
     assert_eq!(
-        removed_dirs[0].path, old_dir_path,
-        "old_dir should have removed status"
+        removed_entries[0].path, old_file_path,
+        "old_file should have removed status"
     );
 
     // 9. Verify audit trail contains all actions
@@ -269,10 +236,11 @@ async fn test_full_workflow() {
         .list_recent(10)
         .expect("should list recent audit entries");
 
-    // Should have at least 3 entries: scan, transition, approve, remove
+    // Should have at least 3 entries: scan, approve, remove
     assert!(
-        audit_entries.len() >= 4,
-        "should have at least 4 audit entries (scan, transition, approve, remove)"
+        audit_entries.len() >= 3,
+        "should have at least 3 audit entries (scan, approve, remove), got {}",
+        audit_entries.len()
     );
 
     // Check for specific audit actions
@@ -297,13 +265,13 @@ async fn test_full_workflow() {
         .expect("should find approve entry");
     assert_eq!(
         approve_entry.target_path,
-        Some(old_dir_path.clone()),
-        "approve entry should reference old_dir"
+        Some(old_file_path.clone()),
+        "approve entry should reference old_file"
     );
     assert_eq!(
-        approve_entry.directory_id,
-        Some(old_dir_record.id),
-        "approve entry should have directory_id"
+        approve_entry.entry_id,
+        Some(old_file_entry.id),
+        "approve entry should have entry_id"
     );
 
     // Verify remove action recorded bytes freed
@@ -316,35 +284,35 @@ async fn test_full_workflow() {
             .details
             .as_ref()
             .expect("remove audit entry should have details field populated with bytes freed - check removal service records details correctly")
-            .contains(&(1024 + 2048).to_string()),
+            .contains("1024"),
         "remove entry should mention bytes freed"
     );
 
-    // 10. Verify recent and middle directories are untouched
+    // 10. Verify recent and middle files are untouched
     assert!(
-        recent_dir.exists(),
-        "recent_dir should still exist (not expired)"
+        recent_file.exists(),
+        "recent_file should still exist (not expired)"
     );
     assert!(
-        middle_dir.exists(),
-        "middle_dir should still exist (within warning period)"
+        middle_file.exists(),
+        "middle_file should still exist (within warning period)"
     );
 
-    let tracked_dirs = db
-        .list_directories(Some("tracked"))
-        .expect("should list tracked directories");
+    let tracked_entries: Vec<_> = db
+        .list_entries(Some("tracked"))
+        .expect("should list tracked entries")
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .collect();
     assert_eq!(
-        tracked_dirs.len(),
+        tracked_entries.len(),
         2,
-        "should still have 2 tracked directories (recent and middle)"
+        "should still have 2 tracked file entries (recent and middle files)"
     );
 
     // Verify stats were updated
     let stats = db.get_stats().expect("should get stats");
-    assert_eq!(
-        stats.total_tracked_paths, 3,
-        "stats should show 3 total paths"
-    );
+    assert_eq!(stats.total_files, 3, "stats should show 3 total files");
     assert!(
         stats.last_scan_completed.is_some(),
         "stats should have last_scan_completed timestamp"

@@ -28,10 +28,10 @@ use input::InputHandler;
 /// State for an in-progress deferral action.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingDeferral {
-    /// Directory ID being deferred (or file ID for file deferrals - field name is misleading due to legacy code).
-    pub directory_id: i64,
+    /// Entry ID being deferred (first entry in multi-select).
+    pub entry_id: i64,
 
-    /// Path of the directory being deferred (or first path in multi-select).
+    /// Path of the entry being deferred (or first path in multi-select).
     pub path: String,
 
     /// Accumulated input buffer for days to defer.
@@ -40,8 +40,8 @@ pub(crate) struct PendingDeferral {
     /// Default number of days to defer (from config).
     pub default_days: u32,
 
-    /// Additional file IDs for multi-select deferral (excludes `directory_id` which is included separately).
-    pub additional_file_ids: Vec<i64>,
+    /// Additional entry IDs for multi-select deferral (excludes `entry_id` which is included separately).
+    pub additional_entry_ids: Vec<i64>,
 }
 
 /// Main TUI application state.
@@ -58,17 +58,17 @@ pub struct App {
     /// Which panel is focused (sidebar or main panel) in `FileList` view.
     pub(crate) focus_panel: FocusPanel,
 
-    /// Currently selected index in the sidebar (tracked directories).
+    /// Currently selected index in the sidebar (tracked roots).
     pub(crate) sidebar_selected_index: usize,
 
-    /// Currently selected index in the main panel (files).
-    pub(crate) file_selected_index: usize,
+    /// Currently selected index in the main panel (entries).
+    pub(crate) entry_selected_index: usize,
 
-    /// Current sort mode for files.
+    /// Current sort mode for entries.
     pub(crate) sort_mode: SortMode,
 
     /// Filter for days until expiration.
-    // Allow: Planned feature for filtering file list by expiration days.
+    // Allow: Planned feature for filtering entry list by expiration days.
     // Reserved for future implementation.
     #[allow(dead_code)]
     pub(crate) filter_days: Option<u32>,
@@ -76,41 +76,34 @@ pub struct App {
     /// Length of the sidebar list (updated by render, used for navigation bounds).
     pub(crate) sidebar_len: Cell<usize>,
 
-    /// Length of the file list (updated by render, used for navigation bounds).
-    pub(crate) file_list_len: Cell<usize>,
+    /// Length of the entry list (updated by render, used for navigation bounds).
+    pub(crate) entry_list_len: Cell<usize>,
 
-    /// The directory ID currently selected in sidebar for viewing files.
+    /// The root ID currently selected in sidebar for viewing entries.
     /// Uses Cell for interior mutability since it's updated during rendering.
-    pub(crate) current_directory_id: Cell<Option<i64>>,
+    pub(crate) current_root_id: Cell<Option<i64>>,
 
-    /// Pending approval confirmation state (legacy directory-level).
-    /// Contains the directory ID and path awaiting user confirmation for approval.
-    pub(crate) pending_approval: Option<(i64, String)>,
+    /// The current path being browsed within the selected root.
+    /// This enables hierarchical navigation within a root.
+    pub(crate) current_path: String,
 
-    /// Pending deferral input state (legacy directory-level).
-    pub(crate) pending_deferral: Option<PendingDeferral>,
+    /// Pending entry deletion confirmation state.
+    /// Contains a vector of (`entry_id`, path, `is_dir`) tuples awaiting user confirmation.
+    pub(crate) pending_entry_delete: Option<Vec<(i64, String, bool)>>,
 
-    /// Pending ignore confirmation state (legacy directory-level).
-    /// Contains the directory ID and path awaiting user confirmation for ignoring.
-    pub(crate) pending_ignore: Option<(i64, String)>,
+    /// Pending entry deferral input state.
+    pub(crate) pending_entry_deferral: Option<PendingDeferral>,
 
-    /// Pending file deletion confirmation state.
-    /// Contains a vector of (`file_id`, path) tuples awaiting user confirmation for deletion.
-    pub(crate) pending_file_delete: Option<Vec<(i64, String)>>,
+    /// Pending entry ignore confirmation state.
+    /// Contains a vector of (`entry_id`, path) tuples awaiting user confirmation for ignoring.
+    pub(crate) pending_entry_ignore: Option<Vec<(i64, String)>>,
 
-    /// Pending file deferral input state.
-    pub(crate) pending_file_deferral: Option<PendingDeferral>,
+    /// Pending entry approval confirmation state.
+    /// Contains a vector of (`entry_id`, path) tuples awaiting user confirmation for approval.
+    pub(crate) pending_entry_approval: Option<Vec<(i64, String)>>,
 
-    /// Pending file ignore confirmation state.
-    /// Contains a vector of (`file_id`, path) tuples awaiting user confirmation for ignoring.
-    pub(crate) pending_file_ignore: Option<Vec<(i64, String)>>,
-
-    /// Pending file approval confirmation state.
-    /// Contains a vector of (`file_id`, path) tuples awaiting user confirmation for approval.
-    pub(crate) pending_file_approval: Option<Vec<(i64, String)>>,
-
-    /// Set of selected file IDs for multi-select operations.
-    pub(crate) selected_files: HashSet<i64>,
+    /// Set of selected entry IDs for multi-select operations.
+    pub(crate) selected_entries: HashSet<i64>,
 
     /// Pending add path text input state.
     /// Contains the accumulated input buffer for the new path to add.
@@ -152,9 +145,9 @@ impl App {
         self.sidebar_selected_index
     }
 
-    /// Get the currently selected index in file list.
-    pub fn file_selected_index(&self) -> usize {
-        self.file_selected_index
+    /// Get the currently selected index in entry list.
+    pub fn entry_selected_index(&self) -> usize {
+        self.entry_selected_index
     }
 
     /// Get the current sort mode.
@@ -169,49 +162,41 @@ impl App {
         self.filter_days
     }
 
-    /// Get the current directory ID selected in sidebar.
-    pub fn current_directory_id(&self) -> Option<i64> {
-        self.current_directory_id.get()
+    /// Get the current root ID selected in sidebar.
+    // Allow: Public API for TUI state access, will be used by upcoming directory navigation.
+    #[allow(dead_code)]
+    pub fn current_root_id(&self) -> Option<i64> {
+        self.current_root_id.get()
     }
 
-    /// Get the pending approval confirmation state.
-    pub fn pending_approval(&self) -> Option<&(i64, String)> {
-        self.pending_approval.as_ref()
+    /// Get the current path being browsed.
+    pub fn current_path(&self) -> &str {
+        &self.current_path
     }
 
-    /// Get the pending deferral input state.
-    pub fn pending_deferral(&self) -> Option<&PendingDeferral> {
-        self.pending_deferral.as_ref()
+    /// Get the pending entry deletion confirmation state.
+    pub fn pending_entry_delete(&self) -> Option<&Vec<(i64, String, bool)>> {
+        self.pending_entry_delete.as_ref()
     }
 
-    /// Get the pending ignore confirmation state.
-    pub fn pending_ignore(&self) -> Option<&(i64, String)> {
-        self.pending_ignore.as_ref()
+    /// Get the pending entry deferral input state.
+    pub fn pending_entry_deferral(&self) -> Option<&PendingDeferral> {
+        self.pending_entry_deferral.as_ref()
     }
 
-    /// Get the pending file deletion confirmation state.
-    pub fn pending_file_delete(&self) -> Option<&Vec<(i64, String)>> {
-        self.pending_file_delete.as_ref()
+    /// Get the pending entry ignore confirmation state.
+    pub fn pending_entry_ignore(&self) -> Option<&Vec<(i64, String)>> {
+        self.pending_entry_ignore.as_ref()
     }
 
-    /// Get the pending file deferral input state.
-    pub fn pending_file_deferral(&self) -> Option<&PendingDeferral> {
-        self.pending_file_deferral.as_ref()
+    /// Get the pending entry approval confirmation state.
+    pub fn pending_entry_approval(&self) -> Option<&Vec<(i64, String)>> {
+        self.pending_entry_approval.as_ref()
     }
 
-    /// Get the pending file ignore confirmation state.
-    pub fn pending_file_ignore(&self) -> Option<&Vec<(i64, String)>> {
-        self.pending_file_ignore.as_ref()
-    }
-
-    /// Get the pending file approval confirmation state.
-    pub fn pending_file_approval(&self) -> Option<&Vec<(i64, String)>> {
-        self.pending_file_approval.as_ref()
-    }
-
-    /// Get the set of selected file IDs.
-    pub fn selected_files(&self) -> &HashSet<i64> {
-        &self.selected_files
+    /// Get the set of selected entry IDs.
+    pub fn selected_entries(&self) -> &HashSet<i64> {
+        &self.selected_entries
     }
 
     /// Get the pending add path input state.
@@ -229,17 +214,17 @@ impl App {
         self.sidebar_visible
     }
 
-    /// Clear all file selections.
+    /// Clear all entry selections.
     pub(crate) fn clear_selection(&mut self) {
-        self.selected_files.clear();
+        self.selected_entries.clear();
     }
 
-    /// Toggle selection of a file ID.
-    pub(crate) fn toggle_file_selection(&mut self, file_id: i64) {
-        if self.selected_files.contains(&file_id) {
-            self.selected_files.remove(&file_id);
+    /// Toggle selection of an entry ID.
+    pub(crate) fn toggle_entry_selection(&mut self, entry_id: i64) {
+        if self.selected_entries.contains(&entry_id) {
+            self.selected_entries.remove(&entry_id);
         } else {
-            self.selected_files.insert(file_id);
+            self.selected_entries.insert(entry_id);
         }
     }
 
@@ -250,11 +235,33 @@ impl App {
         self.sidebar_selected_index = len.saturating_sub(1);
     }
 
-    /// Select the last item in the file list.
+    /// Select the last item in the entry list.
     ///
-    /// Sets `file_selected_index` to `len - 1`, or 0 if the list is empty.
-    pub(crate) fn select_last_file(&mut self, len: usize) {
-        self.file_selected_index = len.saturating_sub(1);
+    /// Sets `entry_selected_index` to `len - 1`, or 0 if the list is empty.
+    pub(crate) fn select_last_entry(&mut self, len: usize) {
+        self.entry_selected_index = len.saturating_sub(1);
+    }
+
+    /// Navigate into a directory entry.
+    ///
+    /// Sets the current path to the given directory path and resets entry selection.
+    // TODO(cleanup): Will be used when implementing directory drill-down navigation.
+    #[allow(dead_code)]
+    pub(crate) fn navigate_into(&mut self, path: String) {
+        self.current_path = path;
+        self.entry_selected_index = 0;
+    }
+
+    /// Navigate up to the parent directory.
+    ///
+    /// If already at a root level, this is a no-op.
+    // TODO(cleanup): Will be used when implementing directory drill-down navigation.
+    #[allow(dead_code)]
+    pub(crate) fn navigate_up(&mut self) {
+        if let Some(parent) = std::path::Path::new(&self.current_path).parent() {
+            self.current_path = parent.to_string_lossy().to_string();
+            self.entry_selected_index = 0;
+        }
     }
 }
 
@@ -354,20 +361,18 @@ impl App {
             view: View::default(),
             focus_panel: FocusPanel::default(),
             sidebar_selected_index: 0,
-            file_selected_index: 0,
+            entry_selected_index: 0,
             sort_mode: SortMode::default(),
             filter_days: None,
             sidebar_len: Cell::new(0),
-            file_list_len: Cell::new(0),
-            current_directory_id: Cell::new(None),
-            pending_approval: None,
-            pending_deferral: None,
-            pending_ignore: None,
-            pending_file_delete: None,
-            pending_file_deferral: None,
-            pending_file_ignore: None,
-            pending_file_approval: None,
-            selected_files: HashSet::new(),
+            entry_list_len: Cell::new(0),
+            current_root_id: Cell::new(None),
+            current_path: String::new(),
+            pending_entry_delete: None,
+            pending_entry_deferral: None,
+            pending_entry_ignore: None,
+            pending_entry_approval: None,
+            selected_entries: HashSet::new(),
             pending_add_path: None,
             pending_remove_path: None,
             sidebar_visible: true,
@@ -533,7 +538,7 @@ impl App {
                         self.sidebar_selected_index = self.sidebar_selected_index.saturating_add(1);
                     }
                     FocusPanel::MainPanel => {
-                        self.file_selected_index = self.file_selected_index.saturating_add(1);
+                        self.entry_selected_index = self.entry_selected_index.saturating_add(1);
                     }
                 }
             }
@@ -544,7 +549,7 @@ impl App {
                         self.sidebar_selected_index = self.sidebar_selected_index.saturating_sub(1);
                     }
                     FocusPanel::MainPanel => {
-                        self.file_selected_index = self.file_selected_index.saturating_sub(1);
+                        self.entry_selected_index = self.entry_selected_index.saturating_sub(1);
                     }
                 }
             }
@@ -594,8 +599,8 @@ mod tests {
             "App should start with sidebar index 0"
         );
         assert_eq!(
-            app.file_selected_index, 0,
-            "App should start with file index 0"
+            app.entry_selected_index, 0,
+            "App should start with entry index 0"
         );
         assert_eq!(
             app.sort_mode,
@@ -609,46 +614,38 @@ mod tests {
             "App should start with sidebar_len 0"
         );
         assert_eq!(
-            app.file_list_len.get(),
+            app.entry_list_len.get(),
             0,
-            "App should start with file_list_len 0"
+            "App should start with entry_list_len 0"
         );
         assert_eq!(
-            app.current_directory_id.get(),
+            app.current_root_id.get(),
             None,
-            "App should start with no directory selected"
-        );
-        assert_eq!(
-            app.pending_approval, None,
-            "App should start with no pending approval"
-        );
-        assert_eq!(
-            app.pending_deferral, None,
-            "App should start with no pending deferral"
-        );
-        assert_eq!(
-            app.pending_ignore, None,
-            "App should start with no pending ignore"
-        );
-        assert_eq!(
-            app.pending_file_delete, None,
-            "App should start with no pending file delete"
-        );
-        assert_eq!(
-            app.pending_file_deferral, None,
-            "App should start with no pending file deferral"
-        );
-        assert_eq!(
-            app.pending_file_ignore, None,
-            "App should start with no pending file ignore"
-        );
-        assert_eq!(
-            app.pending_file_approval, None,
-            "App should start with no pending file approval"
+            "App should start with no root selected"
         );
         assert!(
-            app.selected_files.is_empty(),
-            "App should start with no selected files"
+            app.current_path.is_empty(),
+            "App should start with empty current_path"
+        );
+        assert_eq!(
+            app.pending_entry_delete, None,
+            "App should start with no pending entry delete"
+        );
+        assert_eq!(
+            app.pending_entry_deferral, None,
+            "App should start with no pending entry deferral"
+        );
+        assert_eq!(
+            app.pending_entry_ignore, None,
+            "App should start with no pending entry ignore"
+        );
+        assert_eq!(
+            app.pending_entry_approval, None,
+            "App should start with no pending entry approval"
+        );
+        assert!(
+            app.selected_entries.is_empty(),
+            "App should start with no selected entries"
         );
         assert_eq!(
             app.pending_add_path, None,
@@ -681,22 +678,22 @@ mod tests {
     }
 
     #[test]
-    fn app_select_last_file_with_empty_list() {
+    fn app_select_last_entry_with_empty_list() {
         let mut app = App::new();
-        app.select_last_file(0);
+        app.select_last_entry(0);
         assert_eq!(
-            app.file_selected_index, 0,
-            "Selecting last in empty file list should set index to 0"
+            app.entry_selected_index, 0,
+            "Selecting last in empty entry list should set index to 0"
         );
     }
 
     #[test]
-    fn app_select_last_file_with_nonempty_list() {
+    fn app_select_last_entry_with_nonempty_list() {
         let mut app = App::new();
-        app.select_last_file(10);
+        app.select_last_entry(10);
         assert_eq!(
-            app.file_selected_index, 9,
-            "Selecting last in file list of 10 should set index to 9"
+            app.entry_selected_index, 9,
+            "Selecting last in entry list of 10 should set index to 9"
         );
     }
 
@@ -706,17 +703,47 @@ mod tests {
         app.view = View::Help;
         app.focus_panel = FocusPanel::MainPanel;
         app.sidebar_selected_index = 3;
-        app.file_selected_index = 5;
+        app.entry_selected_index = 5;
         app.sort_mode = SortMode::Size;
         app.filter_days = Some(30);
-        app.current_directory_id.set(Some(42));
+        app.current_root_id.set(Some(42));
 
         assert_eq!(app.view(), View::Help);
         assert_eq!(app.focus_panel(), FocusPanel::MainPanel);
         assert_eq!(app.sidebar_selected_index(), 3);
-        assert_eq!(app.file_selected_index(), 5);
+        assert_eq!(app.entry_selected_index(), 5);
         assert_eq!(app.sort_mode(), SortMode::Size);
         assert_eq!(app.filter_days(), Some(30));
-        assert_eq!(app.current_directory_id(), Some(42));
+        assert_eq!(app.current_root_id(), Some(42));
+    }
+
+    #[test]
+    fn app_navigate_into_sets_path_and_resets_index() {
+        let mut app = App::new();
+        app.entry_selected_index = 5;
+        app.navigate_into("/test/path".to_string());
+        assert_eq!(app.current_path, "/test/path");
+        assert_eq!(app.entry_selected_index, 0);
+    }
+
+    #[test]
+    fn app_navigate_up_goes_to_parent() {
+        let mut app = App::new();
+        app.current_path = "/test/path/child".to_string();
+        app.entry_selected_index = 5;
+        app.navigate_up();
+        assert_eq!(app.current_path, "/test/path");
+        assert_eq!(app.entry_selected_index, 0);
+    }
+
+    #[test]
+    fn app_navigate_up_at_root_is_noop() {
+        let mut app = App::new();
+        app.current_path = "/".to_string();
+        app.entry_selected_index = 5;
+        app.navigate_up();
+        // "/" has no parent, so navigate_up is a no-op (path and index unchanged).
+        assert_eq!(app.current_path, "/");
+        assert_eq!(app.entry_selected_index, 5);
     }
 }

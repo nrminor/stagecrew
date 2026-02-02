@@ -224,20 +224,25 @@ async fn add_with_scan_flag() {
     .await
     .expect("failed to scan and persist");
 
-    // Verify scan results
-    assert_eq!(summary.total_directories, 1);
+    // Verify scan results - now counts entries (both directory and file entries)
+    // The root directory itself is an entry, plus 2 file entries = 3 total
+    // But total_files in ScanSummary counts actual files found during walk
     assert_eq!(summary.total_files, 2);
     assert!(summary.total_size_bytes > 0);
 
     // Verify database contains the scanned data
-    let directories = db
-        .list_directories(None)
-        .expect("failed to list directories");
-    assert_eq!(directories.len(), 1);
-    assert_eq!(directories[0].path, canonical_path);
+    let roots = db.list_roots().expect("failed to list roots");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].path, canonical_path.to_string_lossy());
 
-    let db_files = db
-        .list_files_by_directory(directories[0].id)
-        .expect("failed to list files");
-    assert_eq!(db_files.len(), 2);
+    // List entries under the root - should have 2 file entries
+    let entries = db
+        .list_entries_by_parent(&canonical_path.to_string_lossy())
+        .expect("failed to list entries");
+    assert_eq!(entries.len(), 2, "should have 2 file entries under root");
+
+    // Verify entries are files, not directories
+    for entry in &entries {
+        assert!(!entry.is_dir, "entries should be files");
+    }
 }

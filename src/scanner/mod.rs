@@ -13,15 +13,15 @@ use crate::error::{Error, Result};
 /// Seconds in a 24-hour day (not calendar-aware).
 const SECS_PER_DAY: i64 = 86400;
 
-/// Calculate days remaining until expiration based on oldest modification time.
+/// Calculate days remaining until expiration based on modification time.
 ///
-/// Calculates the number of days remaining until a path expires, based on the
-/// oldest file's modification time and the configured expiration period. Returns
-/// a negative value if the path is already expired.
+/// Calculates the number of days remaining until a file expires, based on its
+/// modification time and the configured expiration period. Returns a negative
+/// value if the file is already expired.
 ///
 /// # Arguments
 ///
-/// * `oldest_mtime` - Unix timestamp of the oldest file in the directory
+/// * `mtime` - Unix timestamp of the file's modification time
 /// * `expiration_days` - Number of days until expiration
 ///
 /// # Returns
@@ -40,29 +40,31 @@ const SECS_PER_DAY: i64 = 86400;
 /// // assert!(days_remaining > 59 && days_remaining <= 60);
 /// ```
 #[must_use = "expiration calculation result should be used"]
-pub fn calculate_expiration(oldest_mtime: i64, expiration_days: u32) -> i64 {
+pub fn calculate_expiration(mtime: i64, expiration_days: u32) -> i64 {
     let now = jiff::Timestamp::now();
-    let oldest = jiff::Timestamp::from_second(oldest_mtime).unwrap_or(now);
+    let mtime_ts = jiff::Timestamp::from_second(mtime).unwrap_or(now);
 
     // Calculate expiration timestamp (days as 24-hour periods)
     let expiration_secs = i64::from(expiration_days) * SECS_PER_DAY;
     let expiration_duration = jiff::SignedDuration::from_secs(expiration_secs);
-    let expires_at = oldest.checked_add(expiration_duration).unwrap_or(now);
+    let expires_at = mtime_ts.checked_add(expiration_duration).unwrap_or(now);
 
     // Calculate days remaining (using 86400-second days)
     let duration_remaining = expires_at.duration_since(now);
     duration_remaining.as_secs() / SECS_PER_DAY
 }
 
-/// Transition directories based on expiration and deferral status.
+/// Transition entries based on expiration and deferral status.
 ///
 /// This function implements the core business logic for the removal-by-default
-/// policy. It processes directories in the database and transitions them between
+/// policy. It processes file entries in the database and transitions them between
 /// states based on their expiration status:
 ///
-/// - **Tracked paths**: If expired, transition to `pending` (or `approved` if `auto_remove` is enabled)
-/// - **Deferred paths**: If the deferral period has ended, reset status to `tracked` and clear `deferred_until`
-/// - **Ignored paths**: Never transitioned (permanent exemption)
+/// - **Tracked files**: If expired, transition to `pending` (or `approved` if `auto_remove` is enabled)
+/// - **Deferred files**: If the deferral period has ended, reset status to `tracked` and clear `deferred_until`
+/// - **Ignored files**: Never transitioned (permanent exemption)
+///
+/// Note: Only files (not directories) are subject to expiration.
 ///
 /// This function is typically called after a scan to update the workflow state.
 ///
@@ -70,7 +72,7 @@ pub fn calculate_expiration(oldest_mtime: i64, expiration_days: u32) -> i64 {
 ///
 /// * `db` - Database connection
 /// * `expiration_days` - Number of days until expiration
-/// * `auto_remove` - If true, expired paths go to `approved` instead of `pending`
+/// * `auto_remove` - If true, expired files go to `approved` instead of `pending`
 ///
 /// # Returns
 ///
@@ -102,12 +104,12 @@ pub fn transition_expired_paths(
 
     let now = jiff::Timestamp::now().as_second();
 
-    // Get all directories with status 'tracked' or 'deferred'
+    // Get all file entries (is_dir = 0) with status 'tracked' or 'deferred'
     let conn = db.conn();
     let mut stmt = conn.prepare(
-        "SELECT id, path, oldest_mtime, status, deferred_until
-         FROM directories
-         WHERE status IN ('tracked', 'deferred')",
+        "SELECT id, path, mtime, tracked_since, status, deferred_until
+         FROM entries
+         WHERE is_dir = 0 AND status IN ('tracked', 'deferred')",
     )?;
 
     let mut rows = stmt.query([])?;
@@ -116,11 +118,12 @@ pub fn transition_expired_paths(
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let path: String = row.get(1)?;
-        let oldest_mtime: Option<i64> = row.get(2)?;
-        let status: String = row.get(3)?;
-        let deferred_until: Option<i64> = row.get(4)?;
+        let mtime: Option<i64> = row.get(2)?;
+        let tracked_since: Option<i64> = row.get(3)?;
+        let status: String = row.get(4)?;
+        let deferred_until: Option<i64> = row.get(5)?;
 
-        // Handle deferred paths
+        // Handle deferred entries
         if status == "deferred"
             && let Some(deferred_until_ts) = deferred_until
             && now >= deferred_until_ts
@@ -131,14 +134,20 @@ pub fn transition_expired_paths(
             continue;
         }
 
-        // Handle tracked paths (check expiration)
+        // Handle tracked entries (check expiration)
         if status == "tracked"
-            && let Some(oldest_mtime_ts) = oldest_mtime
+            && let Some(mtime_ts) = mtime
         {
-            let days_remaining = calculate_expiration(oldest_mtime_ts, expiration_days);
+            // Use effective timestamp: max(mtime, tracked_since) for newly tracked old files
+            let effective_mtime = match tracked_since {
+                Some(ts) if ts > mtime_ts => ts,
+                _ => mtime_ts,
+            };
+
+            let days_remaining = calculate_expiration(effective_mtime, expiration_days);
 
             if days_remaining <= 0 {
-                // Path has expired
+                // File has expired
                 let new_status = if auto_remove { "approved" } else { "pending" };
                 transitions.push((id, path, new_status.to_string(), false));
 
@@ -164,11 +173,11 @@ pub fn transition_expired_paths(
         if is_deferral_reset {
             // Clear deferred_until when resetting to tracked
             conn.execute(
-                "UPDATE directories SET status = ?1, deferred_until = NULL, updated_at = strftime('%s', 'now') WHERE id = ?2",
+                "UPDATE entries SET status = ?1, deferred_until = NULL, updated_at = strftime('%s', 'now') WHERE id = ?2",
                 (&new_status, id),
             )?;
         } else {
-            db.update_directory_status(id, &new_status)?;
+            db.update_entry_status(id, &new_status)?;
         }
 
         // Record audit entry
@@ -204,21 +213,22 @@ pub fn transition_expired_paths(
 #[must_use = "transition summary should be logged or displayed"]
 #[non_exhaustive]
 pub struct TransitionSummary {
-    /// Number of tracked paths transitioned to pending status.
+    /// Number of tracked files transitioned to pending status.
     pub expired_to_pending: u64,
-    /// Number of tracked paths transitioned to approved status (auto-remove).
+    /// Number of tracked files transitioned to approved status (auto-remove).
     pub expired_to_approved: u64,
-    /// Number of deferred paths reset to tracked status.
+    /// Number of deferred files reset to tracked status.
     pub deferred_reset: u64,
 }
 
 /// Scan tracked paths and persist results to the database.
 ///
 /// This function orchestrates the full scan workflow:
-/// 1. Scan each tracked path using the scanner
-/// 2. Upsert directories and files into the database
-/// 3. Update the stats table with aggregated totals and expiration counts
-/// 4. Record the scan action in the audit log
+/// 1. Ensure each tracked path exists as a root in the database
+/// 2. Scan each tracked path using the scanner
+/// 3. Upsert both directory and file entries into the database
+/// 4. Update the stats table with aggregated totals and expiration counts
+/// 5. Record the scan action in the audit log
 ///
 /// # Errors
 ///
@@ -260,26 +270,26 @@ pub async fn scan_and_persist(
     for path in tracked_paths {
         tracing::info!(?path, "Scanning path");
 
+        // Ensure the root exists in the database
+        let path_str = path.to_string_lossy();
+        let root_id = db.insert_root(&path_str)?;
+
         let scan_result = scanner.scan(path).await?;
 
-        // Upsert directories
+        // Upsert directory entries and file entries
         for dir_info in &scan_result.directories_found {
-            let path_str = dir_info.path.to_string_lossy();
-            let oldest_mtime_unix = dir_info.oldest_mtime.map(jiff::Timestamp::as_second);
+            let dir_path_str = dir_info.path.to_string_lossy();
 
-            // Allow: size_bytes and file_count are realistic filesystem values that won't
-            // exceed i64::MAX in practice. SQLite uses i64 for INTEGER columns.
-            #[allow(clippy::cast_possible_wrap)]
-            let dir_id = db.insert_or_update_directory(
-                &path_str,
-                dir_info.size_bytes as i64,
-                dir_info.file_count as i64,
-                oldest_mtime_unix,
-                scan_timestamp,
-            )?;
+            // Determine parent_path for this directory
+            let parent_path = dir_info
+                .path
+                .parent()
+                .map_or_else(|| path_str.to_string(), |p| p.to_string_lossy().to_string());
 
-            // Upsert files for this directory
-            // We need to re-walk to get individual file info since DirectoryInfo is aggregated
+            // Insert directory entry (is_dir=true, size_bytes=0, mtime=None)
+            db.upsert_entry(root_id, &dir_path_str, &parent_path, true, 0, None)?;
+
+            // Insert file entries for this directory
             for entry in jwalk::WalkDir::new(&dir_info.path)
                 .skip_hidden(false)
                 .follow_links(false)
@@ -298,25 +308,26 @@ pub async fn scan_and_persist(
                     && metadata.is_file
                 {
                     let file_path_str = file_path.to_string_lossy();
-                    let mtime_unix = metadata.mtime.map_or(0, jiff::Timestamp::as_second);
+                    let mtime_unix = metadata.mtime.map(jiff::Timestamp::as_second);
 
                     // Allow: size_bytes is a realistic file size that won't exceed i64::MAX.
                     #[allow(clippy::cast_possible_wrap)]
-                    db.insert_or_update_file(
-                        dir_id,
+                    db.upsert_entry(
+                        root_id,
                         &file_path_str,
+                        &dir_path_str,
+                        false,
                         metadata.size_bytes as i64,
                         mtime_unix,
                     )?;
                 }
             }
 
-            // Recalculate effective oldest timestamp using max(mtime, tracked_since)
-            // This ensures newly-tracked old files get a full expiration period
-            recalculate_directory_oldest_mtime(db, dir_id)?;
-
             total_directories += 1;
         }
+
+        // Update root's last_scanned timestamp
+        db.update_root_last_scanned(root_id, scan_timestamp)?;
 
         total_files += scan_result.total_files;
         total_size_bytes += scan_result.total_size_bytes;
@@ -327,7 +338,7 @@ pub async fn scan_and_persist(
     #[allow(clippy::cast_possible_wrap)]
     update_stats(
         db,
-        total_directories as i64,
+        total_files as i64,
         total_size_bytes as i64,
         scan_timestamp,
         expiration_days,
@@ -365,67 +376,24 @@ pub async fn scan_and_persist(
     })
 }
 
-/// Recalculate a directory's effective oldest timestamp.
-///
-/// After file upserts, we need to recalculate the directory's `oldest_mtime` field
-/// to reflect the effective expiration time based on `max(mtime, tracked_since)` for
-/// each file. This ensures newly-tracked old files don't appear overdue.
-///
-/// For backward compatibility, files with `NULL` `tracked_since` default to their mtime.
-///
-/// # Arguments
-///
-/// * `db` - Database connection
-/// * `directory_id` - ID of the directory to recalculate
-///
-/// # Errors
-///
-/// Returns an error if the database query fails.
-///
-/// # Visibility
-///
-/// This function is public for testing purposes but is not part of the stable API.
-#[doc(hidden)]
-pub fn recalculate_directory_oldest_mtime(db: &Database, directory_id: i64) -> Result<()> {
-    debug_assert!(directory_id > 0, "directory_id must be positive");
-
-    let rows_affected = db.conn().execute(
-        "UPDATE directories
-         SET oldest_mtime = (
-             SELECT MIN(MAX(mtime, COALESCE(tracked_since, mtime)))
-             FROM files
-             WHERE directory_id = ?1
-         )
-         WHERE id = ?1",
-        [directory_id],
-    )?;
-
-    debug_assert!(
-        rows_affected <= 1,
-        "UPDATE should affect at most one row (got {rows_affected})"
-    );
-
-    Ok(())
-}
-
 /// Update the stats table with scan results.
 ///
 /// This updates the singleton stats row (id=1) with total counts, warning counts,
 /// and timestamps. The stats table is used by the status command for fast queries.
 ///
 /// This function calculates:
-/// - `paths_within_warning`: directories with `days_remaining` <= `warning_days` AND > 0 AND status = 'tracked'
-/// - `paths_pending_approval`: directories with status = 'pending'
-/// - `paths_overdue`: directories with `days_remaining` <= 0 AND status = 'tracked'
+/// - `files_within_warning`: files with `days_remaining` <= `warning_days` AND > 0 AND status = 'tracked'
+/// - `files_pending_approval`: files with status = 'pending'
+/// - `files_overdue`: files with `days_remaining` <= 0 AND status = 'tracked'
 ///
 /// All calculations are performed in a single SQL UPDATE statement using subqueries
-/// for efficiency.
+/// for efficiency. Only files (`is_dir` = 0) are counted.
 ///
 /// # Arguments
 ///
 /// * `db` - Database connection
-/// * `total_directories` - Total number of tracked directories
-/// * `total_size_bytes` - Total size in bytes across all tracked directories
+/// * `total_files` - Total number of tracked files
+/// * `total_size_bytes` - Total size in bytes across all tracked files
 /// * `scan_timestamp` - Unix timestamp when the scan completed
 /// * `expiration_days` - Number of days until expiration (from config)
 /// * `warning_days` - Number of days before expiration to start warning (from config)
@@ -435,7 +403,7 @@ pub fn recalculate_directory_oldest_mtime(db: &Database, directory_id: i64) -> R
 /// Returns an error if the database UPDATE fails.
 fn update_stats(
     db: &Database,
-    total_directories: i64,
+    total_files: i64,
     total_size_bytes: i64,
     scan_timestamp: i64,
     expiration_days: u32,
@@ -446,43 +414,48 @@ fn update_stats(
     let expiration_days_i64 = i64::from(expiration_days);
     let warning_days_i64 = i64::from(warning_days);
 
-    // Calculate paths_within_warning, paths_pending_approval, and paths_overdue
+    // Calculate files_within_warning, files_pending_approval, and files_overdue
     // using a single UPDATE with subqueries for efficiency.
     //
-    // days_remaining calculation:
-    //   (oldest_mtime + (expiration_days * 86400) - now) / 86400
+    // For files, we use the effective mtime: MAX(mtime, COALESCE(tracked_since, mtime))
+    // This ensures newly-tracked old files get a full expiration period.
     //
-    // paths_within_warning: 0 < days_remaining <= warning_days AND status = 'tracked'
-    // paths_pending_approval: status = 'pending'
-    // paths_overdue: days_remaining <= 0 AND status = 'tracked'
+    // days_remaining calculation:
+    //   (effective_mtime + (expiration_days * 86400) - now) / 86400
+    //
+    // files_within_warning: 0 < days_remaining <= warning_days AND status = 'tracked' AND is_dir = 0
+    // files_pending_approval: status = 'pending' AND is_dir = 0
+    // files_overdue: days_remaining <= 0 AND status = 'tracked' AND is_dir = 0
     db.conn().execute(
         "UPDATE stats SET
-            total_tracked_paths = ?1,
+            total_files = ?1,
             total_size_bytes = ?2,
             last_scan_completed = ?3,
-            paths_within_warning = (
+            files_within_warning = (
                 SELECT COUNT(*)
-                FROM directories
-                WHERE oldest_mtime IS NOT NULL
-                  AND ((oldest_mtime + (?4 * 86400) - ?5) / 86400) <= ?6
-                  AND ((oldest_mtime + (?4 * 86400) - ?5) / 86400) > 0
+                FROM entries
+                WHERE is_dir = 0
+                  AND mtime IS NOT NULL
+                  AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?4 * 86400) - ?5) / 86400) <= ?6
+                  AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?4 * 86400) - ?5) / 86400) > 0
                   AND status = 'tracked'
             ),
-            paths_pending_approval = (
+            files_pending_approval = (
                 SELECT COUNT(*)
-                FROM directories
-                WHERE status = 'pending'
+                FROM entries
+                WHERE is_dir = 0 AND status = 'pending'
             ),
-            paths_overdue = (
+            files_overdue = (
                 SELECT COUNT(*)
-                FROM directories
-                WHERE oldest_mtime IS NOT NULL
-                  AND ((oldest_mtime + (?4 * 86400) - ?5) / 86400) <= 0
+                FROM entries
+                WHERE is_dir = 0
+                  AND mtime IS NOT NULL
+                  AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?4 * 86400) - ?5) / 86400) <= 0
                   AND status = 'tracked'
             )
          WHERE id = 1",
         (
-            total_directories,
+            total_files,
             total_size_bytes,
             scan_timestamp,
             expiration_days_i64,
@@ -726,8 +699,12 @@ pub struct ScanResult {
 /// Represents aggregated metadata for all files within a directory. The `oldest_mtime`
 /// field tracks the oldest modification time of any file in the directory, which is used
 /// for expiration calculations.
+// TODO(cleanup): DirectoryInfo is prepared for future directory-level summary views.
+// Currently only `path` is used; other fields will be used when implementing
+// directory-level aggregation in the TUI.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+#[allow(dead_code)]
 pub struct DirectoryInfo {
     pub path: PathBuf,
     pub size_bytes: u64,
@@ -1169,30 +1146,40 @@ mod tests {
     fn transition_expired_paths_moves_expired_tracked_to_pending() {
         let (_temp, db) = temp_database();
 
-        // Insert a directory with an old mtime (100 days ago)
+        // Insert a root and a file entry with an old mtime (100 days ago)
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        let _id = db
-            .insert_or_update_directory(
+        let root_id = db.insert_root("/data").expect("insert root");
+        let entry_id = db
+            .upsert_entry(
+                root_id,
                 "/data/expired",
+                "/data",
+                false,
                 1024,
-                5,
                 Some(hundred_days_ago.as_second()),
-                now.as_second(),
             )
-            .expect("insert directory");
+            .expect("insert entry");
+
+        // Backdate tracked_since to match the old mtime so effective_mtime = hundred_days_ago
+        db.conn()
+            .execute(
+                "UPDATE entries SET tracked_since = ?1 WHERE id = ?2",
+                (hundred_days_ago.as_second(), entry_id),
+            )
+            .expect("failed to backdate tracked_since");
 
         // Verify initial status is 'tracked'
-        let dir_before = db
-            .get_directory_by_path("/data/expired")
-            .expect("failed to query directory from database - connection may be lost")
+        let entry_before = db
+            .get_entry_by_path("/data/expired")
+            .expect("failed to query entry from database - connection may be lost")
             .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
+                "expected entry to exist after insert - verify database persisted data correctly",
             );
-        assert_eq!(dir_before.status, "tracked");
+        assert_eq!(entry_before.status, "tracked");
 
         // Run transition with 90-day expiration policy and auto_remove=false
         let summary = super::transition_expired_paths(&db, 90, false)
@@ -1203,13 +1190,11 @@ mod tests {
         assert_eq!(summary.deferred_reset, 0);
 
         // Verify status changed to 'pending'
-        let dir_after = db
-            .get_directory_by_path("/data/expired")
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        assert_eq!(dir_after.status, "pending");
+        let entry_after = db
+            .get_entry_by_path("/data/expired")
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after transition - verify scanner persisted data correctly");
+        assert_eq!(entry_after.status, "pending");
 
         // Verify audit entry was created
         let audit = crate::audit::AuditService::new(&db);
@@ -1230,20 +1215,31 @@ mod tests {
     fn transition_expired_paths_moves_expired_tracked_to_approved_with_auto_remove() {
         let (_temp, db) = temp_database();
 
-        // Insert a directory with an old mtime
+        // Insert a root and file entry with an old mtime
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        db.insert_or_update_directory(
-            "/data/expired",
-            1024,
-            5,
-            Some(hundred_days_ago.as_second()),
-            now.as_second(),
-        )
-        .expect("failed to insert test directory - database connection may be lost");
+        let root_id = db.insert_root("/data").expect("insert root");
+        let entry_id = db
+            .upsert_entry(
+                root_id,
+                "/data/expired",
+                "/data",
+                false,
+                1024,
+                Some(hundred_days_ago.as_second()),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+
+        // Backdate tracked_since to match the old mtime so effective_mtime = hundred_days_ago
+        db.conn()
+            .execute(
+                "UPDATE entries SET tracked_since = ?1 WHERE id = ?2",
+                (hundred_days_ago.as_second(), entry_id),
+            )
+            .expect("failed to backdate tracked_since");
 
         // Run transition with auto_remove=true
         let summary = super::transition_expired_paths(&db, 90, true)
@@ -1254,33 +1250,33 @@ mod tests {
         assert_eq!(summary.deferred_reset, 0);
 
         // Verify status changed to 'approved'
-        let dir = db
-            .get_directory_by_path("/data/expired")
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        assert_eq!(dir.status, "approved");
+        let entry = db
+            .get_entry_by_path("/data/expired")
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after transition - verify scanner persisted data correctly");
+        assert_eq!(entry.status, "approved");
     }
 
     #[test]
     fn transition_expired_paths_does_not_transition_non_expired() {
         let (_temp, db) = temp_database();
 
-        // Insert a directory with recent mtime (10 days ago)
+        // Insert a root and file entry with recent mtime (10 days ago)
         let now = jiff::Timestamp::now();
         let ten_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(10 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        db.insert_or_update_directory(
+        let root_id = db.insert_root("/data").expect("insert root");
+        db.upsert_entry(
+            root_id,
             "/data/recent",
+            "/data",
+            false,
             1024,
-            5,
             Some(ten_days_ago.as_second()),
-            now.as_second(),
         )
-        .expect("failed to insert test directory - database connection may be lost");
+        .expect("failed to insert test entry - database connection may be lost");
 
         // Run transition with 90-day policy
         let summary = super::transition_expired_paths(&db, 90, false)
@@ -1291,13 +1287,11 @@ mod tests {
         assert_eq!(summary.deferred_reset, 0);
 
         // Verify status unchanged
-        let dir = db
-            .get_directory_by_path("/data/recent")
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        assert_eq!(dir.status, "tracked");
+        let entry = db
+            .get_entry_by_path("/data/recent")
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after transition - verify scanner persisted data correctly");
+        assert_eq!(entry.status, "tracked");
     }
 
     #[test]
@@ -1309,28 +1303,29 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        // Insert a directory with deferred status
-        let id = db
-            .insert_or_update_directory("/data/deferred", 1024, 5, None, now.as_second())
-            .expect("failed to insert test directory - database connection may be lost");
+        // Insert a root and file entry with deferred status
+        let root_id = db.insert_root("/data").expect("insert root");
+        let entry_id = db
+            .upsert_entry(root_id, "/data/deferred", "/data", false, 1024, None)
+            .expect("failed to insert test entry - database connection may be lost");
 
         // Set status to 'deferred' with deferred_until in the past
         db.conn()
             .execute(
-                "UPDATE directories SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
-                (yesterday.as_second(), id),
+                "UPDATE entries SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
+                (yesterday.as_second(), entry_id),
             )
-            .expect("failed to update directory status in test - database connection may be lost");
+            .expect("failed to update entry status in test - database connection may be lost");
 
         // Verify initial state
-        let dir_before = db
-            .get_directory_by_path("/data/deferred")
-            .expect("failed to query directory from database - connection may be lost")
+        let entry_before = db
+            .get_entry_by_path("/data/deferred")
+            .expect("failed to query entry from database - connection may be lost")
             .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
+                "expected entry to exist after insert - verify scanner persisted data correctly",
             );
-        assert_eq!(dir_before.status, "deferred");
-        assert!(dir_before.deferred_until.is_some());
+        assert_eq!(entry_before.status, "deferred");
+        assert!(entry_before.deferred_until.is_some());
 
         // Run transition
         let summary = super::transition_expired_paths(&db, 90, false)
@@ -1341,14 +1336,12 @@ mod tests {
         assert_eq!(summary.deferred_reset, 1);
 
         // Verify status reset to 'tracked' and deferred_until cleared
-        let dir_after = db
-            .get_directory_by_path("/data/deferred")
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        assert_eq!(dir_after.status, "tracked");
-        assert_eq!(dir_after.deferred_until, None);
+        let entry_after = db
+            .get_entry_by_path("/data/deferred")
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after transition - verify scanner persisted data correctly");
+        assert_eq!(entry_after.status, "tracked");
+        assert_eq!(entry_after.deferred_until, None);
     }
 
     #[test]
@@ -1360,18 +1353,19 @@ mod tests {
             .checked_add(jiff::SignedDuration::from_secs(7 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        // Insert a directory with deferred status
-        let id = db
-            .insert_or_update_directory("/data/deferred", 1024, 5, None, now.as_second())
-            .expect("failed to insert test directory - database connection may be lost");
+        // Insert a root and file entry with deferred status
+        let root_id = db.insert_root("/data").expect("insert root");
+        let entry_id = db
+            .upsert_entry(root_id, "/data/deferred", "/data", false, 1024, None)
+            .expect("failed to insert test entry - database connection may be lost");
 
         // Set status to 'deferred' with deferred_until in the future
         db.conn()
             .execute(
-                "UPDATE directories SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
-                (next_week.as_second(), id),
+                "UPDATE entries SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
+                (next_week.as_second(), entry_id),
             )
-            .expect("failed to update directory status in test - database connection may be lost");
+            .expect("failed to update entry status in test - database connection may be lost");
 
         // Run transition
         let summary = super::transition_expired_paths(&db, 90, false)
@@ -1382,39 +1376,39 @@ mod tests {
         assert_eq!(summary.deferred_reset, 0);
 
         // Verify status unchanged
-        let dir = db
-            .get_directory_by_path("/data/deferred")
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        assert_eq!(dir.status, "deferred");
-        assert_eq!(dir.deferred_until, Some(next_week.as_second()));
+        let entry = db
+            .get_entry_by_path("/data/deferred")
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after transition - verify scanner persisted data correctly");
+        assert_eq!(entry.status, "deferred");
+        assert_eq!(entry.deferred_until, Some(next_week.as_second()));
     }
 
     #[test]
     fn transition_expired_paths_ignores_ignored_status() {
         let (_temp, db) = temp_database();
 
-        // Insert a directory with old mtime but 'ignored' status
+        // Insert a root and file entry with old mtime but 'ignored' status
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        let id = db
-            .insert_or_update_directory(
+        let root_id = db.insert_root("/data").expect("insert root");
+        let entry_id = db
+            .upsert_entry(
+                root_id,
                 "/data/ignored",
+                "/data",
+                false,
                 1024,
-                5,
                 Some(hundred_days_ago.as_second()),
-                now.as_second(),
             )
-            .expect("failed to insert test directory - database connection may be lost");
+            .expect("failed to insert test entry - database connection may be lost");
 
         // Set status to 'ignored'
-        db.update_directory_status(id, "ignored")
-            .expect("failed to update directory status - database connection may be lost");
+        db.update_entry_status(entry_id, "ignored")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Run transition
         let summary = super::transition_expired_paths(&db, 90, false)
@@ -1425,17 +1419,15 @@ mod tests {
         assert_eq!(summary.deferred_reset, 0);
 
         // Verify status unchanged
-        let dir = db
-            .get_directory_by_path("/data/ignored")
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        assert_eq!(dir.status, "ignored");
+        let entry = db
+            .get_entry_by_path("/data/ignored")
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after transition - verify scanner persisted data correctly");
+        assert_eq!(entry.status, "ignored");
     }
 
     #[test]
-    fn transition_expired_paths_handles_multiple_directories() {
+    fn transition_expired_paths_handles_multiple_entries() {
         let (_temp, db) = temp_database();
 
         let now = jiff::Timestamp::now();
@@ -1449,46 +1441,61 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        // Expired tracked directory
-        db.insert_or_update_directory(
-            "/data/expired1",
-            1024,
-            5,
-            Some(hundred_days_ago.as_second()),
-            now.as_second(),
-        )
-        .expect("failed to insert test directory - database connection may be lost");
+        let root_id = db.insert_root("/data").expect("insert root");
 
-        // Another expired tracked directory
-        db.insert_or_update_directory(
-            "/data/expired2",
-            2048,
-            10,
-            Some(hundred_days_ago.as_second()),
-            now.as_second(),
-        )
-        .expect("failed to insert test directory - database connection may be lost");
+        // Expired tracked file
+        let expired1_id = db
+            .upsert_entry(
+                root_id,
+                "/data/expired1",
+                "/data",
+                false,
+                1024,
+                Some(hundred_days_ago.as_second()),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
 
-        // Non-expired tracked directory
-        db.insert_or_update_directory(
+        // Another expired tracked file
+        let expired2_id = db
+            .upsert_entry(
+                root_id,
+                "/data/expired2",
+                "/data",
+                false,
+                2048,
+                Some(hundred_days_ago.as_second()),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+
+        // Backdate tracked_since for expired entries
+        db.conn()
+            .execute(
+                "UPDATE entries SET tracked_since = ?1 WHERE id IN (?2, ?3)",
+                (hundred_days_ago.as_second(), expired1_id, expired2_id),
+            )
+            .expect("failed to backdate tracked_since");
+
+        // Non-expired tracked file
+        db.upsert_entry(
+            root_id,
             "/data/recent",
+            "/data",
+            false,
             512,
-            2,
             Some(ten_days_ago.as_second()),
-            now.as_second(),
         )
-        .expect("failed to insert test directory - database connection may be lost");
+        .expect("failed to insert test entry - database connection may be lost");
 
         // Expired deferral
         let deferred_id = db
-            .insert_or_update_directory("/data/deferred", 256, 1, None, now.as_second())
-            .expect("failed to insert test directory - database connection may be lost");
+            .upsert_entry(root_id, "/data/deferred", "/data", false, 256, None)
+            .expect("failed to insert test entry - database connection may be lost");
         db.conn()
             .execute(
-                "UPDATE directories SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
+                "UPDATE entries SET status = 'deferred', deferred_until = ?1 WHERE id = ?2",
                 (yesterday.as_second(), deferred_id),
             )
-            .expect("failed to update directory status in test - database connection may be lost");
+            .expect("failed to update entry status in test - database connection may be lost");
 
         // Run transition
         let summary = super::transition_expired_paths(&db, 90, false)
@@ -1498,64 +1505,80 @@ mod tests {
         assert_eq!(summary.expired_to_approved, 0);
         assert_eq!(summary.deferred_reset, 1);
 
-        // Verify each directory
+        // Verify each entry
         assert_eq!(
-            db.get_directory_by_path("/data/expired1")
-                .expect("failed to query directory from database - connection may be lost")
-                .expect("expected directory to exist after scan - verify scanner persisted data correctly")
+            db.get_entry_by_path("/data/expired1")
+                .expect("failed to query entry from database - connection may be lost")
+                .expect("expected entry to exist after transition - verify scanner persisted data correctly")
                 .status,
             "pending"
         );
         assert_eq!(
-            db.get_directory_by_path("/data/expired2")
-                .expect("failed to query directory from database - connection may be lost")
-                .expect("expected directory to exist after scan - verify scanner persisted data correctly")
+            db.get_entry_by_path("/data/expired2")
+                .expect("failed to query entry from database - connection may be lost")
+                .expect("expected entry to exist after transition - verify scanner persisted data correctly")
                 .status,
             "pending"
         );
         assert_eq!(
-            db.get_directory_by_path("/data/recent")
-                .expect("failed to query directory from database - connection may be lost")
-                .expect("expected directory to exist after scan - verify scanner persisted data correctly")
+            db.get_entry_by_path("/data/recent")
+                .expect("failed to query entry from database - connection may be lost")
+                .expect("expected entry to exist after transition - verify scanner persisted data correctly")
                 .status,
             "tracked"
         );
         assert_eq!(
-            db.get_directory_by_path("/data/deferred")
-                .expect("failed to query directory from database - connection may be lost")
-                .expect("expected directory to exist after scan - verify scanner persisted data correctly")
+            db.get_entry_by_path("/data/deferred")
+                .expect("failed to query entry from database - connection may be lost")
+                .expect("expected entry to exist after transition - verify scanner persisted data correctly")
                 .status,
             "tracked"
         );
     }
 
     #[test]
-    fn transition_expired_paths_handles_directory_without_mtime() {
+    fn transition_expired_paths_handles_entry_without_mtime() {
         let (_temp, db) = temp_database();
 
-        let now = jiff::Timestamp::now();
-
-        // Directory with no oldest_mtime (empty directory)
-        db.insert_or_update_directory("/data/empty", 0, 0, None, now.as_second())
-            .expect("failed to insert test directory - database connection may be lost");
+        // File entry with no mtime
+        let root_id = db.insert_root("/data").expect("insert root");
+        db.upsert_entry(root_id, "/data/no_mtime", "/data", false, 0, None)
+            .expect("failed to insert test entry - database connection may be lost");
 
         // Run transition
         let summary = super::transition_expired_paths(&db, 90, false)
             .expect("failed to transition expired paths - database connection may be lost");
 
-        // Should not transition directories without mtime
+        // Should not transition entries without mtime
         assert_eq!(summary.expired_to_pending, 0);
         assert_eq!(summary.expired_to_approved, 0);
         assert_eq!(summary.deferred_reset, 0);
 
         // Verify status unchanged
-        let dir = db
-            .get_directory_by_path("/data/empty")
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        assert_eq!(dir.status, "tracked");
+        let entry = db
+            .get_entry_by_path("/data/no_mtime")
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after transition - verify scanner persisted data correctly");
+        assert_eq!(entry.status, "tracked");
+    }
+
+    #[test]
+    fn transition_expired_paths_ignores_directories() {
+        let (_temp, db) = temp_database();
+
+        // Create a directory entry (is_dir=true) - directories should not expire
+        let root_id = db.insert_root("/data").expect("insert root");
+        db.upsert_entry(root_id, "/data/subdir", "/data", true, 0, None)
+            .expect("failed to insert test entry - database connection may be lost");
+
+        // Run transition
+        let summary = super::transition_expired_paths(&db, 90, false)
+            .expect("failed to transition expired paths - database connection may be lost");
+
+        // Directory should not be transitioned
+        assert_eq!(summary.expired_to_pending, 0);
+        assert_eq!(summary.expired_to_approved, 0);
+        assert_eq!(summary.deferred_reset, 0);
     }
 
     // === Additional High-Priority Tests from testing-guru Review ===
@@ -1568,24 +1591,27 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        // Create directories with various statuses that should NOT be transitioned
+        let root_id = db.insert_root("/data").expect("insert root");
+
+        // Create file entries with various statuses that should NOT be transitioned
         for (path, status) in [
             ("/data/pending", "pending"),
             ("/data/approved", "approved"),
             ("/data/removed", "removed"),
             ("/data/blocked", "blocked"),
         ] {
-            let id = db
-                .insert_or_update_directory(
+            let entry_id = db
+                .upsert_entry(
+                    root_id,
                     path,
+                    "/data",
+                    false,
                     1024,
-                    5,
                     Some(hundred_days_ago.as_second()),
-                    now.as_second(),
                 )
-                .expect("failed to insert test directory - database connection may be lost");
-            db.update_directory_status(id, status)
-                .expect("failed to update directory status - database connection may be lost");
+                .expect("failed to insert test entry - database connection may be lost");
+            db.update_entry_status(entry_id, status)
+                .expect("failed to update entry status - database connection may be lost");
         }
 
         let summary = super::transition_expired_paths(&db, 90, false)
@@ -1602,9 +1628,9 @@ mod tests {
             ("/data/removed", "removed"),
             ("/data/blocked", "blocked"),
         ] {
-            let dir = db.get_directory_by_path(path).expect("failed to query directory from database - connection may be lost").expect("expected directory to exist after scan - verify scanner persisted data correctly");
+            let entry = db.get_entry_by_path(path).expect("failed to query entry from database - connection may be lost").expect("expected entry to exist after transition - verify scanner persisted data correctly");
             assert_eq!(
-                dir.status, expected_status,
+                entry.status, expected_status,
                 "Status for {path} should be unchanged"
             );
         }
@@ -1613,19 +1639,19 @@ mod tests {
     #[test]
     fn transition_expired_paths_handles_deferred_with_null_deferred_until() {
         let (_temp, db) = temp_database();
-        let now = jiff::Timestamp::now();
 
-        let id = db
-            .insert_or_update_directory("/data/deferred-null", 1024, 5, None, now.as_second())
-            .expect("failed to insert test directory - database connection may be lost");
+        let root_id = db.insert_root("/data").expect("insert root");
+        let entry_id = db
+            .upsert_entry(root_id, "/data/deferred-null", "/data", false, 1024, None)
+            .expect("failed to insert test entry - database connection may be lost");
 
         // Set status to deferred but leave deferred_until as NULL
         db.conn()
             .execute(
-                "UPDATE directories SET status = 'deferred' WHERE id = ?1",
-                (id,),
+                "UPDATE entries SET status = 'deferred' WHERE id = ?1",
+                (entry_id,),
             )
-            .expect("failed to update directory status in test - database connection may be lost");
+            .expect("failed to update entry status in test - database connection may be lost");
 
         let summary = super::transition_expired_paths(&db, 90, false)
             .expect("failed to transition expired paths - database connection may be lost");
@@ -1633,13 +1659,11 @@ mod tests {
         // Should NOT reset because deferred_until is None
         assert_eq!(summary.deferred_reset, 0);
 
-        let dir = db
-            .get_directory_by_path("/data/deferred-null")
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        assert_eq!(dir.status, "deferred");
+        let entry = db
+            .get_entry_by_path("/data/deferred-null")
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after transition - verify scanner persisted data correctly");
+        assert_eq!(entry.status, "deferred");
     }
 
     #[test]
@@ -1657,7 +1681,7 @@ mod tests {
     // === Integration Tests ===
 
     #[tokio::test]
-    async fn scan_and_persist_creates_directory_records() {
+    async fn scan_and_persist_creates_root_and_entries() {
         use crate::db::Database;
 
         let temp_dir = TempDir::new().expect(
@@ -1687,31 +1711,42 @@ mod tests {
         let scanner = Scanner::new();
         let summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Verify summary
         assert_eq!(summary.total_directories, 1);
         assert_eq!(summary.total_files, 1);
         assert_eq!(summary.total_size_bytes, 100);
 
-        // Verify directory was persisted
-        let dir = db
-            .get_directory_by_path(&project_dir.to_string_lossy())
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
+        // Verify root was created
+        let roots = db.list_roots().expect("failed to list roots");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, project_dir.to_string_lossy());
+        assert!(roots[0].last_scanned.is_some());
 
-        assert_eq!(dir.path, project_dir.to_string_lossy());
-        assert_eq!(dir.size_bytes, 100);
-        assert_eq!(dir.file_count, 1);
-        assert!(dir.oldest_mtime.is_some());
-        assert!(dir.last_scanned.is_some());
-        assert_eq!(dir.status, "tracked");
+        // Verify directory entry was created
+        let dir_entry = db
+            .get_entry_by_path(&project_dir.to_string_lossy())
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected directory entry to exist after scan");
+        assert!(dir_entry.is_dir);
+        assert_eq!(dir_entry.status, "tracked");
+
+        // Verify file entry was created
+        let file_path = project_dir.join("file1.txt");
+        let file_entry = db
+            .get_entry_by_path(&file_path.to_string_lossy())
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected file entry to exist after scan");
+        assert!(!file_entry.is_dir);
+        assert_eq!(file_entry.size_bytes, 100);
+        assert!(file_entry.mtime.is_some());
+        assert!(file_entry.tracked_since.is_some());
+        assert_eq!(file_entry.status, "tracked");
     }
 
     #[tokio::test]
-    async fn scan_and_persist_creates_file_records() {
+    async fn scan_and_persist_creates_file_entries() {
         use crate::db::Database;
 
         let temp_dir = TempDir::new().expect(
@@ -1739,27 +1774,21 @@ mod tests {
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
-        // Get directory id
-        let dir = db
-            .get_directory_by_path(&project_dir.to_string_lossy())
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
+        // Verify files were persisted as entries
+        let entries = db
+            .list_entries_by_parent(&project_dir.to_string_lossy())
+            .expect("failed to list entries from database - connection may be lost");
+        assert_eq!(entries.len(), 2, "Expected 2 file entries");
 
-        // Verify files were persisted
-        let files = db
-            .list_files_by_directory(dir.id)
-            .expect("failed to list files from database - connection may be lost");
-        assert_eq!(files.len(), 2, "Expected 2 files");
-
-        // Files should be ordered by path
-        assert!(files[0].path.ends_with("a.txt"));
-        assert_eq!(files[0].size_bytes, 10);
-        assert!(files[1].path.ends_with("b.txt"));
-        assert_eq!(files[1].size_bytes, 20);
+        // Entries should be ordered by path
+        assert!(entries[0].path.ends_with("a.txt"));
+        assert_eq!(entries[0].size_bytes, 10);
+        assert!(!entries[0].is_dir);
+        assert!(entries[1].path.ends_with("b.txt"));
+        assert_eq!(entries[1].size_bytes, 20);
+        assert!(!entries[1].is_dir);
     }
 
     #[tokio::test]
@@ -1787,22 +1816,19 @@ mod tests {
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, &[project_dir], 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Verify stats were updated
-        let stats: (i64, i64, Option<i64>) = db
-            .conn()
-            .query_row(
-                "SELECT total_tracked_paths, total_size_bytes, last_scan_completed
-                 FROM stats WHERE id = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+        let stats = db
+            .get_stats()
             .expect("failed to query stats from database - connection may be lost");
 
-        assert_eq!(stats.0, 1, "Expected 1 tracked directory");
-        assert_eq!(stats.1, 500, "Expected 500 bytes total");
-        assert!(stats.2.is_some(), "Expected last_scan_completed to be set");
+        assert_eq!(stats.total_files, 1, "Expected 1 tracked file");
+        assert_eq!(stats.total_size_bytes, 500, "Expected 500 bytes total");
+        assert!(
+            stats.last_scan_completed.is_some(),
+            "Expected last_scan_completed to be set"
+        );
     }
 
     #[tokio::test]
@@ -1831,7 +1857,7 @@ mod tests {
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, &[project_dir], 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Verify audit entry was created
         let audit = AuditService::new(&db);
@@ -1885,28 +1911,32 @@ mod tests {
         let scanner = Scanner::new();
         let summary = scan_and_persist(&db, &scanner, &[dir1.clone(), dir2.clone()], 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Verify both directories were scanned
         assert_eq!(summary.total_directories, 2);
         assert_eq!(summary.total_files, 2);
         assert_eq!(summary.total_size_bytes, 300);
 
-        // Verify both are in database
+        // Verify both roots are in database
+        let roots = db.list_roots().expect("failed to list roots");
+        assert_eq!(roots.len(), 2);
+
+        // Verify entries exist for both
         assert!(
-            db.get_directory_by_path(&dir1.to_string_lossy())
-                .expect("failed to query directory from database - connection may be lost")
+            db.get_entry_by_path(&dir1.to_string_lossy())
+                .expect("failed to query entry from database - connection may be lost")
                 .is_some()
         );
         assert!(
-            db.get_directory_by_path(&dir2.to_string_lossy())
-                .expect("failed to query directory from database - connection may be lost")
+            db.get_entry_by_path(&dir2.to_string_lossy())
+                .expect("failed to query entry from database - connection may be lost")
                 .is_some()
         );
     }
 
     #[tokio::test]
-    async fn scan_and_persist_upserts_existing_directories() {
+    async fn scan_and_persist_upserts_existing_entries() {
         use crate::db::Database;
 
         let temp_dir = TempDir::new().expect(
@@ -1930,17 +1960,16 @@ mod tests {
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
-        // Change directory status manually (simulating user action)
-        let dir = db
-            .get_directory_by_path(&project_dir.to_string_lossy())
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        db.update_directory_status(dir.id, "approved")
-            .expect("failed to update directory status - database connection may be lost");
+        // Change entry status manually (simulating user action)
+        let file_path = project_dir.join("file1.txt");
+        let entry = db
+            .get_entry_by_path(&file_path.to_string_lossy())
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after scan");
+        db.update_entry_status(entry.id, "approved")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Add a new file
         File::create(project_dir.join("file2.txt"))
@@ -1951,29 +1980,25 @@ mod tests {
         // Scan again
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
-        // Verify directory was updated but status preserved
-        let updated_dir = db
-            .get_directory_by_path(&project_dir.to_string_lossy())
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
+        // Verify entry was updated but status preserved
+        let updated_entry = db
+            .get_entry_by_path(&file_path.to_string_lossy())
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after scan");
 
-        assert_eq!(updated_dir.id, dir.id, "ID should not change");
-        assert_eq!(updated_dir.status, "approved", "Status should be preserved");
-        assert_eq!(updated_dir.file_count, 2, "File count should be updated");
+        assert_eq!(updated_entry.id, entry.id, "ID should not change");
         assert_eq!(
-            updated_dir.size_bytes, 150,
-            "Size should reflect both files"
+            updated_entry.status, "approved",
+            "Status should be preserved"
         );
     }
 
     // === Stats Update Tests ===
 
     #[tokio::test]
-    async fn stats_update_calculates_paths_within_warning() {
+    async fn stats_update_calculates_files_within_warning() {
         use crate::db::Database;
 
         let temp_dir = TempDir::new().expect(
@@ -1997,7 +2022,7 @@ mod tests {
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&warning_dir), 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Manually set tracked_since to 80 days ago and mtime to even older
         // to simulate a file tracked for 80 days. The effective timestamp will be
@@ -2012,38 +2037,29 @@ mod tests {
             .expect("timestamp arithmetic should succeed");
         db.conn()
             .execute(
-                "UPDATE files SET tracked_since = ?1, mtime = ?2",
+                "UPDATE entries SET tracked_since = ?1, mtime = ?2 WHERE is_dir = 0",
                 (eighty_days_ago.as_second(), ninety_days_ago.as_second()),
             )
             .expect("failed to update tracked_since for test");
 
-        // Recalculate directory oldest_mtime and stats
-        let dirs = db
-            .list_directories(None)
-            .expect("failed to list directories");
-        recalculate_directory_oldest_mtime(&db, dirs[0].id).expect("failed to recalculate");
-        // Allow: Test uses single directory, will never overflow i64.
-        #[allow(clippy::cast_possible_wrap)]
-        let total_dirs = dirs.len() as i64;
-        let total_size: i64 = dirs.iter().map(|d| d.size_bytes).sum();
-        update_stats(&db, total_dirs, total_size, now.as_second(), 90, 14)
-            .expect("failed to update stats");
+        // Update stats
+        update_stats(&db, 1, 100, now.as_second(), 90, 14).expect("failed to update stats");
 
         // Verify stats were calculated correctly
         let stats = db
             .get_stats()
             .expect("failed to query stats from database - connection may be lost");
-        assert_eq!(stats.total_tracked_paths, 1);
+        assert_eq!(stats.total_files, 1);
         assert_eq!(
-            stats.paths_within_warning, 1,
-            "Directory with file tracked for 80 days should be in warning period (10 days remaining, within 14-day warning)"
+            stats.files_within_warning, 1,
+            "File tracked for 80 days should be in warning period (10 days remaining, within 14-day warning)"
         );
-        assert_eq!(stats.paths_pending_approval, 0);
-        assert_eq!(stats.paths_overdue, 0);
+        assert_eq!(stats.files_pending_approval, 0);
+        assert_eq!(stats.files_overdue, 0);
     }
 
     #[tokio::test]
-    async fn stats_update_calculates_paths_pending_approval() {
+    async fn stats_update_calculates_files_pending_approval() {
         use crate::db::Database;
 
         let temp_dir = TempDir::new().expect(
@@ -2067,32 +2083,31 @@ mod tests {
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&pending_dir), 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Manually set status to 'pending'
-        let dir = db
-            .get_directory_by_path(&pending_dir.to_string_lossy())
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        db.update_directory_status(dir.id, "pending")
-            .expect("failed to update directory status - database connection may be lost");
+        let file_path = pending_dir.join("file.txt");
+        let entry = db
+            .get_entry_by_path(&file_path.to_string_lossy())
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after scan");
+        db.update_entry_status(entry.id, "pending")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Scan again to update stats
         let _summary = scan_and_persist(&db, &scanner, &[pending_dir], 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Verify stats
         let stats = db
             .get_stats()
             .expect("failed to query stats from database - connection may be lost");
-        assert_eq!(stats.paths_pending_approval, 1);
+        assert_eq!(stats.files_pending_approval, 1);
     }
 
     #[tokio::test]
-    async fn stats_update_calculates_paths_overdue() {
+    async fn stats_update_calculates_files_overdue() {
         use crate::db::Database;
 
         let temp_dir = TempDir::new().expect(
@@ -2116,7 +2131,7 @@ mod tests {
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&overdue_dir), 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Manually set tracked_since to 100 days ago and mtime to even older
         // to simulate a file that's been tracked for a long time.
@@ -2130,7 +2145,7 @@ mod tests {
             .expect("timestamp arithmetic should succeed");
         db.conn()
             .execute(
-                "UPDATE files SET tracked_since = ?1, mtime = ?2",
+                "UPDATE entries SET tracked_since = ?1, mtime = ?2 WHERE is_dir = 0",
                 (
                     hundred_days_ago.as_second(),
                     two_hundred_days_ago.as_second(),
@@ -2138,31 +2153,20 @@ mod tests {
             )
             .expect("failed to update tracked_since for test");
 
-        // Recalculate directory oldest_mtime based on the backdated tracked_since
-        let dirs = db
-            .list_directories(None)
-            .expect("failed to list directories");
-        recalculate_directory_oldest_mtime(&db, dirs[0].id).expect("failed to recalculate");
+        // Update stats
+        update_stats(&db, 1, 100, now.as_second(), 90, 14).expect("failed to update stats");
 
-        // Update stats again to reflect the backdated tracked_since
-        // Allow: Test uses single directory, will never overflow i64.
-        #[allow(clippy::cast_possible_wrap)]
-        let total_dirs = dirs.len() as i64;
-        let total_size: i64 = dirs.iter().map(|d| d.size_bytes).sum();
-        update_stats(&db, total_dirs, total_size, now.as_second(), 90, 14)
-            .expect("failed to update stats");
-
-        // Verify stats - should have 1 overdue path (status is still 'tracked')
+        // Verify stats - should have 1 overdue file (status is still 'tracked')
         let stats = db
             .get_stats()
             .expect("failed to query stats from database - connection may be lost");
-        assert_eq!(stats.total_tracked_paths, 1);
+        assert_eq!(stats.total_files, 1);
         assert_eq!(
-            stats.paths_overdue, 1,
-            "Directory with file tracked for 100 days should be overdue"
+            stats.files_overdue, 1,
+            "File tracked for 100 days should be overdue"
         );
-        assert_eq!(stats.paths_pending_approval, 0);
-        assert_eq!(stats.paths_within_warning, 0);
+        assert_eq!(stats.files_pending_approval, 0);
+        assert_eq!(stats.files_within_warning, 0);
     }
 
     #[tokio::test]
@@ -2228,66 +2232,52 @@ mod tests {
         let _summary = scan_and_persist(
             &db,
             &scanner,
-            &[safe_dir, warning_dir.clone(), overdue_dir.clone()],
+            &[safe_dir.clone(), warning_dir.clone(), overdue_dir.clone()],
             90,
             14,
         )
         .await
-        .expect(
-            "failed to scan and persist directories - check permissions and database connection",
-        );
+        .expect("failed to scan and persist - check permissions and database connection");
 
-        // Backdate tracked_since for the overdue directory's files to simulate
-        // files that have been tracked for 100 days (not just discovered today).
-        // Without this, the max(mtime, tracked_since) logic would use today's
-        // tracked_since, making the files appear fresh.
-        let overdue_dir_record = db
-            .get_directory_by_path(&overdue_dir.to_string_lossy())
-            .expect("failed to query directory")
-            .expect("overdue directory should exist");
+        // Backdate tracked_since for the overdue file to simulate
+        // a file that has been tracked for 100 days (not just discovered today).
+        let overdue_file_path = overdue_dir.join("overdue.txt");
         db.conn()
             .execute(
-                "UPDATE files SET tracked_since = ?1 WHERE directory_id = ?2",
-                (hundred_days_ago.as_second(), overdue_dir_record.id),
+                "UPDATE entries SET tracked_since = ?1 WHERE path = ?2",
+                (
+                    hundred_days_ago.as_second(),
+                    overdue_file_path.to_string_lossy().as_ref(),
+                ),
             )
             .expect("failed to backdate tracked_since");
-        recalculate_directory_oldest_mtime(&db, overdue_dir_record.id)
-            .expect("failed to recalculate oldest_mtime");
 
-        // Mark warning_dir as 'pending'
-        let dir = db
-            .get_directory_by_path(&warning_dir.to_string_lossy())
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        db.update_directory_status(dir.id, "pending")
-            .expect("failed to update directory status - database connection may be lost");
+        // Mark warning file as 'pending'
+        let warning_file_path = warning_dir.join("warning.txt");
+        let entry = db
+            .get_entry_by_path(&warning_file_path.to_string_lossy())
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after scan");
+        db.update_entry_status(entry.id, "pending")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Scan again to update stats
-        let _summary = scan_and_persist(
-            &db,
-            &scanner,
-            &[root.join("safe"), warning_dir, root.join("overdue")],
-            90,
-            14,
-        )
-        .await
-        .expect(
-            "failed to scan and persist directories - check permissions and database connection",
-        );
+        let _summary =
+            scan_and_persist(&db, &scanner, &[safe_dir, warning_dir, overdue_dir], 90, 14)
+                .await
+                .expect("failed to scan and persist - check permissions and database connection");
 
         // Verify stats
         let stats = db
             .get_stats()
             .expect("failed to query stats from database - connection may be lost");
-        assert_eq!(stats.total_tracked_paths, 3);
-        assert_eq!(stats.paths_overdue, 1, "One overdue directory");
-        assert_eq!(stats.paths_pending_approval, 1, "One pending directory");
-        // Note: warning_dir is now 'pending', so paths_within_warning should be 0
+        assert_eq!(stats.total_files, 3);
+        assert_eq!(stats.files_overdue, 1, "One overdue file");
+        assert_eq!(stats.files_pending_approval, 1, "One pending file");
+        // Note: warning file is now 'pending', so files_within_warning should be 0
         assert_eq!(
-            stats.paths_within_warning, 0,
-            "Warning path was marked pending"
+            stats.files_within_warning, 0,
+            "Warning file was marked pending"
         );
     }
 
@@ -2327,30 +2317,29 @@ mod tests {
         let scanner = Scanner::new();
         let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&ignored_dir), 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Mark as ignored
-        let dir = db
-            .get_directory_by_path(&ignored_dir.to_string_lossy())
-            .expect("failed to query directory from database - connection may be lost")
-            .expect(
-                "expected directory to exist after scan - verify scanner persisted data correctly",
-            );
-        db.update_directory_status(dir.id, "ignored")
-            .expect("failed to update directory status - database connection may be lost");
+        let file_path = ignored_dir.join("old.txt");
+        let entry = db
+            .get_entry_by_path(&file_path.to_string_lossy())
+            .expect("failed to query entry from database - connection may be lost")
+            .expect("expected entry to exist after scan");
+        db.update_entry_status(entry.id, "ignored")
+            .expect("failed to update entry status - database connection may be lost");
 
         // Scan again to update stats
         let _summary = scan_and_persist(&db, &scanner, &[ignored_dir], 90, 14)
             .await
-            .expect("failed to scan and persist directories - check permissions and database connection");
+            .expect("failed to scan and persist - check permissions and database connection");
 
-        // Verify stats - ignored directory should NOT be counted as overdue
+        // Verify stats - ignored file should NOT be counted as overdue
         let stats = db
             .get_stats()
             .expect("failed to query stats from database - connection may be lost");
         assert_eq!(
-            stats.paths_overdue, 0,
-            "Ignored paths should not be counted as overdue"
+            stats.files_overdue, 0,
+            "Ignored files should not be counted as overdue"
         );
     }
 
@@ -2391,43 +2380,34 @@ mod tests {
             .expect("timestamp arithmetic overflow");
         db.conn()
             .execute(
-                "UPDATE files SET tracked_since = ?1, mtime = ?2",
+                "UPDATE entries SET tracked_since = ?1, mtime = ?2 WHERE is_dir = 0",
                 (twentyfive_days_ago.as_second(), thirty_days_ago.as_second()),
             )
             .expect("failed to update tracked_since for test");
 
-        // Recalculate directory oldest_mtime and stats
-        let dirs = db
-            .list_directories(None)
-            .expect("failed to list directories");
-        recalculate_directory_oldest_mtime(&db, dirs[0].id).expect("failed to recalculate");
-        // Allow: Test uses single directory, will never overflow i64.
-        #[allow(clippy::cast_possible_wrap)]
-        let total_dirs = dirs.len() as i64;
-        let total_size: i64 = dirs.iter().map(|d| d.size_bytes).sum();
-        update_stats(&db, total_dirs, total_size, now.as_second(), 30, 7)
-            .expect("failed to update stats");
+        // Update stats
+        update_stats(&db, 1, 50, now.as_second(), 30, 7).expect("failed to update stats");
 
         // Verify stats
         let stats = db.get_stats().expect(
             "failed to query stats from database - connection may be lost or stats table corrupted",
         );
-        assert_eq!(stats.total_tracked_paths, 1);
+        assert_eq!(stats.total_files, 1);
         assert_eq!(
-            stats.paths_within_warning, 1,
+            stats.files_within_warning, 1,
             "With 30-day expiration and 7-day warning, file tracked for 25 days (5 days remaining) should be in warning"
         );
-        assert_eq!(stats.paths_overdue, 0);
+        assert_eq!(stats.files_overdue, 0);
     }
 
     #[tokio::test]
-    async fn stats_update_handles_directories_without_mtime() {
+    async fn stats_update_handles_entries_without_mtime() {
         use crate::db::Database;
 
         let temp_dir = TempDir::new().expect("failed to create temp directory for test - check disk space and system temp directory permissions");
         let root = temp_dir.path();
 
-        // Create empty directory (no files, so no oldest_mtime)
+        // Create empty directory (no files, so no entries with mtime)
         let empty_dir = root.join("empty");
         fs::create_dir(&empty_dir).expect(
             "failed to create empty test directory - check disk space and write permissions",
@@ -2442,15 +2422,14 @@ mod tests {
             .await
             .expect("scan_and_persist failed on empty directory - check permissions and database connection");
 
-        // Verify stats - directories without mtime should not be counted in warning/overdue
+        // Verify stats - entries without mtime should not be counted in warning/overdue
         let stats = db.get_stats().expect(
             "failed to query stats from database - connection may be lost or stats table corrupted",
         );
-        // Note: empty directories don't get inserted by scan_and_persist
-        // because scan_directory_tree only aggregates directories with files
-        assert_eq!(stats.total_tracked_paths, 0);
-        assert_eq!(stats.paths_within_warning, 0);
-        assert_eq!(stats.paths_overdue, 0);
+        // Note: empty directories don't get file entries
+        assert_eq!(stats.total_files, 0);
+        assert_eq!(stats.files_within_warning, 0);
+        assert_eq!(stats.files_overdue, 0);
     }
 
     #[tokio::test]
@@ -2547,18 +2526,14 @@ mod tests {
 
         let after_scan = jiff::Timestamp::now().as_second();
 
-        // Query the directory and file
-        let dirs = db
-            .list_directories(None)
-            .expect("failed to list directories");
-        assert_eq!(dirs.len(), 1);
-        let files = db
-            .list_files_by_directory(dirs[0].id)
-            .expect("failed to list files");
-        assert_eq!(files.len(), 1);
+        // Query the file entry
+        let entry = db
+            .get_entry_by_path(&file_path.to_string_lossy())
+            .expect("failed to query entry")
+            .expect("entry should exist");
 
         // Verify tracked_since was set to current time (not the old mtime)
-        let tracked_since = files[0]
+        let tracked_since = entry
             .tracked_since
             .expect("tracked_since should be set on first insert");
         assert!(
@@ -2570,8 +2545,8 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(
-                files[0].mtime,
-                hundred_days_ago.as_second(),
+                entry.mtime,
+                Some(hundred_days_ago.as_second()),
                 "mtime should preserve file's actual modification time"
             );
         }
@@ -2606,14 +2581,12 @@ mod tests {
             .await
             .expect("first scan failed");
 
-        // Get the directory and file from first scan
-        let dirs = db
-            .list_directories(None)
-            .expect("failed to list directories");
-        let files_before = db
-            .list_files_by_directory(dirs[0].id)
-            .expect("failed to list files");
-        let tracked_since_original = files_before[0]
+        // Get the entry from first scan
+        let entry_before = db
+            .get_entry_by_path(&file_path.to_string_lossy())
+            .expect("failed to query entry")
+            .expect("entry should exist");
+        let tracked_since_original = entry_before
             .tracked_since
             .expect("tracked_since should be set after first scan");
 
@@ -2636,28 +2609,29 @@ mod tests {
             .expect("second scan failed");
 
         // Verify tracked_since was NOT changed by the update
-        let files_after = db
-            .list_files_by_directory(dirs[0].id)
-            .expect("failed to list files after second scan");
+        let entry_after = db
+            .get_entry_by_path(&file_path.to_string_lossy())
+            .expect("failed to query entry after second scan")
+            .expect("entry should exist");
         assert_eq!(
-            files_after[0].tracked_since,
+            entry_after.tracked_since,
             Some(tracked_since_original),
             "tracked_since should be preserved on file updates"
         );
 
         // Verify mtime and size were updated
         assert_ne!(
-            files_after[0].mtime, files_before[0].mtime,
+            entry_after.mtime, entry_before.mtime,
             "mtime should be updated on file modification"
         );
         assert_ne!(
-            files_after[0].size_bytes, files_before[0].size_bytes,
+            entry_after.size_bytes, entry_before.size_bytes,
             "size_bytes should be updated on file modification"
         );
     }
 
     #[tokio::test]
-    async fn directory_oldest_mtime_uses_effective_timestamp() {
+    async fn expiration_uses_effective_timestamp() {
         use crate::db::Database;
 
         let temp_dir = TempDir::new()
@@ -2695,96 +2669,23 @@ mod tests {
         let db = Database::open(&db_path).expect("failed to open database - check permissions");
         let scanner = Scanner::new();
 
-        #[cfg(not(unix))]
-        let before_scan = jiff::Timestamp::now().as_second();
-
         let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
             .await
             .expect("scan failed - check permissions");
 
-        // Query directory
-        let dirs = db
-            .list_directories(None)
-            .expect("failed to list directories");
-        assert_eq!(dirs.len(), 1);
+        // Query entry
+        let entry = db
+            .get_entry_by_path(&file_path.to_string_lossy())
+            .expect("failed to query entry")
+            .expect("entry should exist");
 
-        // Verify directory's oldest_mtime is the effective timestamp (tracked_since, not mtime)
-        let oldest_mtime = dirs[0].oldest_mtime.expect("oldest_mtime should be set");
+        // Calculate effective mtime (max of mtime and tracked_since)
+        let mtime = entry.mtime.expect("mtime should be set");
+        let tracked_since = entry.tracked_since.expect("tracked_since should be set");
+        let effective_mtime = std::cmp::max(mtime, tracked_since);
 
-        #[cfg(unix)]
-        {
-            // oldest_mtime should be close to current time (tracked_since), not 200 days ago (mtime)
-            let now = jiff::Timestamp::now().as_second();
-            let age_days = (now - oldest_mtime) / SECS_PER_DAY;
-            assert!(
-                age_days < 1,
-                "oldest_mtime should be current time (tracked_since), not old mtime. Age: {age_days} days"
-            );
-        }
-
-        // On platforms where we can't set mtime, just verify it's close to scan time
-        #[cfg(not(unix))]
-        {
-            let after_scan = jiff::Timestamp::now().as_second();
-            assert!(
-                oldest_mtime >= before_scan && oldest_mtime <= after_scan,
-                "oldest_mtime should be within scan time range"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn expiration_calculation_gives_full_period_for_old_files() {
-        use crate::db::Database;
-
-        let temp_dir = TempDir::new()
-            .expect("failed to create temp directory - check disk space and permissions");
-        let root = temp_dir.path();
-
-        // Create directory with a very old file (500 days)
-        let project_dir = root.join("project");
-        fs::create_dir(&project_dir)
-            .expect("failed to create test directory - check disk space and permissions");
-        let file_path = project_dir.join("ancient_file.txt");
-        let mut file = File::create(&file_path)
-            .expect("failed to create test file - check disk space and permissions");
-        file.write_all(b"ancient data")
-            .expect("failed to write test data - disk may be full");
-        file.sync_all()
-            .expect("failed to sync file - check filesystem health");
-
-        // Set mtime to 500 days ago
-        let five_hundred_days_ago = jiff::Timestamp::now()
-            .checked_sub(jiff::SignedDuration::from_secs(500 * SECS_PER_DAY))
-            .expect("timestamp arithmetic failed");
-        #[cfg(unix)]
-        {
-            use filetime::FileTime;
-            filetime::set_file_mtime(
-                &file_path,
-                FileTime::from_unix_time(five_hundred_days_ago.as_second(), 0),
-            )
-            .expect("failed to set file mtime - check permissions");
-        }
-
-        // Create database and scan
-        let db_path = root.join("test.db");
-        let db = Database::open(&db_path).expect("failed to open database - check permissions");
-        let scanner = Scanner::new();
-
-        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
-            .await
-            .expect("scan failed - check permissions");
-
-        // Query directory
-        let dirs = db
-            .list_directories(None)
-            .expect("failed to list directories");
-        assert_eq!(dirs.len(), 1);
-
-        // Calculate expiration
-        let oldest_mtime = dirs[0].oldest_mtime.expect("oldest_mtime should be set");
-        let days_remaining = calculate_expiration(oldest_mtime, 90);
+        // Calculate expiration using effective mtime
+        let days_remaining = calculate_expiration(effective_mtime, 90);
 
         // Should have ~90 days remaining (not negative), because expiration is based on
         // tracked_since (current time), not the file's ancient mtime
@@ -2804,117 +2705,5 @@ mod tests {
                 "newly tracked file should not be overdue"
             );
         }
-    }
-
-    #[test]
-    fn recalculate_directory_oldest_mtime_uses_max_of_mtime_and_tracked_since() {
-        use crate::db::Database;
-
-        let temp_file =
-            tempfile::NamedTempFile::new().expect("failed to create temp file - check disk space");
-        let db =
-            Database::open(temp_file.path()).expect("failed to open database - check permissions");
-
-        // Create a directory
-        let dir_id = db
-            .insert_or_update_directory("/test", 100, 2, None, 1_700_000_000)
-            .expect("failed to insert directory");
-
-        // Insert two files:
-        // File 1: old mtime (100 days ago), recent tracked_since (now)
-        // File 2: recent mtime (now), NULL tracked_since (legacy)
-        let now = jiff::Timestamp::now().as_second();
-        let hundred_days_ago = now - (100 * SECS_PER_DAY);
-
-        // File 1: Manually insert with old mtime but recent tracked_since
-        db.conn()
-            .execute(
-                "INSERT INTO files (directory_id, path, size_bytes, mtime, tracked_since) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (dir_id, "/test/old_file.txt", 50, hundred_days_ago, now),
-            )
-            .expect("failed to insert file 1");
-
-        // File 2: Manually insert with recent mtime but NULL tracked_since (legacy file)
-        db.conn()
-            .execute(
-                "INSERT INTO files (directory_id, path, size_bytes, mtime, tracked_since) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (dir_id, "/test/new_file.txt", 50, now, rusqlite::types::Value::Null),
-            )
-            .expect("failed to insert file 2");
-
-        // Recalculate oldest_mtime
-        super::recalculate_directory_oldest_mtime(&db, dir_id)
-            .expect("recalculate failed - check database connection");
-
-        // Query the directory
-        let dir = db
-            .conn()
-            .query_row(
-                "SELECT oldest_mtime FROM directories WHERE id = ?1",
-                [dir_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .expect("failed to query directory - check database connection");
-
-        let oldest_mtime = dir.expect("oldest_mtime should be set");
-
-        // For File 1: max(old_mtime, recent_tracked_since) = recent_tracked_since = now
-        // For File 2: max(recent_mtime, NULL) = recent_mtime = now
-        // MIN(now, now) = now
-        // So oldest_mtime should be approximately now
-        let age_seconds = now - oldest_mtime;
-        assert!(
-            age_seconds < 2,
-            "oldest_mtime should be recent (age: {age_seconds} seconds)"
-        );
-    }
-
-    #[test]
-    fn recalculate_directory_oldest_mtime_handles_null_tracked_since() {
-        use crate::db::Database;
-
-        let temp_file =
-            tempfile::NamedTempFile::new().expect("failed to create temp file - check disk space");
-        let db =
-            Database::open(temp_file.path()).expect("failed to open database - check permissions");
-
-        // Create a directory
-        let dir_id = db
-            .insert_or_update_directory("/test", 100, 1, None, 1_700_000_000)
-            .expect("failed to insert directory");
-
-        // Insert a legacy file with NULL tracked_since
-        let now = jiff::Timestamp::now().as_second();
-        let fifty_days_ago = now - (50 * SECS_PER_DAY);
-
-        db.conn()
-            .execute(
-                "INSERT INTO files (directory_id, path, size_bytes, mtime, tracked_since) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (dir_id, "/test/legacy_file.txt", 100, fifty_days_ago, rusqlite::types::Value::Null),
-            )
-            .expect("failed to insert legacy file");
-
-        // Recalculate oldest_mtime
-        super::recalculate_directory_oldest_mtime(&db, dir_id)
-            .expect("recalculate failed - check database connection");
-
-        // Query the directory
-        let dir = db
-            .conn()
-            .query_row(
-                "SELECT oldest_mtime FROM directories WHERE id = ?1",
-                [dir_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .expect("failed to query directory - check database connection");
-
-        let oldest_mtime = dir.expect("oldest_mtime should be set");
-
-        // For legacy file with NULL tracked_since, COALESCE(tracked_since, mtime) = mtime
-        // So oldest_mtime should be fifty_days_ago
-        assert_eq!(
-            oldest_mtime, fifty_days_ago,
-            "legacy files should use mtime when tracked_since is NULL"
-        );
     }
 }

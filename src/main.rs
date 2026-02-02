@@ -267,7 +267,7 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
 ///
 /// Queries the stats table and prints a fast, human-readable summary for use in shell hooks.
 /// Output format varies based on urgency:
-/// - If paths are overdue or pending: shows warning with counts
+/// - If files are overdue or pending: shows warning with counts
 /// - If nothing urgent: shows "All clear" message
 ///
 /// Note: Output format is unstable and may change between versions.
@@ -275,22 +275,19 @@ fn handle_status(db: &Database) -> Result<()> {
     let stats = db.get_stats().context("Failed to query stats")?;
 
     // Verify invariants
-    debug_assert!(
-        stats.total_tracked_paths >= 0,
-        "total_tracked_paths cannot be negative"
-    );
+    debug_assert!(stats.total_files >= 0, "total_files cannot be negative");
     debug_assert!(
         stats.total_size_bytes >= 0,
         "total_size_bytes cannot be negative"
     );
-    debug_assert!(stats.paths_overdue >= 0, "paths_overdue cannot be negative");
+    debug_assert!(stats.files_overdue >= 0, "files_overdue cannot be negative");
     debug_assert!(
-        stats.paths_pending_approval >= 0,
-        "paths_pending_approval cannot be negative"
+        stats.files_pending_approval >= 0,
+        "files_pending_approval cannot be negative"
     );
     debug_assert!(
-        stats.paths_within_warning >= 0,
-        "paths_within_warning cannot be negative"
+        stats.files_within_warning >= 0,
+        "files_within_warning cannot be negative"
     );
 
     println!("{}", format_status_output(&stats));
@@ -302,29 +299,29 @@ fn handle_status(db: &Database) -> Result<()> {
 /// Returns a human-readable status line for shell hook display.
 /// The output follows a priority hierarchy: overdue > pending > warning > all clear.
 fn format_status_output(stats: &db::Stats) -> String {
-    let paths_overdue = stats.paths_overdue;
-    let paths_pending = stats.paths_pending_approval;
-    let paths_within_warning = stats.paths_within_warning;
+    let files_overdue = stats.files_overdue;
+    let files_pending = stats.files_pending_approval;
+    let files_within_warning = stats.files_within_warning;
 
-    if paths_overdue > 0 {
-        // Most urgent: paths are overdue
-        if paths_pending > 0 {
-            format!("stagecrew: {paths_overdue} paths overdue, {paths_pending} pending approval")
+    if files_overdue > 0 {
+        // Most urgent: files are overdue
+        if files_pending > 0 {
+            format!("stagecrew: {files_overdue} files overdue, {files_pending} pending approval")
         } else {
-            format!("stagecrew: {paths_overdue} paths overdue")
+            format!("stagecrew: {files_overdue} files overdue")
         }
-    } else if paths_pending > 0 {
-        // Urgent: paths need approval
-        if paths_within_warning > 0 {
+    } else if files_pending > 0 {
+        // Urgent: files need approval
+        if files_within_warning > 0 {
             format!(
-                "stagecrew: {paths_pending} paths pending approval, {paths_within_warning} within warning period"
+                "stagecrew: {files_pending} files pending approval, {files_within_warning} within warning period"
             )
         } else {
-            format!("stagecrew: {paths_pending} paths pending approval")
+            format!("stagecrew: {files_pending} files pending approval")
         }
-    } else if paths_within_warning > 0 {
-        // Warning: paths approaching expiration
-        format!("stagecrew: {paths_within_warning} paths within warning period")
+    } else if files_within_warning > 0 {
+        // Warning: files approaching expiration
+        format!("stagecrew: {files_within_warning} files within warning period")
     } else {
         // All clear
         let formatted_size = format_bytes(
@@ -336,8 +333,8 @@ fn format_status_output(stats: &db::Stats) -> String {
             },
         );
         format!(
-            "stagecrew: All clear. {} paths tracked, {formatted_size}",
-            stats.total_tracked_paths
+            "stagecrew: All clear. {} files tracked, {formatted_size}",
+            stats.total_files
         )
     }
 }
@@ -431,109 +428,109 @@ mod tests {
     #[test]
     fn format_status_output_overdue_with_pending() {
         let stats = db::Stats {
-            total_tracked_paths: 10,
+            total_files: 10,
             total_size_bytes: 1_000_000,
-            paths_within_warning: 1,
-            paths_pending_approval: 2,
-            paths_overdue: 3,
+            files_within_warning: 1,
+            files_pending_approval: 2,
+            files_overdue: 3,
             last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
-            "stagecrew: 3 paths overdue, 2 pending approval"
+            "stagecrew: 3 files overdue, 2 pending approval"
         );
     }
 
     #[test]
     fn format_status_output_overdue_only() {
         let stats = db::Stats {
-            total_tracked_paths: 10,
+            total_files: 10,
             total_size_bytes: 1_000_000,
-            paths_within_warning: 1,
-            paths_pending_approval: 0,
-            paths_overdue: 3,
+            files_within_warning: 1,
+            files_pending_approval: 0,
+            files_overdue: 3,
             last_scan_completed: None,
         };
-        assert_eq!(format_status_output(&stats), "stagecrew: 3 paths overdue");
+        assert_eq!(format_status_output(&stats), "stagecrew: 3 files overdue");
     }
 
     #[test]
     fn format_status_output_pending_with_warning() {
         let stats = db::Stats {
-            total_tracked_paths: 10,
+            total_files: 10,
             total_size_bytes: 1_000_000,
-            paths_within_warning: 4,
-            paths_pending_approval: 2,
-            paths_overdue: 0,
+            files_within_warning: 4,
+            files_pending_approval: 2,
+            files_overdue: 0,
             last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
-            "stagecrew: 2 paths pending approval, 4 within warning period"
+            "stagecrew: 2 files pending approval, 4 within warning period"
         );
     }
 
     #[test]
     fn format_status_output_pending_only() {
         let stats = db::Stats {
-            total_tracked_paths: 10,
+            total_files: 10,
             total_size_bytes: 1_000_000,
-            paths_within_warning: 0,
-            paths_pending_approval: 2,
-            paths_overdue: 0,
+            files_within_warning: 0,
+            files_pending_approval: 2,
+            files_overdue: 0,
             last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
-            "stagecrew: 2 paths pending approval"
+            "stagecrew: 2 files pending approval"
         );
     }
 
     #[test]
     fn format_status_output_warning_only() {
         let stats = db::Stats {
-            total_tracked_paths: 10,
+            total_files: 10,
             total_size_bytes: 1_000_000,
-            paths_within_warning: 5,
-            paths_pending_approval: 0,
-            paths_overdue: 0,
+            files_within_warning: 5,
+            files_pending_approval: 0,
+            files_overdue: 0,
             last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
-            "stagecrew: 5 paths within warning period"
+            "stagecrew: 5 files within warning period"
         );
     }
 
     #[test]
     fn format_status_output_all_clear() {
         let stats = db::Stats {
-            total_tracked_paths: 10,
+            total_files: 10,
             total_size_bytes: 1_234_567_890,
-            paths_within_warning: 0,
-            paths_pending_approval: 0,
-            paths_overdue: 0,
+            files_within_warning: 0,
+            files_pending_approval: 0,
+            files_overdue: 0,
             last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
-            "stagecrew: All clear. 10 paths tracked, 1.2 GB"
+            "stagecrew: All clear. 10 files tracked, 1.2 GB"
         );
     }
 
     #[test]
     fn format_status_output_all_clear_empty_database() {
         let stats = db::Stats {
-            total_tracked_paths: 0,
+            total_files: 0,
             total_size_bytes: 0,
-            paths_within_warning: 0,
-            paths_pending_approval: 0,
-            paths_overdue: 0,
+            files_within_warning: 0,
+            files_pending_approval: 0,
+            files_overdue: 0,
             last_scan_completed: None,
         };
         assert_eq!(
             format_status_output(&stats),
-            "stagecrew: All clear. 0 paths tracked, 0 B"
+            "stagecrew: All clear. 0 files tracked, 0 B"
         );
     }
 }

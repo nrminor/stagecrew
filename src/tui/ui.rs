@@ -37,40 +37,19 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     // Render the footer
     render_footer(app, frame, chunks[1]);
 
-    // Render confirmation modal if pending approval
-    if let Some((_, path)) = app.pending_approval() {
-        render_confirmation_modal(frame, path);
-    }
-
-    // Render deferral input modal if pending deferral
-    if let Some(deferral) = app.pending_deferral() {
-        render_deferral_modal(
-            frame,
-            &deferral.path,
-            &deferral.input,
-            deferral.default_days,
-            1, // Directory-level deferral is always single item
-        );
-    }
-
-    // Render ignore confirmation modal if pending ignore
-    if let Some((_, path)) = app.pending_ignore() {
-        render_ignore_modal(frame, path);
-    }
-
-    // Render file deletion confirmation modal if pending file delete
-    if let Some(files) = app.pending_file_delete() {
-        let count = files.len();
+    // Render entry deletion confirmation modal if pending entry delete
+    if let Some(entries) = app.pending_entry_delete() {
+        let count = entries.len();
         if count == 1 {
-            render_file_delete_modal(frame, &files[0].1);
+            render_entry_delete_modal(frame, &entries[0].1, entries[0].2);
         } else {
-            render_file_delete_modal_multi(frame, count);
+            render_entry_delete_modal_multi(frame, count);
         }
     }
 
-    // Render file deferral input modal if pending file deferral
-    if let Some(deferral) = app.pending_file_deferral() {
-        let count = 1 + deferral.additional_file_ids.len();
+    // Render entry deferral input modal if pending entry deferral
+    if let Some(deferral) = app.pending_entry_deferral() {
+        let count = 1 + deferral.additional_entry_ids.len();
         render_deferral_modal(
             frame,
             &deferral.path,
@@ -80,21 +59,21 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
         );
     }
 
-    // Render file ignore confirmation modal if pending file ignore
-    if let Some(files) = app.pending_file_ignore() {
-        let count = files.len();
+    // Render entry ignore confirmation modal if pending entry ignore
+    if let Some(entries) = app.pending_entry_ignore() {
+        let count = entries.len();
         if count == 1 {
-            render_ignore_modal(frame, &files[0].1);
+            render_ignore_modal(frame, &entries[0].1);
         } else {
             render_ignore_modal_multi(frame, count);
         }
     }
 
-    // Render file approval confirmation modal if pending file approval
-    if let Some(files) = app.pending_file_approval() {
-        let count = files.len();
+    // Render entry approval confirmation modal if pending entry approval
+    if let Some(entries) = app.pending_entry_approval() {
+        let count = entries.len();
         if count == 1 {
-            render_confirmation_modal(frame, &files[0].1);
+            render_confirmation_modal(frame, &entries[0].1);
         } else {
             render_confirmation_modal_multi(frame, count);
         }
@@ -151,11 +130,11 @@ fn render_file_list_view(
         // Render sidebar with tracked directories
         render_sidebar(app, db, frame, h_chunks[0]);
 
-        // Render main panel with files from selected directory
-        render_main_file_panel(app, config, db, frame, h_chunks[1]);
+        // Render main panel with entries from current path
+        render_main_entry_panel(app, config, db, frame, h_chunks[1]);
     } else {
         // Sidebar hidden - main panel takes full width
-        render_main_file_panel(app, config, db, frame, v_chunks[1]);
+        render_main_entry_panel(app, config, db, frame, v_chunks[1]);
     }
 }
 
@@ -173,11 +152,11 @@ fn render_file_view_header(
         Err(_) => {
             // Use zeros if stats aren't available
             crate::db::Stats {
-                total_tracked_paths: 0,
+                total_files: 0,
                 total_size_bytes: 0,
-                paths_within_warning: 0,
-                paths_pending_approval: 0,
-                paths_overdue: 0,
+                files_within_warning: 0,
+                files_pending_approval: 0,
+                files_overdue: 0,
                 last_scan_completed: None,
             }
         }
@@ -190,22 +169,22 @@ fn render_file_view_header(
     // Build header text, including status message if present
     let header_text = if let Some(status) = app.status_message.as_ref() {
         format!(
-            "Total: {} paths, {} | Pending: {} | Within warning: {} | Overdue: {} | {}",
-            stats.total_tracked_paths,
+            "Total: {} files, {} | Pending: {} | Within warning: {} | Overdue: {} | {}",
+            stats.total_files,
             total_size_str,
-            stats.paths_pending_approval,
-            stats.paths_within_warning,
-            stats.paths_overdue,
+            stats.files_pending_approval,
+            stats.files_within_warning,
+            stats.files_overdue,
             status
         )
     } else {
         format!(
-            "Total: {} paths, {} | Pending: {} | Within warning: {} | Overdue: {}",
-            stats.total_tracked_paths,
+            "Total: {} files, {} | Pending: {} | Within warning: {} | Overdue: {}",
+            stats.total_files,
             total_size_str,
-            stats.paths_pending_approval,
-            stats.paths_within_warning,
-            stats.paths_overdue
+            stats.files_pending_approval,
+            stats.files_within_warning,
+            stats.files_overdue
         )
     };
 
@@ -216,42 +195,42 @@ fn render_file_view_header(
     frame.render_widget(header, area);
 }
 
-/// Render the sidebar showing tracked directories.
+/// Render the sidebar showing tracked roots.
 fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
-    // Fetch directories from database
-    let Ok(directories) = db.list_directories(None) else {
-        let error_text = Paragraph::new("Error loading directories")
-            .block(Block::default().borders(Borders::ALL).title("Directories"))
+    // Fetch roots from database
+    let Ok(roots) = db.list_roots() else {
+        let error_text = Paragraph::new("Error loading roots")
+            .block(Block::default().borders(Borders::ALL).title("Roots"))
             .style(Style::default().fg(Color::Red));
         frame.render_widget(error_text, area);
         return;
     };
 
     // Update sidebar list length for navigation
-    app.sidebar_len.set(directories.len());
+    app.sidebar_len.set(roots.len());
 
     // Clamp selected index
-    let selected_idx = if directories.is_empty() {
+    let selected_idx = if roots.is_empty() {
         0
     } else {
-        app.sidebar_selected_index().min(directories.len() - 1)
+        app.sidebar_selected_index().min(roots.len() - 1)
     };
 
-    // Set current directory ID based on selection
-    if let Some(dir) = directories.get(selected_idx) {
-        app.current_directory_id.set(Some(dir.id));
+    // Set current root ID based on selection
+    if let Some(root) = roots.get(selected_idx) {
+        app.current_root_id.set(Some(root.id));
     }
 
     // Build sidebar rows
-    let rows: Vec<Row> = directories
+    let rows: Vec<Row> = roots
         .iter()
         .enumerate()
-        .map(|(idx, dir)| {
+        .map(|(idx, root)| {
             // Extract just the directory name from full path
-            let dir_name = std::path::Path::new(&dir.path)
+            let dir_name = std::path::Path::new(&root.path)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or(&dir.path);
+                .unwrap_or(&root.path);
 
             let cell = Cell::from(dir_name);
 
@@ -275,7 +254,7 @@ fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::la
     // Empty state
     if rows.is_empty() {
         let empty_text = Paragraph::new("No tracked paths.\n\nRun 'stagecrew add PATH'")
-            .block(Block::default().borders(Borders::ALL).title("Directories"))
+            .block(Block::default().borders(Borders::ALL).title("Roots"))
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty_text, area);
         return;
@@ -283,7 +262,7 @@ fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::la
 
     let table = Table::new(rows, [Constraint::Percentage(100)]).block(
         Block::default()
-            .title("Directories")
+            .title("Roots")
             .borders(Borders::ALL)
             .border_style(if app.focus_panel() == FocusPanel::Sidebar {
                 Style::default().fg(Color::Cyan)
@@ -295,118 +274,145 @@ fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::la
     frame.render_widget(table, area);
 }
 
-/// Render the main panel showing files from the selected directory.
-// Allow: This function handles file loading, sorting, and table rendering which are
+/// Render the main panel showing entries from the current path.
+// Allow: This function handles entry loading, sorting, and table rendering which are
 // sequential operations that form a cohesive rendering pipeline.
 #[allow(clippy::too_many_lines)]
-fn render_main_file_panel(
+fn render_main_entry_panel(
     app: &App,
     config: &Config,
     db: &Database,
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
-    // Get the current directory ID from sidebar selection
-    let Some(directory_id) = app.current_directory_id() else {
+    // Get the current path for browsing
+    let current_path = app.current_path();
+
+    // If current_path is empty, show a message to select a root
+    if current_path.is_empty() {
         let message = Paragraph::new(
-            "Select a directory from the sidebar\n\n(Use j/k to navigate, Tab to switch panels)",
+            "Select a root from the sidebar\n\n(Use j/k to navigate, Tab to switch panels)",
         )
-        .block(Block::default().borders(Borders::ALL).title("Files"))
+        .block(Block::default().borders(Borders::ALL).title("Entries"))
         .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(message, area);
         return;
-    };
+    }
 
-    // Fetch files for this directory
-    let Ok(files) = db.list_files_by_directory(directory_id) else {
-        let error_text = Paragraph::new("Error loading files from database")
-            .block(Block::default().borders(Borders::ALL).title("Files"))
+    // Fetch entries for this path
+    let Ok(entries) = db.list_entries_by_parent(current_path) else {
+        let error_text = Paragraph::new("Error loading entries from database")
+            .block(Block::default().borders(Borders::ALL).title("Entries"))
             .style(Style::default().fg(Color::Red));
         frame.render_widget(error_text, area);
         return;
     };
 
     // Empty state
-    if files.is_empty() {
-        let empty_text = Paragraph::new("No files in this directory")
-            .block(Block::default().borders(Borders::ALL).title("Files"))
+    if entries.is_empty() {
+        let empty_text = Paragraph::new("No entries in this directory")
+            .block(Block::default().borders(Borders::ALL).title("Entries"))
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty_text, area);
         return;
     }
 
-    // Sort files by expiration (most urgent first) by default
-    let mut file_rows: Vec<_> = files
+    // Sort entries by expiration (most urgent first) by default
+    // For directories (no mtime), use a large positive value so they sort to end
+    let mut entry_rows: Vec<_> = entries
         .into_iter()
-        .map(|file| {
-            let days_remaining = calculate_expiration(file.mtime, config.expiration_days);
-            (file, days_remaining)
+        .map(|entry| {
+            // Directories have no mtime
+            let days_remaining = entry.mtime.map_or(i64::MAX, |mtime| {
+                calculate_expiration(mtime, config.expiration_days)
+            });
+            (entry, days_remaining)
         })
         .collect();
 
     // Sort based on current sort mode
-    sort_file_rows(&mut file_rows, app.sort_mode());
+    sort_entry_rows(&mut entry_rows, app.sort_mode());
 
-    // Update file list length for navigation
-    app.file_list_len.set(file_rows.len());
+    // Update entry list length for navigation
+    app.entry_list_len.set(entry_rows.len());
 
     // Clamp selected index
-    let selected_idx = if file_rows.is_empty() {
+    let selected_idx = if entry_rows.is_empty() {
         0
     } else {
-        app.file_selected_index().min(file_rows.len() - 1)
+        app.entry_selected_index().min(entry_rows.len() - 1)
     };
 
-    // Build file table rows
-    let rows: Vec<Row> = file_rows
+    // Build entry table rows
+    let rows: Vec<Row> = entry_rows
         .iter()
         .enumerate()
-        .map(|(idx, (file, days_remaining))| {
+        .map(|(idx, (entry, days_remaining))| {
             // Visual indicator showing attention status
-            let (indicator_symbol, indicator_color) =
-                expiration_indicator(&file.status, *days_remaining, config.warning_days, file);
+            let (indicator_symbol, indicator_color) = expiration_indicator_entry(
+                &entry.status,
+                *days_remaining,
+                config.warning_days,
+                entry,
+            );
             let indicator_cell = Cell::from(indicator_symbol).fg(indicator_color);
 
-            // Extract filename from path
-            let filename = std::path::Path::new(&file.path)
+            // Extract filename from path with directory indicator
+            let filename = std::path::Path::new(&entry.path)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or(&file.path);
-            let filename_cell = Cell::from(filename);
+                .unwrap_or(&entry.path);
+            let display_name = if entry.is_dir {
+                format!("{filename}/")
+            } else {
+                filename.to_string()
+            };
+            let filename_cell = Cell::from(display_name);
 
-            // Format size
-            // Allow: size_bytes is guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
-            #[allow(clippy::cast_sign_loss)]
-            let size_cell = Cell::from(format_bytes(file.size_bytes as u64));
+            // Format size (directories show as "-")
+            let size_str = if entry.is_dir {
+                "-".to_string()
+            } else {
+                // Allow: size_bytes is guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
+                #[allow(clippy::cast_sign_loss)]
+                format_bytes(entry.size_bytes as u64)
+            };
+            let size_cell = Cell::from(size_str);
 
-            // Format expiration
-            let expires_str = if *days_remaining >= 0 {
+            // Format expiration (directories show as "-")
+            let expires_str = if entry.is_dir {
+                "-".to_string()
+            } else if *days_remaining >= 0 {
                 format!("{days_remaining} days")
             } else {
                 format!("{} days ago", -days_remaining)
             };
             let expires_cell = Cell::from(expires_str);
 
-            // Display status from database, with expiration-based fallback for "tracked" files
-            let status_str = match file.status.as_str() {
-                "tracked" => {
-                    // For tracked files, show expiration-based status
-                    if *days_remaining <= 0 {
-                        "overdue"
-                    } else if *days_remaining <= i64::from(config.warning_days) {
-                        "warning"
-                    } else {
-                        "tracked"
+            // Display status from database, with expiration-based fallback for "tracked" entries
+            let status_str = if entry.is_dir {
+                "dir"
+            } else {
+                match entry.status.as_str() {
+                    "tracked" => {
+                        // For tracked entries, show expiration-based status
+                        if *days_remaining <= 0 {
+                            "overdue"
+                        } else if *days_remaining <= i64::from(config.warning_days) {
+                            "warning"
+                        } else {
+                            "tracked"
+                        }
                     }
+                    other => other, // Show actual status: ignored, deferred, pending, approved, etc.
                 }
-                other => other, // Show actual status: ignored, deferred, pending, approved, etc.
             };
             let status_cell = Cell::from(status_str);
 
-            // Determine row color based on actual file status
-            // For deferred files, use the deferral end date instead of mtime-based expiration
-            let effective_days = if file.status == "deferred" {
-                if let Some(deferred_until) = file.deferred_until {
+            // Determine row color based on actual entry status
+            // For deferred entries, use the deferral end date instead of mtime-based expiration
+            let effective_days = if entry.status == "deferred" {
+                if let Some(deferred_until) = entry.deferred_until {
                     let now = jiff::Timestamp::now().as_second();
                     (deferred_until - now) / 86400
                 } else {
@@ -415,18 +421,21 @@ fn render_main_file_panel(
             } else {
                 *days_remaining
             };
-            let row_style =
-                determine_row_style(&file.status, Some(effective_days), config.warning_days);
+            let row_style = if entry.is_dir {
+                Style::default().fg(Color::Blue) // Directories are blue
+            } else {
+                determine_row_style(&entry.status, Some(effective_days), config.warning_days)
+            };
 
-            // Check if this file is selected (multi-select)
-            let is_selected = app.selected_files().contains(&file.id);
+            // Check if this entry is selected (multi-select)
+            let is_selected = app.selected_entries().contains(&entry.id);
 
             // Highlight selected row and show focus
             let style = if is_selected {
-                // Selected files get dark gray background for contrast with all text colors
+                // Selected entries get dark gray background for contrast with all text colors
                 row_style.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
             } else if idx == selected_idx {
-                // Currently focused file
+                // Currently focused entry
                 if app.focus_panel() == FocusPanel::MainPanel {
                     row_style.add_modifier(Modifier::REVERSED).fg(Color::Cyan)
                 } else {
@@ -463,16 +472,16 @@ fn render_main_file_panel(
         SortMode::Modified => " (by modified)",
     };
 
-    let selection_info = if app.selected_files().is_empty() {
+    let selection_info = if app.selected_entries().is_empty() {
         String::new()
     } else {
-        format!(" | {} selected", app.selected_files().len())
+        format!(" | {} selected", app.selected_entries().len())
     };
 
     let table = Table::new(rows, widths)
         .block(
             Block::default()
-                .title(format!("Files{sort_indicator}{selection_info}"))
+                .title(format!("Entries{sort_indicator}{selection_info}"))
                 .borders(Borders::ALL)
                 .border_style(if app.focus_panel() == FocusPanel::MainPanel {
                     Style::default().fg(Color::Cyan)
@@ -481,7 +490,7 @@ fn render_main_file_panel(
                 }),
         )
         .header(
-            Row::new(file_table_header_cells(app.sort_mode()))
+            Row::new(entry_table_header_cells(app.sort_mode()))
                 .style(Style::default().add_modifier(Modifier::BOLD))
                 .bottom_margin(1),
         );
@@ -489,40 +498,63 @@ fn render_main_file_panel(
     frame.render_widget(table, area);
 }
 
-/// Sort file rows according to the specified sort mode.
-pub(super) fn sort_file_rows(rows: &mut [(crate::db::File, i64)], sort_mode: SortMode) {
+/// Sort entry rows according to the specified sort mode.
+pub(super) fn sort_entry_rows(rows: &mut [(crate::db::Entry, i64)], sort_mode: SortMode) {
     match sort_mode {
         SortMode::Expiration => {
             // Ascending (most urgent first), but:
-            // - Ignored files sort to the end (they're not expiring)
-            // - Deferred files sort by their deferred_until date
+            // - Directories sort to the end (they don't have expiration)
+            // - Ignored entries sort to the end (they're not expiring)
+            // - Deferred entries sort by their deferred_until date
             rows.sort_by(|a, b| {
-                let key_a = expiration_sort_key(&a.0, a.1);
-                let key_b = expiration_sort_key(&b.0, b.1);
+                let key_a = expiration_sort_key_entry(&a.0, a.1);
+                let key_b = expiration_sort_key_entry(&b.0, b.1);
                 key_a.cmp(&key_b)
             });
         }
         SortMode::Size => {
-            // Descending (largest first)
-            rows.sort_by(|a, b| b.0.size_bytes.cmp(&a.0.size_bytes));
+            // Descending (largest first), directories sort to end
+            rows.sort_by(|a, b| {
+                // Directories go to end
+                match (a.0.is_dir, b.0.is_dir) {
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    _ => b.0.size_bytes.cmp(&a.0.size_bytes),
+                }
+            });
         }
         SortMode::Name => {
-            // Alphabetical ascending by filename
+            // Alphabetical ascending by filename, directories first
             rows.sort_by(|a, b| {
-                let name_a = std::path::Path::new(&a.0.path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&a.0.path);
-                let name_b = std::path::Path::new(&b.0.path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&b.0.path);
-                name_a.cmp(name_b)
+                // Directories first
+                match (a.0.is_dir, b.0.is_dir) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => {
+                        let name_a = std::path::Path::new(&a.0.path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&a.0.path);
+                        let name_b = std::path::Path::new(&b.0.path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&b.0.path);
+                        name_a.cmp(name_b)
+                    }
+                }
             });
         }
         SortMode::Modified => {
-            // Descending (most recent first = highest mtime first)
-            rows.sort_by(|a, b| b.0.mtime.cmp(&a.0.mtime));
+            // Descending (most recent first = highest mtime first), directories to end
+            rows.sort_by(|a, b| {
+                // Directories go to end (no mtime)
+                match (a.0.mtime, b.0.mtime) {
+                    (Some(mtime_a), Some(mtime_b)) => mtime_b.cmp(&mtime_a),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
         }
     }
 }
@@ -530,15 +562,21 @@ pub(super) fn sort_file_rows(rows: &mut [(crate::db::File, i64)], sort_mode: Sor
 /// Compute a sort key for expiration-based sorting.
 ///
 /// Returns an `i64` where lower values sort first (more urgent):
-/// - Ignored files return `i64::MAX` (sort to end)
-/// - Deferred files return days until deferral expires
-/// - Other files return their `days_remaining`
-fn expiration_sort_key(file: &crate::db::File, days_remaining: i64) -> i64 {
-    match file.status.as_str() {
+/// - Directories return `i64::MAX - 1` (sort near end, before ignored)
+/// - Ignored entries return `i64::MAX` (sort to end)
+/// - Deferred entries return days until deferral expires
+/// - Other entries return their `days_remaining`
+fn expiration_sort_key_entry(entry: &crate::db::Entry, days_remaining: i64) -> i64 {
+    // Directories don't expire, sort near end
+    if entry.is_dir {
+        return i64::MAX - 1;
+    }
+
+    match entry.status.as_str() {
         "ignored" => i64::MAX, // Sort to end
         "deferred" => {
             // Sort by days until deferral expires
-            if let Some(deferred_until) = file.deferred_until {
+            if let Some(deferred_until) = entry.deferred_until {
                 let now = jiff::Timestamp::now().as_second();
                 let seconds_remaining = deferred_until - now;
                 seconds_remaining / 86400 // Convert to days
@@ -548,66 +586,6 @@ fn expiration_sort_key(file: &crate::db::File, days_remaining: i64) -> i64 {
             }
         }
         _ => days_remaining,
-    }
-}
-
-/// LEGACY: Old header function - superseded by `render_file_view_header` in US-027.
-#[allow(dead_code)]
-fn render_header(
-    stats: &crate::db::Stats,
-    _config: &Config,
-    _app: &App,
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-) {
-    // Allow: size values are guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
-    #[allow(clippy::cast_sign_loss)]
-    let total_size_str = format_bytes(stats.total_size_bytes as u64);
-
-    let header_text = format!(
-        "Total: {} paths, {} | Pending: {} | Within warning: {} | Overdue: {}",
-        stats.total_tracked_paths,
-        total_size_str,
-        stats.paths_pending_approval,
-        stats.paths_within_warning,
-        stats.paths_overdue
-    );
-
-    let header = Paragraph::new(header_text)
-        .block(Block::default().borders(Borders::ALL).title("Overview"))
-        .style(Style::default());
-
-    frame.render_widget(header, area);
-}
-
-/// LEGACY: Old directory sorting function - superseded by `sort_file_rows` in US-027.
-#[allow(dead_code)]
-fn sort_directory_rows(rows: &mut [(crate::db::Directory, Option<i64>)], sort_mode: SortMode) {
-    match sort_mode {
-        SortMode::Expiration => {
-            // Ascending (most urgent first) - None sorts to beginning
-            rows.sort_by(|a, b| a.1.cmp(&b.1));
-        }
-        SortMode::Size => {
-            // Descending (largest first)
-            rows.sort_by(|a, b| b.0.size_bytes.cmp(&a.0.size_bytes));
-        }
-        SortMode::Name => {
-            // Alphabetical ascending
-            rows.sort_by(|a, b| a.0.path.cmp(&b.0.path));
-        }
-        SortMode::Modified => {
-            // Descending (most recent first = highest oldest_mtime first)
-            // Note: oldest_mtime represents the oldest file in each directory
-            rows.sort_by(|a, b| {
-                match (a.0.oldest_mtime, b.0.oldest_mtime) {
-                    (Some(mtime_a), Some(mtime_b)) => mtime_b.cmp(&mtime_a), // Descending
-                    (Some(_), None) => std::cmp::Ordering::Less,             // Some before None
-                    (None, Some(_)) => std::cmp::Ordering::Greater,          // None after Some
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
-            });
-        }
     }
 }
 
@@ -635,29 +613,35 @@ fn determine_row_style(status: &str, days_remaining: Option<i64>, warning_days: 
     }
 }
 
-/// Generate a visual indicator (symbol + color) for attention status.
+/// Generate a visual indicator (symbol + color) for attention status (for entries).
 ///
 /// Returns a tuple of (symbol, color) that signals when attention is needed:
 /// - `●` RED: Overdue (expired, requires immediate attention)
 /// - `⚠` YELLOW: Warning period (approaching expiration)
 /// - `—` GRAY: Ignored (won't expire, no action needed)
+/// - `📁` BLUE: Directory (no expiration)
 /// - ` ` (space): Safe, no attention needed
 ///
-/// For deferred files, the indicator is based on the deferral end date.
-fn expiration_indicator(
+/// For deferred entries, the indicator is based on the deferral end date.
+fn expiration_indicator_entry(
     status: &str,
     days_remaining: i64,
     warning_days: u32,
-    file: &crate::db::File,
+    entry: &crate::db::Entry,
 ) -> (&'static str, Color) {
-    // Ignored files show a dash — they won't expire
+    // Directories show a folder indicator
+    if entry.is_dir {
+        return (" ", Color::Blue);
+    }
+
+    // Ignored entries show a dash — they won't expire
     if status == "ignored" {
         return ("—", Color::DarkGray);
     }
 
-    // Deferred files: calculate days until deferral expires
+    // Deferred entries: calculate days until deferral expires
     let effective_days = if status == "deferred" {
-        if let Some(deferred_until) = file.deferred_until {
+        if let Some(deferred_until) = entry.deferred_until {
             let now = jiff::Timestamp::now().as_second();
             (deferred_until - now) / 86400
         } else {
@@ -676,12 +660,12 @@ fn expiration_indicator(
     }
 }
 
-/// Generate header cells for the file table with sort indicators.
+/// Generate header cells for the entry table with sort indicators.
 ///
 /// The currently sorted column gets a triangle indicator:
 /// - `▲` for ascending sort (Name, Expiration)
 /// - `▼` for descending sort (Size, Modified)
-fn file_table_header_cells(sort_mode: SortMode) -> Vec<Cell<'static>> {
+fn entry_table_header_cells(sort_mode: SortMode) -> Vec<Cell<'static>> {
     let indicator_asc = " ▲";
     let indicator_desc = " ▼";
 
@@ -744,325 +728,6 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit_idx])
     }
-}
-
-/// LEGACY: Old directory detail view - superseded by file-centric layout in US-027.
-// Allow: Function kept for reference during transition. Will be removed in cleanup pass.
-#[allow(dead_code, clippy::too_many_lines)]
-fn render_directory_detail(
-    app: &App,
-    _config: &Config,
-    db: &Database,
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-) {
-    // Split into breadcrumb area and table area
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Breadcrumb header
-            Constraint::Min(0),    // File table
-        ])
-        .split(area);
-
-    // Get the current directory ID from app state
-    let Some(directory_id) = app.current_directory_id() else {
-        // No directory selected - show error message
-        let error_text = Paragraph::new("No directory selected. Press 'h' to go back.")
-            .block(Block::default().borders(Borders::ALL).title("Error"))
-            .style(Style::default().fg(Color::Red));
-        frame.render_widget(error_text, area);
-        return;
-    };
-
-    // Fetch files for this directory
-    let Ok(files) = db.list_files_by_directory(directory_id) else {
-        // Error loading files
-        let error_text = Paragraph::new("Error loading files from database")
-            .block(Block::default().borders(Borders::ALL).title("Error"))
-            .style(Style::default().fg(Color::Red));
-        frame.render_widget(error_text, area);
-        return;
-    };
-
-    // Get directory info for breadcrumb (using first file's path or fallback)
-    let directory_path = if let Some(first_file) = files.first() {
-        // Extract directory path from file path
-        std::path::Path::new(&first_file.path).parent().map_or_else(
-            || "Unknown".to_string(),
-            |p| p.to_string_lossy().to_string(),
-        )
-    } else {
-        // Try to get directory info from database
-        if let Ok(directories) = db.list_directories(None) {
-            directories
-                .iter()
-                .find(|d| d.id == directory_id)
-                .map_or_else(|| "Unknown".to_string(), |d| d.path.clone())
-        } else {
-            "Unknown".to_string()
-        }
-    };
-
-    // Render breadcrumb header
-    let breadcrumb = Paragraph::new(format!("Viewing: {directory_path}"))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Directory Details"),
-        )
-        .style(Style::default());
-    frame.render_widget(breadcrumb, chunks[0]);
-
-    // Sort files by size descending (largest first)
-    let mut sorted_files = files;
-    sorted_files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-
-    // Update list length for navigation
-    app.file_list_len.set(sorted_files.len());
-
-    // Clamp selected index to valid range
-    let selected_idx = if sorted_files.is_empty() {
-        0
-    } else {
-        app.file_selected_index().min(sorted_files.len() - 1)
-    };
-
-    // Build table rows
-    let rows: Vec<Row> = sorted_files
-        .iter()
-        .enumerate()
-        .map(|(idx, file)| {
-            // Extract filename from path
-            let filename = std::path::Path::new(&file.path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&file.path);
-            let filename_cell = Cell::from(filename);
-
-            // Format size
-            // Allow: size_bytes is guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
-            #[allow(clippy::cast_sign_loss)]
-            let size_cell = Cell::from(format_bytes(file.size_bytes as u64));
-
-            // Format modified time
-            let modified_str = match jiff::Timestamp::from_second(file.mtime) {
-                Ok(timestamp) => {
-                    // Format as YYYY-MM-DD HH:MM
-                    timestamp
-                        .to_zoned(jiff::tz::TimeZone::system())
-                        .strftime("%Y-%m-%d %H:%M")
-                        .to_string()
-                }
-                Err(_) => "Invalid date".to_string(),
-            };
-            let modified_cell = Cell::from(modified_str);
-
-            // Highlight selected row
-            let style = if idx == selected_idx {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-
-            Row::new(vec![filename_cell, size_cell, modified_cell]).style(style)
-        })
-        .collect();
-
-    // Empty state message
-    if rows.is_empty() {
-        let empty_text = Paragraph::new("No files in this directory")
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Files (by size)"),
-            )
-            .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(empty_text, chunks[1]);
-        return;
-    }
-
-    // Build table
-    let widths = [
-        Constraint::Percentage(50), // Filename
-        Constraint::Percentage(20), // Size
-        Constraint::Percentage(30), // Modified
-    ];
-
-    let table = Table::new(rows, widths)
-        .block(
-            Block::default()
-                .title("Files (by size)")
-                .borders(Borders::ALL),
-        )
-        .header(
-            Row::new(vec![
-                Cell::from("Filename"),
-                Cell::from("Size"),
-                Cell::from("Modified"),
-            ])
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .bottom_margin(1),
-        );
-
-    frame.render_widget(table, chunks[1]);
-}
-
-/// LEGACY: Old pending approvals view - superseded by file-centric layout in US-027.
-// Allow: Function kept for reference during transition. Will be removed in cleanup pass.
-#[allow(dead_code, clippy::too_many_lines)]
-fn render_pending_approvals(
-    app: &App,
-    config: &Config,
-    db: &Database,
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-) {
-    // Split into header area and table area
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(0),    // Table
-        ])
-        .split(area);
-
-    // Fetch only pending directories from database
-    let Ok(directories) = db.list_directories(Some("pending")) else {
-        // Error handling: show error message
-        let error_text = Paragraph::new("Error loading directories from database")
-            .block(Block::default().borders(Borders::ALL).title("Error"))
-            .style(Style::default().fg(Color::Red));
-        frame.render_widget(error_text, area);
-        return;
-    };
-
-    // Render header showing pending count
-    render_pending_header(directories.len(), frame, chunks[0]);
-
-    // Handle empty state
-    if directories.is_empty() {
-        let empty_text = Paragraph::new(
-            "No pending directories.\n\nPress 'q' or Esc to return to directory list.",
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Pending Approvals"),
-        )
-        .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(empty_text, chunks[1]);
-        return;
-    }
-
-    // Prepare directory rows with calculated expiration
-    let mut dir_rows: Vec<_> = directories
-        .into_iter()
-        .map(|dir| {
-            let days_remaining = dir
-                .oldest_mtime
-                .map(|mtime| calculate_expiration(mtime, config.expiration_days));
-            (dir, days_remaining)
-        })
-        .collect();
-
-    // Sort based on current sort mode
-    sort_directory_rows(&mut dir_rows, app.sort_mode());
-
-    // Update list length for navigation
-    app.sidebar_len.set(dir_rows.len());
-
-    // Clamp selected index to valid range
-    let selected_idx = app.sidebar_selected_index().min(dir_rows.len() - 1);
-
-    // Set current directory ID for potential actions
-    if let Some((dir, _)) = dir_rows.get(selected_idx) {
-        app.current_directory_id.set(Some(dir.id));
-    }
-
-    // Build table rows
-    let rows: Vec<Row> = dir_rows
-        .iter()
-        .enumerate()
-        .map(|(idx, (dir, days_remaining))| {
-            let path_cell = Cell::from(dir.path.as_str());
-            // Allow: size_bytes is guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
-            #[allow(clippy::cast_sign_loss)]
-            let size_cell = Cell::from(format_bytes(dir.size_bytes as u64));
-
-            let expires_str = days_remaining.map_or_else(
-                || "N/A".to_string(),
-                |days| {
-                    if days >= 0 {
-                        format!("{days} days")
-                    } else {
-                        format!("{} days ago", -days)
-                    }
-                },
-            );
-            let expires_cell = Cell::from(expires_str);
-
-            let status_cell = Cell::from(dir.status.as_str());
-
-            // Determine row color based on status and expiration
-            let row_style = determine_row_style(&dir.status, *days_remaining, config.warning_days);
-
-            // Highlight selected row
-            let style = if idx == selected_idx {
-                row_style.add_modifier(Modifier::REVERSED)
-            } else {
-                row_style
-            };
-
-            Row::new(vec![path_cell, size_cell, expires_cell, status_cell]).style(style)
-        })
-        .collect();
-
-    // Build table
-    let widths = [
-        Constraint::Percentage(50), // Path
-        Constraint::Percentage(15), // Size
-        Constraint::Percentage(20), // Expires
-        Constraint::Percentage(15), // Status
-    ];
-
-    let sort_indicator = match app.sort_mode() {
-        SortMode::Expiration => " (by expiration)",
-        SortMode::Size => " (by size)",
-        SortMode::Name => " (by name)",
-        SortMode::Modified => " (by modified)",
-    };
-
-    let table = Table::new(rows, widths)
-        .block(
-            Block::default()
-                .title(format!("Pending Approvals{sort_indicator}"))
-                .borders(Borders::ALL),
-        )
-        .header(
-            Row::new(vec![
-                Cell::from("Path"),
-                Cell::from("Size"),
-                Cell::from("Expires"),
-                Cell::from("Status"),
-            ])
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .bottom_margin(1),
-        );
-
-    frame.render_widget(table, chunks[1]);
-}
-
-/// LEGACY: Header for old pending approvals view - no longer used.
-#[allow(dead_code)]
-fn render_pending_header(pending_count: usize, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let header_text = format!("Pending directories awaiting approval: {pending_count}");
-
-    let header = Paragraph::new(header_text)
-        .block(Block::default().borders(Borders::ALL).title("Overview"))
-        .style(Style::default());
-
-    frame.render_widget(header, area);
 }
 
 /// Render the audit log view.
@@ -1231,19 +896,16 @@ Press any key to close this help screen";
 /// Render the footer with context-sensitive keybinding hints.
 fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Check if any modal is open (takes precedence over normal view hints)
-    let modal_open = app.pending_approval().is_some()
-        || app.pending_deferral().is_some()
-        || app.pending_ignore().is_some()
-        || app.pending_file_delete().is_some()
-        || app.pending_file_deferral().is_some()
-        || app.pending_file_ignore().is_some()
-        || app.pending_file_approval().is_some()
+    let modal_open = app.pending_entry_delete().is_some()
+        || app.pending_entry_deferral().is_some()
+        || app.pending_entry_ignore().is_some()
+        || app.pending_entry_approval().is_some()
         || app.pending_add_path().is_some()
         || app.pending_remove_path().is_some();
 
     let hints = if modal_open {
         // When a modal is open, show appropriate modal controls
-        if app.pending_deferral().is_some() || app.pending_file_deferral().is_some() {
+        if app.pending_entry_deferral().is_some() {
             "[0-9] Enter days [Backspace] Delete [Enter] Confirm [Esc] Cancel".to_string()
         } else if app.pending_add_path().is_some() {
             "[Type path] (supports ~) [Backspace] Delete [Enter] Add [Esc] Cancel".to_string()
@@ -1254,7 +916,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         // Show context-sensitive hints based on current view and state
         match app.view() {
             View::FileList => {
-                let selection_count = app.selected_files().len();
+                let selection_count = app.selected_entries().len();
 
                 if selection_count > 0 {
                     // When files are selected, show multi-select action hints
@@ -1386,11 +1048,11 @@ fn render_deferral_modal(
     frame.render_widget(modal, modal_area);
 }
 
-/// Render a file deletion confirmation modal.
+/// Render an entry deletion confirmation modal.
 ///
 /// Displays a centered modal prompting the user to confirm deletion
-/// of the selected file.
-fn render_file_delete_modal(frame: &mut Frame, path: &str) {
+/// of the selected entry (file or directory).
+fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool) {
     use ratatui::layout::{Alignment, Rect};
 
     // Calculate centered rectangle for modal (50% width, 7 lines height)
@@ -1408,8 +1070,47 @@ fn render_file_delete_modal(frame: &mut Frame, path: &str) {
     };
 
     // Create the modal content
-    let title = "Delete File";
-    let message = format!("Delete file:\n\n{path}\n\n(y/n)");
+    let (title, type_name) = if is_dir {
+        ("Delete Directory", "directory")
+    } else {
+        ("Delete File", "file")
+    };
+    let message = format!("Delete {type_name}:\n\n{path}\n\n(y/n)");
+
+    let modal = Paragraph::new(message)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
+    frame.render_widget(modal, modal_area);
+}
+
+/// Render a multi-entry deletion confirmation modal.
+fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize) {
+    use ratatui::layout::{Alignment, Rect};
+
+    let area = frame.area();
+    let modal_width = area.width / 2;
+    let modal_height = 7;
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    let title = format!("Delete {count} Entries");
+    let message = format!("Delete {count} entries?\n\n(y/n)");
 
     let modal = Paragraph::new(message)
         .block(
@@ -1536,41 +1237,6 @@ fn render_confirmation_modal_multi(frame: &mut Frame, count: usize) {
     frame.render_widget(modal, modal_area);
 }
 
-/// Render a multi-file deletion confirmation modal.
-fn render_file_delete_modal_multi(frame: &mut Frame, count: usize) {
-    use ratatui::layout::{Alignment, Rect};
-
-    let area = frame.area();
-    let modal_width = area.width / 2;
-    let modal_height = 7;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
-    let title = format!("Delete {count} Files");
-    let message = format!("Delete {count} files?\n\n(y/n)");
-
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
-}
-
 /// Render add path text input modal.
 ///
 /// Displays a centered modal prompting the user to enter a path to add to `tracked_paths`.
@@ -1655,255 +1321,15 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
 mod tests {
     use super::*;
 
-    // Helper to create a minimal Directory for testing
-    fn test_directory(path: &str, size_bytes: i64) -> crate::db::Directory {
+    // Helper to create a minimal Entry for testing (file)
+    fn test_entry(path: &str, size_bytes: i64, mtime: Option<i64>) -> crate::db::Entry {
         let now = jiff::Timestamp::now().as_second();
-        crate::db::Directory {
+        crate::db::Entry {
             id: 0,
+            root_id: 1,
             path: path.to_string(),
-            size_bytes,
-            file_count: 0,
-            oldest_mtime: None,
-            last_scanned: Some(now),
-            status: "tracked".to_string(),
-            deferred_until: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    // Helper to create a Directory with custom oldest_mtime for testing
-    fn test_directory_with_mtime(
-        path: &str,
-        size_bytes: i64,
-        oldest_mtime: Option<i64>,
-    ) -> crate::db::Directory {
-        let now = jiff::Timestamp::now().as_second();
-        crate::db::Directory {
-            id: 0,
-            path: path.to_string(),
-            size_bytes,
-            file_count: 0,
-            oldest_mtime,
-            last_scanned: Some(now),
-            status: "tracked".to_string(),
-            deferred_until: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    // Tests for sort_directory_rows
-
-    #[test]
-    fn sort_by_expiration_most_urgent_first() {
-        let mut rows = vec![
-            (test_directory("/c", 100), Some(30)), // 30 days remaining
-            (test_directory("/a", 200), Some(5)),  // 5 days remaining (most urgent)
-            (test_directory("/b", 150), Some(15)), // 15 days remaining
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Expiration);
-
-        assert_eq!(rows[0].0.path, "/a", "Most urgent (5 days) should be first");
-        assert_eq!(
-            rows[1].0.path, "/b",
-            "Middle urgency (15 days) should be second"
-        );
-        assert_eq!(
-            rows[2].0.path, "/c",
-            "Least urgent (30 days) should be last"
-        );
-    }
-
-    #[test]
-    fn sort_by_expiration_none_sorts_to_beginning() {
-        let mut rows = vec![
-            (test_directory("/c", 100), Some(30)),
-            (test_directory("/a", 200), Some(5)),
-            (test_directory("/d", 50), None), // No mtime
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Expiration);
-
-        assert_eq!(
-            rows[0].0.path, "/d",
-            "Directory with no mtime (None) should sort to beginning"
-        );
-        assert_eq!(rows[1].0.path, "/a", "Most urgent should be second");
-        assert_eq!(rows[2].0.path, "/c", "Least urgent should be last");
-    }
-
-    #[test]
-    fn sort_by_expiration_handles_negative_values() {
-        let mut rows = vec![
-            (test_directory("/a", 100), Some(-10)), // Overdue by 10 days
-            (test_directory("/b", 100), Some(5)),   // 5 days remaining
-            (test_directory("/c", 100), Some(-30)), // Overdue by 30 days
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Expiration);
-
-        assert_eq!(
-            rows[0].0.path, "/c",
-            "Most overdue (-30) should be first (most urgent)"
-        );
-        assert_eq!(rows[1].0.path, "/a", "Less overdue (-10) should be second");
-        assert_eq!(rows[2].0.path, "/b", "Not overdue (5) should be last");
-    }
-
-    #[test]
-    fn sort_by_size_largest_first() {
-        let mut rows = vec![
-            (test_directory("/a", 100), Some(10)),
-            (test_directory("/b", 500), Some(10)),
-            (test_directory("/c", 250), Some(10)),
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Size);
-
-        assert_eq!(rows[0].0.path, "/b", "Largest (500) should be first");
-        assert_eq!(rows[1].0.path, "/c", "Middle (250) should be second");
-        assert_eq!(rows[2].0.path, "/a", "Smallest (100) should be last");
-    }
-
-    #[test]
-    fn sort_by_name_alphabetical() {
-        let mut rows = vec![
-            (test_directory("/zebra", 100), Some(10)),
-            (test_directory("/alpha", 100), Some(10)),
-            (test_directory("/mango", 100), Some(10)),
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Name);
-
-        assert_eq!(rows[0].0.path, "/alpha", "Alpha should be first");
-        assert_eq!(rows[1].0.path, "/mango", "Mango should be second");
-        assert_eq!(rows[2].0.path, "/zebra", "Zebra should be last");
-    }
-
-    #[test]
-    fn sort_empty_list_does_not_panic() {
-        let mut rows: Vec<(crate::db::Directory, Option<i64>)> = vec![];
-
-        // Should not panic for any sort mode
-        sort_directory_rows(&mut rows, SortMode::Expiration);
-        sort_directory_rows(&mut rows, SortMode::Size);
-        sort_directory_rows(&mut rows, SortMode::Name);
-        sort_directory_rows(&mut rows, SortMode::Modified);
-
-        assert_eq!(rows.len(), 0, "Empty list should remain empty");
-    }
-
-    #[test]
-    fn sort_single_item_is_trivial() {
-        let mut rows = vec![(test_directory("/only", 100), Some(10))];
-
-        sort_directory_rows(&mut rows, SortMode::Expiration);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0.path, "/only");
-
-        sort_directory_rows(&mut rows, SortMode::Size);
-        assert_eq!(rows[0].0.path, "/only");
-
-        sort_directory_rows(&mut rows, SortMode::Name);
-        assert_eq!(rows[0].0.path, "/only");
-
-        sort_directory_rows(&mut rows, SortMode::Modified);
-        assert_eq!(rows[0].0.path, "/only");
-    }
-
-    #[test]
-    fn sort_by_expiration_with_equal_values() {
-        let mut rows = vec![
-            (test_directory("/c", 100), Some(10)),
-            (test_directory("/a", 200), Some(10)),
-            (test_directory("/b", 150), Some(10)),
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Expiration);
-
-        // All have same expiration, so order is stable (depends on Rust's stable sort)
-        // Just verify they're all still present
-        assert_eq!(rows.len(), 3);
-        assert!(rows.iter().any(|(d, _)| d.path == "/a"));
-        assert!(rows.iter().any(|(d, _)| d.path == "/b"));
-        assert!(rows.iter().any(|(d, _)| d.path == "/c"));
-    }
-
-    #[test]
-    fn sort_by_size_with_equal_values() {
-        let mut rows = vec![
-            (test_directory("/c", 100), Some(10)),
-            (test_directory("/a", 100), Some(10)),
-            (test_directory("/b", 100), Some(10)),
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Size);
-
-        // All have same size, so order is stable
-        assert_eq!(rows.len(), 3);
-        assert!(rows.iter().any(|(d, _)| d.path == "/a"));
-        assert!(rows.iter().any(|(d, _)| d.path == "/b"));
-        assert!(rows.iter().any(|(d, _)| d.path == "/c"));
-    }
-
-    #[test]
-    fn sort_directory_by_modified_most_recent_first() {
-        let mut rows = vec![
-            (test_directory_with_mtime("/a", 100, Some(1000)), Some(10)), // Oldest
-            (test_directory_with_mtime("/b", 100, Some(5000)), Some(10)), // Most recent
-            (test_directory_with_mtime("/c", 100, Some(3000)), Some(10)), // Middle
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Modified);
-
-        assert_eq!(rows[0].0.path, "/b", "Most recent (5000) should be first");
-        assert_eq!(rows[1].0.path, "/c", "Middle (3000) should be second");
-        assert_eq!(rows[2].0.path, "/a", "Oldest (1000) should be last");
-    }
-
-    #[test]
-    fn sort_directory_by_modified_none_sorts_to_end() {
-        let mut rows = vec![
-            (test_directory_with_mtime("/a", 100, Some(1000)), Some(10)),
-            (test_directory_with_mtime("/b", 100, None), Some(10)), // No mtime
-            (test_directory_with_mtime("/c", 100, Some(3000)), Some(10)),
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Modified);
-
-        assert_eq!(rows[0].0.path, "/c", "Most recent should be first");
-        assert_eq!(rows[1].0.path, "/a", "Older should be second");
-        assert_eq!(rows[2].0.path, "/b", "None should sort to end");
-    }
-
-    #[test]
-    fn sort_directory_by_modified_with_equal_values() {
-        let mut rows = vec![
-            (test_directory_with_mtime("/c", 100, Some(1000)), Some(10)),
-            (test_directory_with_mtime("/a", 200, Some(1000)), Some(10)),
-            (test_directory_with_mtime("/b", 150, Some(1000)), Some(10)),
-        ];
-
-        sort_directory_rows(&mut rows, SortMode::Modified);
-
-        // All have same oldest_mtime, so order is stable
-        assert_eq!(rows.len(), 3);
-        assert!(rows.iter().any(|(d, _)| d.path == "/a"));
-        assert!(rows.iter().any(|(d, _)| d.path == "/b"));
-        assert!(rows.iter().any(|(d, _)| d.path == "/c"));
-    }
-
-    // Tests for sort_file_rows (file-centric view)
-
-    // Helper to create a minimal File for testing
-    fn test_file(path: &str, size_bytes: i64, mtime: i64) -> crate::db::File {
-        let now = jiff::Timestamp::now().as_second();
-        crate::db::File {
-            id: 0,
-            directory_id: 1,
-            path: path.to_string(),
+            parent_path: "/".to_string(),
+            is_dir: false,
             size_bytes,
             mtime,
             tracked_since: Some(now),
@@ -1914,127 +1340,125 @@ mod tests {
         }
     }
 
+    // Helper to create a directory Entry for testing
+    fn test_entry_dir(path: &str) -> crate::db::Entry {
+        let now = jiff::Timestamp::now().as_second();
+        crate::db::Entry {
+            id: 0,
+            root_id: 1,
+            path: path.to_string(),
+            parent_path: "/".to_string(),
+            is_dir: true,
+            size_bytes: 0,
+            mtime: None,
+            tracked_since: Some(now),
+            status: "tracked".to_string(),
+            deferred_until: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // Tests for sort_entry_rows
+
     #[test]
-    fn sort_files_by_expiration_most_urgent_first() {
-        // Test file sorting by expiration (ascending, most urgent first)
+    fn sort_entries_by_expiration_most_urgent_first() {
         let mut rows = vec![
-            (test_file("/file_c.txt", 100, 1000), 30), // 30 days remaining
-            (test_file("/file_a.txt", 200, 5000), 5),  // 5 days remaining (most urgent)
-            (test_file("/file_b.txt", 150, 3000), 15), // 15 days remaining
+            (test_entry("/c.txt", 100, Some(1000)), 30), // 30 days remaining
+            (test_entry("/a.txt", 200, Some(5000)), 5),  // 5 days remaining (most urgent)
+            (test_entry("/b.txt", 150, Some(3000)), 15), // 15 days remaining
         ];
 
-        sort_file_rows(&mut rows, SortMode::Expiration);
+        sort_entry_rows(&mut rows, SortMode::Expiration);
 
         assert_eq!(
-            rows[0].0.path, "/file_a.txt",
+            rows[0].0.path, "/a.txt",
             "Most urgent (5 days) should be first"
         );
         assert_eq!(
-            rows[1].0.path, "/file_b.txt",
+            rows[1].0.path, "/b.txt",
             "Middle urgency (15 days) should be second"
         );
         assert_eq!(
-            rows[2].0.path, "/file_c.txt",
+            rows[2].0.path, "/c.txt",
             "Least urgent (30 days) should be last"
         );
     }
 
     #[test]
-    fn sort_files_by_size_largest_first() {
-        // Test file sorting by size (descending, largest first)
+    fn sort_entries_directories_sort_to_end_in_expiration() {
         let mut rows = vec![
-            (test_file("/file_a.txt", 100, 1000), 10),
-            (test_file("/file_b.txt", 500, 1000), 10),
-            (test_file("/file_c.txt", 250, 1000), 10),
+            (test_entry("/a.txt", 100, Some(1000)), 5),
+            (test_entry_dir("/subdir"), i64::MAX),
+            (test_entry("/b.txt", 100, Some(1000)), 10),
         ];
 
-        sort_file_rows(&mut rows, SortMode::Size);
+        sort_entry_rows(&mut rows, SortMode::Expiration);
 
-        assert_eq!(
-            rows[0].0.path, "/file_b.txt",
-            "Largest (500) should be first"
-        );
-        assert_eq!(
-            rows[1].0.path, "/file_c.txt",
-            "Middle (250) should be second"
-        );
-        assert_eq!(
-            rows[2].0.path, "/file_a.txt",
-            "Smallest (100) should be last"
-        );
+        assert_eq!(rows[0].0.path, "/a.txt", "Most urgent file first");
+        assert_eq!(rows[1].0.path, "/b.txt", "Less urgent file second");
+        assert_eq!(rows[2].0.path, "/subdir", "Directory should sort to end");
     }
 
     #[test]
-    fn sort_files_by_name_alphabetical() {
-        // Test file sorting by name (alphabetical ascending)
+    fn sort_entries_by_size_largest_first() {
         let mut rows = vec![
-            (test_file("/dir/zebra.txt", 100, 1000), 10),
-            (test_file("/dir/alpha.txt", 100, 1000), 10),
-            (test_file("/dir/mango.txt", 100, 1000), 10),
+            (test_entry("/a.txt", 100, Some(1000)), 10),
+            (test_entry("/b.txt", 500, Some(1000)), 10),
+            (test_entry("/c.txt", 250, Some(1000)), 10),
         ];
 
-        sort_file_rows(&mut rows, SortMode::Name);
+        sort_entry_rows(&mut rows, SortMode::Size);
 
-        assert_eq!(rows[0].0.path, "/dir/alpha.txt", "Alpha should be first");
-        assert_eq!(rows[1].0.path, "/dir/mango.txt", "Mango should be second");
-        assert_eq!(rows[2].0.path, "/dir/zebra.txt", "Zebra should be last");
+        assert_eq!(rows[0].0.path, "/b.txt", "Largest (500) should be first");
+        assert_eq!(rows[1].0.path, "/c.txt", "Middle (250) should be second");
+        assert_eq!(rows[2].0.path, "/a.txt", "Smallest (100) should be last");
     }
 
     #[test]
-    fn sort_files_by_modified_most_recent_first() {
-        // Test file sorting by modification time (descending, most recent first)
-        // mtime is Unix timestamp, so higher value = more recent
+    fn sort_entries_by_name_alphabetical_dirs_first() {
         let mut rows = vec![
-            (test_file("/file_a.txt", 100, 1000), 10), // Oldest
-            (test_file("/file_b.txt", 100, 5000), 10), // Most recent
-            (test_file("/file_c.txt", 100, 3000), 10), // Middle
+            (test_entry("/zebra.txt", 100, Some(1000)), 10),
+            (test_entry_dir("/alpha_dir"), i64::MAX),
+            (test_entry("/mango.txt", 100, Some(1000)), 10),
         ];
 
-        sort_file_rows(&mut rows, SortMode::Modified);
+        sort_entry_rows(&mut rows, SortMode::Name);
 
-        assert_eq!(
-            rows[0].0.path, "/file_b.txt",
-            "Most recent (5000) should be first"
-        );
-        assert_eq!(
-            rows[1].0.path, "/file_c.txt",
-            "Middle (3000) should be second"
-        );
-        assert_eq!(
-            rows[2].0.path, "/file_a.txt",
-            "Oldest (1000) should be last"
-        );
+        assert_eq!(rows[0].0.path, "/alpha_dir", "Directory should come first");
+        assert_eq!(rows[1].0.path, "/mango.txt", "Mango should be second");
+        assert_eq!(rows[2].0.path, "/zebra.txt", "Zebra should be last");
     }
 
     #[test]
-    fn sort_files_empty_list_does_not_panic() {
-        let mut rows: Vec<(crate::db::File, i64)> = vec![];
+    fn sort_entries_empty_list_does_not_panic() {
+        let mut rows: Vec<(crate::db::Entry, i64)> = vec![];
 
         // Should not panic for any sort mode
-        sort_file_rows(&mut rows, SortMode::Expiration);
-        sort_file_rows(&mut rows, SortMode::Size);
-        sort_file_rows(&mut rows, SortMode::Name);
-        sort_file_rows(&mut rows, SortMode::Modified);
+        sort_entry_rows(&mut rows, SortMode::Expiration);
+        sort_entry_rows(&mut rows, SortMode::Size);
+        sort_entry_rows(&mut rows, SortMode::Name);
+        sort_entry_rows(&mut rows, SortMode::Modified);
 
         assert_eq!(rows.len(), 0, "Empty list should remain empty");
     }
 
     #[test]
-    fn sort_files_by_modified_with_equal_values() {
-        // Test file sorting by modification time with equal mtime values
+    fn sort_entries_by_modified_most_recent_first() {
         let mut rows = vec![
-            (test_file("/file_c.txt", 100, 1000), 10),
-            (test_file("/file_a.txt", 200, 1000), 10),
-            (test_file("/file_b.txt", 150, 1000), 10),
+            (test_entry("/a.txt", 100, Some(1000)), 10), // Oldest
+            (test_entry("/b.txt", 100, Some(5000)), 10), // Most recent
+            (test_entry("/c.txt", 100, Some(3000)), 10), // Middle
         ];
 
-        sort_file_rows(&mut rows, SortMode::Modified);
+        sort_entry_rows(&mut rows, SortMode::Modified);
 
-        // All have same mtime, so order is stable (verify all present)
-        assert_eq!(rows.len(), 3);
-        assert!(rows.iter().any(|(f, _)| f.path == "/file_a.txt"));
-        assert!(rows.iter().any(|(f, _)| f.path == "/file_b.txt"));
-        assert!(rows.iter().any(|(f, _)| f.path == "/file_c.txt"));
+        assert_eq!(
+            rows[0].0.path, "/b.txt",
+            "Most recent (5000) should be first"
+        );
+        assert_eq!(rows[1].0.path, "/c.txt", "Middle (3000) should be second");
+        assert_eq!(rows[2].0.path, "/a.txt", "Oldest (1000) should be last");
     }
 
     // Tests for determine_row_style
@@ -2171,15 +1595,17 @@ mod tests {
         );
     }
 
-    // Tests for expiration_indicator
+    // Tests for expiration_indicator_entry
 
-    fn make_test_file(status: &str, deferred_until: Option<i64>) -> crate::db::File {
-        crate::db::File {
+    fn make_test_entry(status: &str, deferred_until: Option<i64>) -> crate::db::Entry {
+        crate::db::Entry {
             id: 1,
-            directory_id: 1,
+            root_id: 1,
             path: "/test/file.txt".to_string(),
+            parent_path: "/test".to_string(),
+            is_dir: false,
             size_bytes: 100,
-            mtime: 0,
+            mtime: Some(0),
             tracked_since: None,
             status: status.to_string(),
             deferred_until,
@@ -2189,67 +1615,70 @@ mod tests {
     }
 
     #[test]
-    fn expiration_indicator_overdue_is_red_circle() {
-        let file = make_test_file("tracked", None);
-        let (symbol, color) = expiration_indicator("tracked", 0, 14, &file);
+    fn expiration_indicator_entry_overdue_is_red_circle() {
+        let entry = make_test_entry("tracked", None);
+        let (symbol, color) = expiration_indicator_entry("tracked", 0, 14, &entry);
         assert_eq!(symbol, "●", "Overdue (0 days) should show filled circle");
         assert_eq!(color, Color::Red, "Overdue should be red");
 
-        let (symbol, color) = expiration_indicator("tracked", -5, 14, &file);
+        let (symbol, color) = expiration_indicator_entry("tracked", -5, 14, &entry);
         assert_eq!(symbol, "●", "Negative days should show filled circle");
         assert_eq!(color, Color::Red, "Overdue should be red");
     }
 
     #[test]
-    fn expiration_indicator_within_warning_is_yellow_triangle() {
-        let file = make_test_file("tracked", None);
-        let (symbol, color) = expiration_indicator("tracked", 1, 14, &file);
+    fn expiration_indicator_entry_within_warning_is_yellow_triangle() {
+        let entry = make_test_entry("tracked", None);
+        let (symbol, color) = expiration_indicator_entry("tracked", 1, 14, &entry);
         assert_eq!(symbol, "⚠", "1 day remaining should show warning triangle");
         assert_eq!(color, Color::Yellow, "Warning should be yellow");
 
-        let (symbol, color) = expiration_indicator("tracked", 14, 14, &file);
+        let (symbol, color) = expiration_indicator_entry("tracked", 14, 14, &entry);
         assert_eq!(symbol, "⚠", "At warning threshold should show warning");
         assert_eq!(color, Color::Yellow, "Warning should be yellow");
     }
 
     #[test]
-    fn expiration_indicator_safe_is_empty() {
-        let file = make_test_file("tracked", None);
-        let (symbol, color) = expiration_indicator("tracked", 15, 14, &file);
-        assert_eq!(symbol, " ", "Safe files should show no indicator");
+    fn expiration_indicator_entry_safe_is_empty() {
+        let entry = make_test_entry("tracked", None);
+        let (symbol, color) = expiration_indicator_entry("tracked", 15, 14, &entry);
+        assert_eq!(symbol, " ", "Safe entries should show no indicator");
         assert_eq!(color, Color::Reset, "Safe should use reset color");
 
-        let (symbol, _) = expiration_indicator("tracked", 90, 14, &file);
-        assert_eq!(symbol, " ", "Very safe files should show no indicator");
+        let (symbol, _) = expiration_indicator_entry("tracked", 90, 14, &entry);
+        assert_eq!(symbol, " ", "Very safe entries should show no indicator");
     }
 
     #[test]
-    fn expiration_indicator_ignored_is_gray_dash() {
-        let file = make_test_file("ignored", None);
-        let (symbol, color) = expiration_indicator("ignored", -30, 14, &file);
-        assert_eq!(symbol, "—", "Ignored files should show dash");
+    fn expiration_indicator_entry_ignored_is_gray_dash() {
+        let entry = make_test_entry("ignored", None);
+        let (symbol, color) = expiration_indicator_entry("ignored", -30, 14, &entry);
+        assert_eq!(symbol, "—", "Ignored entries should show dash");
         assert_eq!(color, Color::DarkGray, "Ignored should be gray");
 
-        // Even if "overdue", ignored files show dash
-        let (symbol, _) = expiration_indicator("ignored", 0, 14, &file);
-        assert_eq!(symbol, "—", "Ignored overdue files should still show dash");
+        // Even if "overdue", ignored entries show dash
+        let (symbol, _) = expiration_indicator_entry("ignored", 0, 14, &entry);
+        assert_eq!(
+            symbol, "—",
+            "Ignored overdue entries should still show dash"
+        );
     }
 
     #[test]
-    fn expiration_indicator_deferred_uses_deferred_until() {
-        // Deferred file with plenty of time on deferral
+    fn expiration_indicator_entry_deferred_uses_deferred_until() {
+        // Deferred entry with plenty of time on deferral
         let future = jiff::Timestamp::now().as_second() + (30 * 86400); // 30 days from now
-        let file = make_test_file("deferred", Some(future));
-        let (symbol, _) = expiration_indicator("deferred", -100, 14, &file);
+        let entry = make_test_entry("deferred", Some(future));
+        let (symbol, _) = expiration_indicator_entry("deferred", -100, 14, &entry);
         assert_eq!(
             symbol, " ",
             "Deferred with time remaining should show no indicator"
         );
 
-        // Deferred file with deferral expiring soon
+        // Deferred entry with deferral expiring soon
         let soon = jiff::Timestamp::now().as_second() + (5 * 86400); // 5 days from now
-        let file = make_test_file("deferred", Some(soon));
-        let (symbol, color) = expiration_indicator("deferred", -100, 14, &file);
+        let entry = make_test_entry("deferred", Some(soon));
+        let (symbol, color) = expiration_indicator_entry("deferred", -100, 14, &entry);
         assert_eq!(symbol, "⚠", "Deferred expiring soon should show warning");
         assert_eq!(color, Color::Yellow);
     }
