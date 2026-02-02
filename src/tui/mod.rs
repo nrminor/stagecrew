@@ -73,16 +73,31 @@ pub struct App {
     /// Uses Cell for interior mutability since it's updated during rendering.
     pub(crate) current_directory_id: Cell<Option<i64>>,
 
-    /// Pending approval confirmation state.
-    /// Contains the file ID and path awaiting user confirmation for approval.
+    /// Pending approval confirmation state (legacy directory-level).
+    /// Contains the directory ID and path awaiting user confirmation for approval.
     pub(crate) pending_approval: Option<(i64, String)>,
 
-    /// Pending deferral input state.
+    /// Pending deferral input state (legacy directory-level).
     pub(crate) pending_deferral: Option<PendingDeferral>,
 
-    /// Pending ignore confirmation state.
-    /// Contains the file ID and path awaiting user confirmation for ignoring.
+    /// Pending ignore confirmation state (legacy directory-level).
+    /// Contains the directory ID and path awaiting user confirmation for ignoring.
     pub(crate) pending_ignore: Option<(i64, String)>,
+
+    /// Pending file deletion confirmation state.
+    /// Contains the file ID and path awaiting user confirmation for deletion.
+    pub(crate) pending_file_delete: Option<(i64, String)>,
+
+    /// Pending file deferral input state.
+    pub(crate) pending_file_deferral: Option<PendingDeferral>,
+
+    /// Pending file ignore confirmation state.
+    /// Contains the file ID and path awaiting user confirmation for ignoring.
+    pub(crate) pending_file_ignore: Option<(i64, String)>,
+
+    /// Pending file approval confirmation state.
+    /// Contains the file ID and path awaiting user confirmation for approval.
+    pub(crate) pending_file_approval: Option<(i64, String)>,
 }
 
 impl App {
@@ -136,6 +151,26 @@ impl App {
     /// Get the pending ignore confirmation state.
     pub fn pending_ignore(&self) -> Option<&(i64, String)> {
         self.pending_ignore.as_ref()
+    }
+
+    /// Get the pending file deletion confirmation state.
+    pub fn pending_file_delete(&self) -> Option<&(i64, String)> {
+        self.pending_file_delete.as_ref()
+    }
+
+    /// Get the pending file deferral input state.
+    pub fn pending_file_deferral(&self) -> Option<&PendingDeferral> {
+        self.pending_file_deferral.as_ref()
+    }
+
+    /// Get the pending file ignore confirmation state.
+    pub fn pending_file_ignore(&self) -> Option<&(i64, String)> {
+        self.pending_file_ignore.as_ref()
+    }
+
+    /// Get the pending file approval confirmation state.
+    pub fn pending_file_approval(&self) -> Option<&(i64, String)> {
+        self.pending_file_approval.as_ref()
     }
 
     /// Select the last item in the sidebar.
@@ -258,6 +293,10 @@ impl App {
             pending_approval: None,
             pending_deferral: None,
             pending_ignore: None,
+            pending_file_delete: None,
+            pending_file_deferral: None,
+            pending_file_ignore: None,
+            pending_file_approval: None,
         }
     }
 
@@ -381,6 +420,22 @@ mod tests {
         assert_eq!(
             app.pending_ignore, None,
             "App should start with no pending ignore"
+        );
+        assert_eq!(
+            app.pending_file_delete, None,
+            "App should start with no pending file delete"
+        );
+        assert_eq!(
+            app.pending_file_deferral, None,
+            "App should start with no pending file deferral"
+        );
+        assert_eq!(
+            app.pending_file_ignore, None,
+            "App should start with no pending file ignore"
+        );
+        assert_eq!(
+            app.pending_file_approval, None,
+            "App should start with no pending file approval"
         );
     }
 

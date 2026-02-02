@@ -28,7 +28,11 @@ CREATE TABLE IF NOT EXISTS files (
     size_bytes INTEGER NOT NULL,
     mtime INTEGER NOT NULL,  -- Unix timestamp
     tracked_since INTEGER,  -- Unix timestamp when first added, NULL for legacy files
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+    status TEXT NOT NULL DEFAULT 'tracked'
+        CHECK (status IN ('tracked', 'pending', 'approved', 'deferred', 'ignored', 'removed', 'blocked')),
+    deferred_until INTEGER,  -- Unix timestamp, NULL if not deferred
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
 );
 
 -- Audit trail for all actions

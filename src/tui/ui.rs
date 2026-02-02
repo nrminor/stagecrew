@@ -56,6 +56,31 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     if let Some((_, path)) = app.pending_ignore() {
         render_ignore_modal(frame, path);
     }
+
+    // Render file deletion confirmation modal if pending file delete
+    if let Some((_, path)) = app.pending_file_delete() {
+        render_file_delete_modal(frame, path);
+    }
+
+    // Render file deferral input modal if pending file deferral
+    if let Some(deferral) = app.pending_file_deferral() {
+        render_deferral_modal(
+            frame,
+            &deferral.path,
+            &deferral.input,
+            deferral.default_days,
+        );
+    }
+
+    // Render file ignore confirmation modal if pending file ignore
+    if let Some((_, path)) = app.pending_file_ignore() {
+        render_ignore_modal(frame, path);
+    }
+
+    // Render file approval confirmation modal if pending file approval
+    if let Some((_, path)) = app.pending_file_approval() {
+        render_confirmation_modal(frame, path);
+    }
 }
 
 /// Render the file list view with sidebar.
@@ -1132,6 +1157,50 @@ fn render_deferral_modal(frame: &mut Frame, path: &str, input: &str, default_day
     frame.render_widget(modal, modal_area);
 }
 
+/// Render a file deletion confirmation modal.
+///
+/// Displays a centered modal prompting the user to confirm deletion
+/// of the selected file.
+fn render_file_delete_modal(frame: &mut Frame, path: &str) {
+    use ratatui::layout::{Alignment, Rect};
+
+    // Calculate centered rectangle for modal (50% width, 7 lines height)
+    let area = frame.area();
+    let modal_width = area.width / 2;
+    let modal_height = 7;
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    // Create the modal content
+    let title = "Delete File";
+    let message = format!("Delete file:\n\n{path}\n\n(y/n)");
+
+    let modal = Paragraph::new(message)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    // Clear the area behind the modal (create a simple background)
+    let background = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+
+    frame.render_widget(background, modal_area);
+    frame.render_widget(modal, modal_area);
+}
+
 /// Render an ignore confirmation modal for permanently exempting a path.
 ///
 /// Displays a centered modal prompting the user to confirm permanent exemption
@@ -1432,7 +1501,10 @@ mod tests {
             size_bytes,
             mtime,
             tracked_since: Some(now),
+            status: "tracked".to_string(),
+            deferred_until: None,
             created_at: now,
+            updated_at: now,
         }
     }
 

@@ -523,8 +523,8 @@
         "just check passes"
       ],
       "priority": 30,
-      "passes": false,
-      "notes": "Key insight from user: 'd' should mean delete (what users expect), 'r' for defer. The old TUI had directory-level actions only."
+      "passes": true,
+      "notes": "Completed: Implemented all four file-level actions (d=delete, r=defer, i=ignore, x=approve) with confirmation modals. Added status, deferred_until, updated_at columns to files table. Added database methods: update_file_status(), defer_file(), delete_file(). All actions record audit entries and update database status. 11 comprehensive tests added. Code reviews identified areas for future improvement: (1) PendingDeferral struct reuses directory_id field for file_id (misleading naming), (2) Seven optional pending action fields should be consolidated into an enum, (3) DRY violation in initiate_file_* functions (extract get_selected_file helper), (4) Error::Config misused for 'not found' errors. Testing gaps noted: audit entry verification tests, error path tests, focus guard tests for r/i/x keys. All acceptance criteria met. Semver-nag noted schema migration strategy needed for existing databases (document 'delete DB on upgrade' for 0.x)."
     },
     {
       "id": "US-031",

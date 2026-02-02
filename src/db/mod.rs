@@ -58,8 +58,14 @@ pub struct File {
     /// not its original mtime. This prevents old files from appearing overdue when
     /// first added. None for legacy files (defaults to mtime for backward compat).
     pub tracked_since: Option<i64>,
+    /// Current status in the lifecycle.
+    pub status: String,
+    /// Unix timestamp when deferral expires, or None if not deferred.
+    pub deferred_until: Option<i64>,
     /// Unix timestamp when record was created.
     pub created_at: i64,
+    /// Unix timestamp when record was last updated.
+    pub updated_at: i64,
 }
 
 /// Pre-computed statistics for shell hooks and status display.
@@ -230,7 +236,8 @@ impl Database {
              ON CONFLICT(path) DO UPDATE SET
                  directory_id = excluded.directory_id,
                  size_bytes = excluded.size_bytes,
-                 mtime = excluded.mtime",
+                 mtime = excluded.mtime,
+                 updated_at = strftime('%s', 'now')",
             (directory_id, path, size_bytes, mtime),
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -337,7 +344,7 @@ impl Database {
     /// Returns an error if the database query fails.
     pub fn list_files_by_directory(&self, directory_id: i64) -> Result<Vec<File>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, directory_id, path, size_bytes, mtime, tracked_since, created_at
+            "SELECT id, directory_id, path, size_bytes, mtime, tracked_since, status, deferred_until, created_at, updated_at
              FROM files
              WHERE directory_id = ?1
              ORDER BY path",
@@ -351,7 +358,10 @@ impl Database {
                 size_bytes: row.get(3)?,
                 mtime: row.get(4)?,
                 tracked_since: row.get(5)?,
-                created_at: row.get(6)?,
+                status: row.get(6)?,
+                deferred_until: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
             })
         })?;
 
@@ -388,6 +398,107 @@ impl Database {
                 "Directory with id {directory_id} not found"
             )));
         }
+
+        Ok(())
+    }
+
+    /// Update the status of a file.
+    ///
+    /// Changes the file's status and automatically updates the `updated_at`
+    /// timestamp to the current time.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_id` - The ID of the file to update
+    /// * `new_status` - The new status value
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The `file_id` does not exist
+    /// - The `new_status` violates the CHECK constraint
+    /// - The database operation fails
+    pub fn update_file_status(&self, file_id: i64, new_status: &str) -> Result<()> {
+        let rows_affected = self.conn.execute(
+            "UPDATE files
+             SET status = ?1, updated_at = strftime('%s', 'now')
+             WHERE id = ?2",
+            (new_status, file_id),
+        )?;
+
+        if rows_affected == 0 {
+            return Err(Error::Config(format!("File with id {file_id} not found")));
+        }
+
+        Ok(())
+    }
+
+    /// Update a file's deferral status.
+    ///
+    /// Sets the file's status to 'deferred' and records the `deferred_until` timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_id` - The ID of the file to defer
+    /// * `deferred_until` - Unix timestamp when the deferral expires
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The `file_id` does not exist
+    /// - The database operation fails
+    pub fn defer_file(&self, file_id: i64, deferred_until: i64) -> Result<()> {
+        let rows_affected = self.conn.execute(
+            "UPDATE files
+             SET status = 'deferred', deferred_until = ?1, updated_at = strftime('%s', 'now')
+             WHERE id = ?2",
+            (deferred_until, file_id),
+        )?;
+
+        if rows_affected == 0 {
+            return Err(Error::Config(format!("File with id {file_id} not found")));
+        }
+
+        Ok(())
+    }
+
+    /// Delete a file from the database and filesystem.
+    ///
+    /// Attempts to remove the file from the filesystem, then deletes the database
+    /// record regardless of filesystem result. Updates the file's status to 'removed'
+    /// before attempting deletion.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_id` - The ID of the file to delete
+    /// * `path` - The filesystem path to the file (for deletion)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the file was successfully deleted, or an error containing details
+    /// about filesystem failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The `file_id` does not exist
+    /// - The filesystem deletion fails (permission denied, path not found, etc.)
+    /// - The database operation fails
+    pub fn delete_file(&self, file_id: i64, path: &str) -> Result<()> {
+        // First, attempt to remove the file from the filesystem
+        if let Err(e) = std::fs::remove_file(path) {
+            // Map specific I/O errors to our error types
+            return Err(match e.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    Error::PermissionDenied(std::path::PathBuf::from(path))
+                }
+                std::io::ErrorKind::NotFound => Error::PathNotFound(std::path::PathBuf::from(path)),
+                _ => Error::Io(e),
+            });
+        }
+
+        // Update database status to 'removed'
+        self.update_file_status(file_id, "removed")?;
 
         Ok(())
     }

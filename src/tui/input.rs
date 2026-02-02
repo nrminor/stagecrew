@@ -23,7 +23,25 @@ impl InputHandler {
         }
     }
 
-    fn handle_file_list(app: &mut App, _config: &Config, _db: &Database, key: KeyEvent) {
+    fn handle_file_list(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+        // Check for pending confirmations/inputs first
+        if app.pending_file_delete.is_some() {
+            Self::handle_file_delete_confirmation(app, db, key);
+            return;
+        }
+        if app.pending_file_deferral.is_some() {
+            Self::handle_file_deferral_input(app, config, db, key);
+            return;
+        }
+        if app.pending_file_ignore.is_some() {
+            Self::handle_file_ignore_confirmation(app, db, key);
+            return;
+        }
+        if app.pending_file_approval.is_some() {
+            Self::handle_file_approval_confirmation(app, db, key);
+            return;
+        }
+
         match key.code {
             // Quit
             KeyCode::Char('q') => app.should_quit = true,
@@ -89,6 +107,20 @@ impl InputHandler {
                     SortMode::Name => SortMode::Modified,
                     SortMode::Modified => SortMode::Expiration,
                 };
+            }
+
+            // File-level actions (only when main panel is focused)
+            KeyCode::Char('d') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::initiate_file_delete(app, db);
+            }
+            KeyCode::Char('r') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::initiate_file_defer(app, config, db);
+            }
+            KeyCode::Char('i') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::initiate_file_ignore(app, db);
+            }
+            KeyCode::Char('x') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::initiate_file_approve(app, db);
             }
 
             // Views
@@ -296,6 +328,295 @@ impl InputHandler {
         let _ = key;
         app.view = View::FileList;
     }
+
+    /// Initiate file deletion by querying the database for the selected file.
+    fn initiate_file_delete(app: &mut App, db: &Database) {
+        // Get the currently selected directory ID
+        let Some(directory_id) = app.current_directory_id.get() else {
+            tracing::warn!("Cannot delete file: no directory selected");
+            return;
+        };
+
+        // Query files for this directory
+        let files = match db.list_files_by_directory(directory_id) {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!("Failed to query files: {}", e);
+                return;
+            }
+        };
+
+        // Get the selected file based on file_selected_index
+        let Some(file) = files.get(app.file_selected_index) else {
+            tracing::warn!("No file selected (index out of bounds)");
+            return;
+        };
+
+        // Set pending deletion state
+        app.pending_file_delete = Some((file.id, file.path.clone()));
+    }
+
+    /// Handle file deletion confirmation (y/n/Esc).
+    fn handle_file_delete_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                // User confirmed - perform the deletion
+                if let Some((file_id, path)) = &app.pending_file_delete {
+                    if let Err(e) = db.delete_file(*file_id, path) {
+                        tracing::warn!("Failed to delete file {}: {}", path, e);
+                    } else {
+                        // Record audit entry
+                        let audit = AuditService::new(db);
+                        let user = AuditService::current_user();
+                        let dir_id = app.current_directory_id.get();
+                        if let Err(e) = audit.record(
+                            &user,
+                            AuditAction::Remove,
+                            Some(path),
+                            Some("File deleted by user"),
+                            dir_id,
+                        ) {
+                            tracing::warn!("Failed to record audit entry for file deletion: {}", e);
+                        }
+                    }
+                }
+                // Clear pending deletion
+                app.pending_file_delete = None;
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                // Cancel deletion
+                app.pending_file_delete = None;
+            }
+            _ => {
+                // Ignore other keys during confirmation
+            }
+        }
+    }
+
+    /// Initiate file deferral by setting up the input state.
+    fn initiate_file_defer(app: &mut App, config: &Config, db: &Database) {
+        // Get the currently selected directory ID
+        let Some(directory_id) = app.current_directory_id.get() else {
+            tracing::warn!("Cannot defer file: no directory selected");
+            return;
+        };
+
+        // Query files for this directory
+        let files = match db.list_files_by_directory(directory_id) {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!("Failed to query files: {}", e);
+                return;
+            }
+        };
+
+        // Get the selected file based on file_selected_index
+        let Some(file) = files.get(app.file_selected_index) else {
+            tracing::warn!("No file selected (index out of bounds)");
+            return;
+        };
+
+        // Set pending deferral state (using file_id instead of directory_id)
+        app.pending_file_deferral = Some(super::PendingDeferral {
+            directory_id: file.id, // Note: reusing PendingDeferral struct, directory_id field holds file_id
+            path: file.path.clone(),
+            input: String::new(),
+            default_days: config.expiration_days,
+        });
+    }
+
+    /// Handle file deferral input (digits/backspace/enter/esc).
+    fn handle_file_deferral_input(app: &mut App, _config: &Config, db: &Database, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                // Append digit to input buffer
+                if let Some(ref mut deferral) = app.pending_file_deferral {
+                    deferral.input.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                // Remove last digit from input buffer
+                if let Some(ref mut deferral) = app.pending_file_deferral {
+                    deferral.input.pop();
+                }
+            }
+            KeyCode::Enter => {
+                // User confirmed - process the deferral
+                if let Some(deferral) = &app.pending_file_deferral {
+                    // Parse the input as days (or use default if empty)
+                    let days: u32 = if deferral.input.is_empty() {
+                        deferral.default_days
+                    } else if let Ok(parsed_days) = deferral.input.parse::<u32>() {
+                        if parsed_days == 0 {
+                            tracing::warn!("Invalid deferral period: must be > 0");
+                            app.pending_file_deferral = None;
+                            return;
+                        }
+                        parsed_days
+                    } else {
+                        tracing::warn!("Invalid deferral input: {}", deferral.input);
+                        app.pending_file_deferral = None;
+                        return;
+                    };
+
+                    // Calculate deferred_until timestamp
+                    let now = jiff::Timestamp::now();
+                    let days_i64 = i64::from(days);
+                    let deferred_until = now.as_second() + (days_i64 * 86400);
+
+                    // Update file status to 'deferred' and set deferred_until
+                    let file_id = deferral.directory_id; // Reusing directory_id field for file_id
+                    if let Err(e) = db.defer_file(file_id, deferred_until) {
+                        tracing::warn!("Failed to defer file {}: {}", deferral.path, e);
+                    } else {
+                        // Record audit entry
+                        let audit = AuditService::new(db);
+                        let user = AuditService::current_user();
+                        let details = Some(format!("Deferred for {days} days"));
+                        let dir_id = app.current_directory_id.get();
+                        if let Err(e) = audit.record(
+                            &user,
+                            AuditAction::Defer,
+                            Some(&deferral.path),
+                            details.as_deref(),
+                            dir_id,
+                        ) {
+                            tracing::warn!("Failed to record audit entry for file deferral: {}", e);
+                        }
+                    }
+                }
+                // Clear pending deferral
+                app.pending_file_deferral = None;
+            }
+            KeyCode::Esc => {
+                // Cancel deferral input
+                app.pending_file_deferral = None;
+            }
+            _ => {
+                // Ignore other keys during input
+            }
+        }
+    }
+
+    /// Initiate file ignore by setting up the confirmation state.
+    fn initiate_file_ignore(app: &mut App, db: &Database) {
+        // Get the currently selected directory ID
+        let Some(directory_id) = app.current_directory_id.get() else {
+            tracing::warn!("Cannot ignore file: no directory selected");
+            return;
+        };
+
+        // Query files for this directory
+        let files = match db.list_files_by_directory(directory_id) {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!("Failed to query files: {}", e);
+                return;
+            }
+        };
+
+        // Get the selected file based on file_selected_index
+        let Some(file) = files.get(app.file_selected_index) else {
+            tracing::warn!("No file selected (index out of bounds)");
+            return;
+        };
+
+        // Set pending ignore state
+        app.pending_file_ignore = Some((file.id, file.path.clone()));
+    }
+
+    /// Handle file ignore confirmation (y/n/Esc).
+    fn handle_file_ignore_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                // User confirmed - perform the ignore
+                if let Some((file_id, path)) = &app.pending_file_ignore {
+                    if let Err(e) = db.update_file_status(*file_id, "ignored") {
+                        tracing::warn!("Failed to ignore file {}: {}", path, e);
+                    } else {
+                        // Record audit entry
+                        let audit = AuditService::new(db);
+                        let user = AuditService::current_user();
+                        let dir_id = app.current_directory_id.get();
+                        if let Err(e) =
+                            audit.record(&user, AuditAction::Ignore, Some(path), None, dir_id)
+                        {
+                            tracing::warn!("Failed to record audit entry for file ignore: {}", e);
+                        }
+                    }
+                }
+                // Clear pending ignore
+                app.pending_file_ignore = None;
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                // Cancel ignore
+                app.pending_file_ignore = None;
+            }
+            _ => {
+                // Ignore other keys during confirmation
+            }
+        }
+    }
+
+    /// Initiate file approval by setting up the confirmation state.
+    fn initiate_file_approve(app: &mut App, db: &Database) {
+        // Get the currently selected directory ID
+        let Some(directory_id) = app.current_directory_id.get() else {
+            tracing::warn!("Cannot approve file: no directory selected");
+            return;
+        };
+
+        // Query files for this directory
+        let files = match db.list_files_by_directory(directory_id) {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!("Failed to query files: {}", e);
+                return;
+            }
+        };
+
+        // Get the selected file based on file_selected_index
+        let Some(file) = files.get(app.file_selected_index) else {
+            tracing::warn!("No file selected (index out of bounds)");
+            return;
+        };
+
+        // Set pending approval state
+        app.pending_file_approval = Some((file.id, file.path.clone()));
+    }
+
+    /// Handle file approval confirmation (y/n/Esc).
+    fn handle_file_approval_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                // User confirmed - perform the approval
+                if let Some((file_id, path)) = &app.pending_file_approval {
+                    if let Err(e) = db.update_file_status(*file_id, "approved") {
+                        tracing::warn!("Failed to approve file {}: {}", path, e);
+                    } else {
+                        // Record audit entry
+                        let audit = AuditService::new(db);
+                        let user = AuditService::current_user();
+                        let dir_id = app.current_directory_id.get();
+                        if let Err(e) =
+                            audit.record(&user, AuditAction::Approve, Some(path), None, dir_id)
+                        {
+                            tracing::warn!("Failed to record audit entry for file approval: {}", e);
+                        }
+                    }
+                }
+                // Clear pending approval
+                app.pending_file_approval = None;
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                // Cancel approval
+                app.pending_file_approval = None;
+            }
+            _ => {
+                // Ignore other keys during confirmation
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,6 +624,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::db::Database;
+    use crate::tui::PendingDeferral;
     use tempfile::tempdir;
 
     fn make_key_event(code: KeyCode) -> KeyEvent {
@@ -547,5 +869,420 @@ mod tests {
             make_key_event_with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
         assert!(app.should_quit);
+    }
+
+    // ===== File-Level Action Tests =====
+
+    /// Helper to set up test with a directory and files in the database
+    fn setup_with_files(db: &Database) -> (i64, Vec<i64>) {
+        // Create a test directory
+        let dir_id = db
+            .insert_or_update_directory("/test/dir", 1000, 2, Some(100), 200)
+            .expect("Failed to create test directory");
+
+        // Insert two test files
+        let file1_id = db
+            .insert_or_update_file(dir_id, "/test/dir/file1.txt", 500, 100)
+            .expect("Failed to create file1");
+        let file2_id = db
+            .insert_or_update_file(dir_id, "/test/dir/file2.txt", 500, 150)
+            .expect("Failed to create file2");
+
+        (dir_id, vec![file1_id, file2_id])
+    }
+
+    #[test]
+    fn d_key_initiates_file_delete_confirmation() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, file_ids) = setup_with_files(&db);
+
+        // Set up app state to simulate viewing directory with first file selected
+        app.current_directory_id.set(Some(dir_id));
+        app.focus_panel = FocusPanel::MainPanel;
+        app.file_selected_index = 0;
+
+        // Press 'd' key
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('d')));
+
+        // Should set pending_file_delete with first file
+        assert!(
+            app.pending_file_delete.is_some(),
+            "pending_file_delete should be set"
+        );
+        let (file_id, path) = app
+            .pending_file_delete
+            .as_ref()
+            .expect("Expected pending delete");
+        assert_eq!(*file_id, file_ids[0], "Should be first file");
+        assert_eq!(path, "/test/dir/file1.txt", "Path should match first file");
+    }
+
+    #[test]
+    fn d_key_ignored_when_sidebar_focused() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, _file_ids) = setup_with_files(&db);
+
+        // Focus sidebar (not main panel)
+        app.current_directory_id.set(Some(dir_id));
+        app.focus_panel = FocusPanel::Sidebar;
+
+        // Press 'd' key
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('d')));
+
+        // Should NOT set pending_file_delete when sidebar is focused
+        assert!(
+            app.pending_file_delete.is_none(),
+            "pending_file_delete should not be set when sidebar focused"
+        );
+    }
+
+    #[test]
+    fn file_delete_confirmation_y_deletes_file() {
+        let (db, _db_dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Create a real temporary file for deletion
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let file_path = temp_dir.path().join("test_file.txt");
+        std::fs::write(&file_path, b"test content").expect("Failed to create temp file");
+
+        // Set up database with the real file path
+        let dir_id = db
+            .insert_or_update_directory(
+                temp_dir.path().to_str().expect("Invalid path"),
+                13,
+                1,
+                Some(100),
+                200,
+            )
+            .expect("Failed to create test directory");
+        let file_id = db
+            .insert_or_update_file(dir_id, file_path.to_str().expect("Invalid path"), 13, 100)
+            .expect("Failed to create file");
+
+        app.current_directory_id.set(Some(dir_id));
+
+        // Manually set pending delete (simulating 'd' key press)
+        app.pending_file_delete = Some((
+            file_id,
+            file_path.to_str().expect("Invalid path").to_string(),
+        ));
+
+        // Press 'y' to confirm
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));
+
+        // Should clear pending delete
+        assert!(
+            app.pending_file_delete.is_none(),
+            "pending_file_delete should be cleared"
+        );
+
+        // File should be marked as removed in database
+        let files = db
+            .list_files_by_directory(dir_id)
+            .expect("Failed to list files");
+        let file = files
+            .iter()
+            .find(|f| f.id == file_id)
+            .expect("File should still exist in DB");
+        assert_eq!(file.status, "removed", "File status should be 'removed'");
+
+        // File should be deleted from filesystem
+        assert!(
+            !file_path.exists(),
+            "File should be deleted from filesystem"
+        );
+    }
+
+    #[test]
+    fn file_delete_confirmation_n_cancels() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, file_ids) = setup_with_files(&db);
+        app.current_directory_id.set(Some(dir_id));
+
+        // Manually set pending delete
+        app.pending_file_delete = Some((file_ids[0], "/test/dir/file1.txt".to_string()));
+
+        // Press 'n' to cancel
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('n')));
+
+        // Should clear pending delete
+        assert!(
+            app.pending_file_delete.is_none(),
+            "pending_file_delete should be cleared"
+        );
+
+        // File should still be in tracked status
+        let files = db
+            .list_files_by_directory(dir_id)
+            .expect("Failed to list files");
+        let file = files
+            .iter()
+            .find(|f| f.id == file_ids[0])
+            .expect("File should exist");
+        assert_eq!(
+            file.status, "tracked",
+            "File status should remain 'tracked'"
+        );
+    }
+
+    #[test]
+    fn r_key_initiates_file_deferral() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, _file_ids) = setup_with_files(&db);
+
+        // Set up app state
+        app.current_directory_id.set(Some(dir_id));
+        app.focus_panel = FocusPanel::MainPanel;
+        app.file_selected_index = 0;
+
+        // Press 'r' key
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('r')));
+
+        // Should set pending_file_deferral
+        assert!(
+            app.pending_file_deferral.is_some(),
+            "pending_file_deferral should be set"
+        );
+        let deferral = app
+            .pending_file_deferral
+            .as_ref()
+            .expect("Expected deferral");
+        assert_eq!(deferral.path, "/test/dir/file1.txt");
+        assert_eq!(deferral.default_days, 90); // from test_config
+    }
+
+    #[test]
+    fn file_deferral_enter_confirms_with_default_days() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, file_ids) = setup_with_files(&db);
+        app.current_directory_id.set(Some(dir_id));
+
+        // Manually set pending deferral (empty input means use default)
+        app.pending_file_deferral = Some(PendingDeferral {
+            directory_id: file_ids[0], // Note: field name is misleading, it holds file_id
+            path: "/test/dir/file1.txt".to_string(),
+            input: String::new(),
+            default_days: 90,
+        });
+
+        // Press Enter to confirm
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+
+        // Should clear pending deferral
+        assert!(
+            app.pending_file_deferral.is_none(),
+            "pending_file_deferral should be cleared"
+        );
+
+        // File should be marked as deferred
+        let files = db
+            .list_files_by_directory(dir_id)
+            .expect("Failed to list files");
+        let file = files
+            .iter()
+            .find(|f| f.id == file_ids[0])
+            .expect("File should exist");
+        assert_eq!(file.status, "deferred", "File status should be 'deferred'");
+        assert!(
+            file.deferred_until.is_some(),
+            "deferred_until should be set"
+        );
+    }
+
+    #[test]
+    fn file_deferral_enter_confirms_with_custom_days() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, file_ids) = setup_with_files(&db);
+        app.current_directory_id.set(Some(dir_id));
+
+        // Manually set pending deferral with input
+        app.pending_file_deferral = Some(PendingDeferral {
+            directory_id: file_ids[0],
+            path: "/test/dir/file1.txt".to_string(),
+            input: "30".to_string(),
+            default_days: 90,
+        });
+
+        // Press Enter to confirm
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+
+        // Should clear pending deferral
+        assert!(
+            app.pending_file_deferral.is_none(),
+            "pending_file_deferral should be cleared"
+        );
+
+        // File should be deferred with calculated timestamp
+        let files = db
+            .list_files_by_directory(dir_id)
+            .expect("Failed to list files");
+        let file = files
+            .iter()
+            .find(|f| f.id == file_ids[0])
+            .expect("File should exist");
+        assert_eq!(file.status, "deferred");
+
+        // Verify deferred_until is approximately 30 days in the future
+        let now = jiff::Timestamp::now().as_second();
+        let days_30_secs = 30 * 86400;
+        let expected_until = now + days_30_secs;
+        let actual_until = file.deferred_until.expect("deferred_until should be set");
+        let diff = (actual_until - expected_until).abs();
+        assert!(
+            diff < 10,
+            "deferred_until should be approximately 30 days from now (diff: {diff})"
+        );
+    }
+
+    #[test]
+    fn i_key_initiates_file_ignore() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, file_ids) = setup_with_files(&db);
+
+        // Set up app state
+        app.current_directory_id.set(Some(dir_id));
+        app.focus_panel = FocusPanel::MainPanel;
+        app.file_selected_index = 0;
+
+        // Press 'i' key
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('i')));
+
+        // Should set pending_file_ignore
+        assert!(
+            app.pending_file_ignore.is_some(),
+            "pending_file_ignore should be set"
+        );
+        let (file_id, path) = app
+            .pending_file_ignore
+            .as_ref()
+            .expect("Expected pending ignore");
+        assert_eq!(*file_id, file_ids[0]);
+        assert_eq!(path, "/test/dir/file1.txt");
+    }
+
+    #[test]
+    fn file_ignore_confirmation_y_ignores_file() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, file_ids) = setup_with_files(&db);
+        app.current_directory_id.set(Some(dir_id));
+
+        // Manually set pending ignore
+        app.pending_file_ignore = Some((file_ids[0], "/test/dir/file1.txt".to_string()));
+
+        // Press 'y' to confirm
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));
+
+        // Should clear pending ignore
+        assert!(
+            app.pending_file_ignore.is_none(),
+            "pending_file_ignore should be cleared"
+        );
+
+        // File should be marked as ignored
+        let files = db
+            .list_files_by_directory(dir_id)
+            .expect("Failed to list files");
+        let file = files
+            .iter()
+            .find(|f| f.id == file_ids[0])
+            .expect("File should exist");
+        assert_eq!(file.status, "ignored", "File status should be 'ignored'");
+    }
+
+    #[test]
+    fn x_key_initiates_file_approval() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, file_ids) = setup_with_files(&db);
+
+        // Set up app state
+        app.current_directory_id.set(Some(dir_id));
+        app.focus_panel = FocusPanel::MainPanel;
+        app.file_selected_index = 0;
+
+        // Press 'x' key
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('x')));
+
+        // Should set pending_file_approval
+        assert!(
+            app.pending_file_approval.is_some(),
+            "pending_file_approval should be set"
+        );
+        let (file_id, path) = app
+            .pending_file_approval
+            .as_ref()
+            .expect("Expected pending approval");
+        assert_eq!(*file_id, file_ids[0]);
+        assert_eq!(path, "/test/dir/file1.txt");
+    }
+
+    #[test]
+    fn file_approval_confirmation_y_approves_file() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Set up database with files
+        let (dir_id, file_ids) = setup_with_files(&db);
+        app.current_directory_id.set(Some(dir_id));
+
+        // Manually set pending approval
+        app.pending_file_approval = Some((file_ids[0], "/test/dir/file1.txt".to_string()));
+
+        // Press 'y' to confirm
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));
+
+        // Should clear pending approval
+        assert!(
+            app.pending_file_approval.is_none(),
+            "pending_file_approval should be cleared"
+        );
+
+        // File should be marked as approved
+        let files = db
+            .list_files_by_directory(dir_id)
+            .expect("Failed to list files");
+        let file = files
+            .iter()
+            .find(|f| f.id == file_ids[0])
+            .expect("File should exist");
+        assert_eq!(file.status, "approved", "File status should be 'approved'");
     }
 }
