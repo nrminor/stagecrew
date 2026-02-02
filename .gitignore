@@ -55,3 +55,4 @@
 # === Allowed: Tests ===
 !/tests
 !/tests/integration.rs
+!/tests/cli_add.rs

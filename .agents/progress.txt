@@ -1333,3 +1333,45 @@
 - Known limitation: Tests don't call Config::load() directly due to shellexpand environment caching, but verify expansion logic is correct
 - Next story is US-026: Add CLI command to add tracked paths
 - US-026 will add `stagecrew add PATH` command for adding tracked paths from CLI
+
+## US-026: Add CLI command to add tracked paths (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Added `Add` variant to Command enum with path (PathBuf) and scan (bool) fields
+- Added `NotADirectory` error variant to Error enum for clearer error handling
+- Implemented `handle_add()` function in main.rs with:
+  - Path canonicalization using `.canonicalize()` to prevent duplicate entries with different representations (e.g., /data/staging vs /data/./staging vs /data/staging/)
+  - Uses Error::PathNotFound and Error::NotADirectory instead of ad-hoc eyre errors
+  - Debug assertions for path and config validation per nick-isms standards
+  - Duplicate detection via contains() check on canonicalized paths
+  - Config save after adding path
+  - Optional scan via --scan flag
+- Added 5 comprehensive integration tests in tests/cli_add.rs:
+  - add_path_to_empty_config - verifies config creation and path addition
+  - add_path_to_existing_config - verifies appending to existing config
+  - add_duplicate_path_is_idempotent - verifies duplicate detection
+  - add_different_representations_of_same_path - verifies canonicalization prevents duplicates
+  - add_with_scan_flag - verifies scan integration with database verification
+- Added CLI output format stability note per semver-nag recommendation
+
+**Agent reviews:**
+- nick-isms: Identified critical issues (all fixed): missing path canonicalization (added), should use Error::PathNotFound (fixed), missing assertions (added 2), suggested adding comment for std::slice::from_ref (added). Overall grade: close to ready after fixes.
+- testing-guru: Recommended 6-7 integration tests covering happy paths and error paths. Implemented 5 high-priority tests covering all critical scenarios. Noted handle_add is orchestration function best tested via integration tests.
+- semver-nag: No blocking issues. CLI argument names and config field names are now part of compatibility surface. Documented output format as unstable. Recommended considering --dry-run and canonicalization decisions (canonicalization implemented).
+
+**Technical notes:**
+- Path canonicalization is critical for duplicate prevention - two paths like /data/staging and /data/./staging will both resolve to the same canonical path
+- Config is #[non_exhaustive] so tests must use Config::default() and field assignment rather than struct literals
+- Integration tests use unsafe { set_var } to override XDG_CONFIG_HOME for temp directory isolation
+- CLI arguments (add, --scan) are now de facto API commitments even though output format is documented as unstable
+
+**Notes for next agent:**
+- US-026 is now feature-complete with all acceptance criteria met
+- All 307 tests pass (302 existing + 5 new integration tests)
+- Path canonicalization ensures no duplicate paths in config
+- Error handling uses proper Error enum variants with clear messages
+- Next story is US-027: Redesign TUI with file-centric layout (major rewrite of TUI)
+- US-027 is a significant change - old directory-centric design will be replaced with file-level granularity
+

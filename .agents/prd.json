@@ -451,8 +451,8 @@
         "just check passes"
       ],
       "priority": 26,
-      "passes": false,
-      "notes": "This complements tilde expansion - users can run 'stagecrew add ~/Downloads' and the shell handles ~."
+      "passes": true,
+      "notes": "Completed: Added Add command to CLI enum with path and --scan flag. Implemented handle_add() function with path canonicalization (prevents duplicate entries with different representations like /data vs /data/.  ), uses Error::PathNotFound and Error::NotADirectory from error module, includes assertions per nick-isms standards. Added 5 integration tests covering: add to empty config, add to existing config, duplicate detection, different path representations, and scan flag. All code review feedback addressed (nick-isms, testing-guru, semver-nag). All 307 tests pass."
     },
     {
       "id": "US-027",

@@ -39,4 +39,17 @@ pub enum Command {
 
     /// Initialize or update configuration
     Init,
+
+    /// Add a tracked path to the configuration
+    ///
+    /// Note: The output format is intended for human consumption and may change
+    /// between versions. For scripting, consider editing the config file directly.
+    Add {
+        /// Path to track (must be a directory)
+        path: PathBuf,
+
+        /// Run an initial scan after adding the path
+        #[arg(short, long)]
+        scan: bool,
+    },
 }

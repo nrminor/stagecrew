@@ -37,9 +37,14 @@ async fn main() -> Result<()> {
     // Initialize paths
     let paths = AppPaths::new();
 
-    // Handle init command separately since it may need to create config
+    // Handle init and add commands separately since they may need to create/modify config
     if matches!(command, Command::Init) {
         handle_init(&paths)?;
+        return Ok(());
+    }
+
+    if let Command::Add { path, scan } = command {
+        handle_add(&paths, path, scan).await?;
         return Ok(());
     }
 
@@ -72,6 +77,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Init => unreachable!("Init handled above"),
+        Command::Add { .. } => unreachable!("Add handled above"),
     }
 
     Ok(())
@@ -115,6 +121,93 @@ fn handle_init(paths: &AppPaths) -> Result<()> {
         );
     } else {
         println!("Database initialized at: {}", db_path.display());
+    }
+
+    Ok(())
+}
+
+/// Handle the add subcommand.
+///
+/// Validates that the path exists and is a directory, adds it to the config's `tracked_paths`,
+/// saves the updated config, and optionally runs an initial scan if --scan flag is provided.
+async fn handle_add(paths: &AppPaths, path: PathBuf, run_scan: bool) -> Result<()> {
+    use crate::error::Error;
+
+    debug_assert!(!path.as_os_str().is_empty(), "path should not be empty");
+
+    // Canonicalize path to resolve symlinks and normalize, preventing duplicate entries
+    // with different representations (e.g., /data/staging vs /data/./staging)
+    let path = path
+        .canonicalize()
+        .map_err(|e| {
+            // Check if the path exists vs doesn't exist to provide better error messages
+            if path.exists() {
+                Error::Io(e)
+            } else {
+                Error::PathNotFound(path.clone())
+            }
+        })
+        .context("Failed to canonicalize path")?;
+
+    // Validate that path is a directory
+    if !path.is_dir() {
+        return Err(Error::NotADirectory(path.clone()).into());
+    }
+
+    // Load existing config or create default if missing
+    let config_path = paths.config_file()?;
+    let mut config = if config_path.exists() {
+        Config::load(paths).context("Failed to load existing configuration")?
+    } else {
+        Config::default()
+    };
+
+    debug_assert!(
+        config.expiration_days > 0,
+        "expiration_days must be positive"
+    );
+
+    // Check if path is already tracked (duplicate detection with canonicalized paths)
+    if config.tracked_paths.contains(&path) {
+        println!("Path is already tracked: {}", path.display());
+        return Ok(());
+    }
+
+    // Add path to tracked_paths
+    config.tracked_paths.push(path.clone());
+
+    // Save updated config
+    config.save(paths).context("Failed to save configuration")?;
+
+    println!("Added tracked path: {}", path.display());
+
+    // Optionally run initial scan
+    if run_scan {
+        // Open database (path derived from config)
+        let db_path = paths
+            .database_file(&config)
+            .context("Failed to get database path")?;
+        let db = Database::open(&db_path).context("Failed to open database")?;
+
+        println!("Running initial scan...");
+        let scanner = Scanner::new();
+        // Use from_ref to create a single-element slice without allocation
+        let summary = scan_and_persist(
+            &db,
+            &scanner,
+            std::slice::from_ref(&path),
+            config.expiration_days,
+            config.warning_days,
+        )
+        .await
+        .context("Failed to scan and persist path")?;
+
+        println!(
+            "Scan complete: {} directories, {} files, {}",
+            summary.total_directories,
+            summary.total_files,
+            format_bytes(summary.total_size_bytes)
+        );
     }
 
     Ok(())
