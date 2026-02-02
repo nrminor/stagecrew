@@ -215,8 +215,9 @@ impl InputHandler {
             return;
         };
 
-        // Toggle selection
+        // Toggle selection and advance cursor for hold-to-multi-select behavior
         app.toggle_file_selection(file.id);
+        app.file_selected_index = app.file_selected_index.saturating_add(1);
     }
 
     /// Enter visual mode by selecting all visible files in the current directory.
