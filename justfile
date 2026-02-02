@@ -131,3 +131,7 @@ run-status:
 # Initialize configuration
 init:
     cargo run -- init
+
+# Count source lines of code (excluding blanks and comments)
+sloc:
+    @tokei --types=Rust --compact

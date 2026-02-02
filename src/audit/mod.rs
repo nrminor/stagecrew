@@ -18,6 +18,7 @@ pub enum AuditAction {
     // Allow: Will be used for file-level actions in US-030.
     #[allow(dead_code)]
     Ignore,
+    Unignore,
     Remove,
     Scan,
     // Allow: ConfigChange variant is part of the public API for future config audit logging.
@@ -32,6 +33,7 @@ impl AuditAction {
             Self::Approve => "approve",
             Self::Defer => "defer",
             Self::Ignore => "ignore",
+            Self::Unignore => "unignore",
             Self::Remove => "remove",
             Self::Scan => "scan",
             Self::ConfigChange => "config_change",
@@ -562,6 +564,7 @@ mod tests {
         assert_eq!(AuditAction::Approve.as_str(), "approve");
         assert_eq!(AuditAction::Defer.as_str(), "defer");
         assert_eq!(AuditAction::Ignore.as_str(), "ignore");
+        assert_eq!(AuditAction::Unignore.as_str(), "unignore");
         assert_eq!(AuditAction::Remove.as_str(), "remove");
         assert_eq!(AuditAction::Scan.as_str(), "scan");
         assert_eq!(AuditAction::ConfigChange.as_str(), "config_change");

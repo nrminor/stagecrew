@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     user TEXT NOT NULL,
     action TEXT NOT NULL
-        CHECK (action IN ('approve', 'defer', 'ignore', 'remove', 'scan', 'config_change')),
+        CHECK (action IN ('approve', 'defer', 'ignore', 'unignore', 'remove', 'scan', 'config_change')),
     target_path TEXT,
     details TEXT,  -- JSON for additional context
     directory_id INTEGER REFERENCES directories(id) ON DELETE SET NULL

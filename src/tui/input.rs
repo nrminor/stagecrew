@@ -164,6 +164,9 @@ impl InputHandler {
             KeyCode::Char('x') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::initiate_file_approve(app, config, db);
             }
+            KeyCode::Char('u') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::unignore_file(app, config, db);
+            }
 
             // Views
             KeyCode::Char('a') => app.view = View::AuditLog,
@@ -916,6 +919,95 @@ impl InputHandler {
                 // Ignore other keys during confirmation
             }
         }
+    }
+
+    /// Unignore a file (reset status from "ignored" back to "tracked").
+    ///
+    /// This is a direct action without confirmation since it's non-destructive.
+    /// Works on selected files if any, otherwise the currently focused file.
+    fn unignore_file(app: &mut App, config: &Config, db: &Database) {
+        // Get the currently selected directory ID
+        let Some(directory_id) = app.current_directory_id.get() else {
+            tracing::warn!("Cannot unignore file: no directory selected");
+            return;
+        };
+
+        // Query files for this directory
+        let files = match db.list_files_by_directory(directory_id) {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!("Failed to query files: {}", e);
+                return;
+            }
+        };
+
+        // Sort files the same way the UI does so indices match
+        let mut file_rows: Vec<_> = files
+            .into_iter()
+            .map(|file| {
+                let days_remaining = calculate_expiration(file.mtime, config.expiration_days);
+                (file, days_remaining)
+            })
+            .collect();
+        sort_file_rows(&mut file_rows, app.sort_mode());
+
+        // Determine which files to unignore
+        let files_to_unignore: Vec<(i64, String)> = if app.selected_files.is_empty() {
+            // No selection - use currently focused file
+            if let Some((file, _)) = file_rows.get(app.file_selected_index) {
+                // Only unignore if currently ignored
+                if file.status == "ignored" {
+                    vec![(file.id, file.path.clone())]
+                } else {
+                    app.status_message = Some("File is not ignored".to_string());
+                    app.status_message_time = Some(std::time::Instant::now());
+                    return;
+                }
+            } else {
+                tracing::warn!("No file selected (index out of bounds)");
+                return;
+            }
+        } else {
+            // Use selected files that are ignored
+            file_rows
+                .into_iter()
+                .filter(|(f, _)| app.selected_files.contains(&f.id) && f.status == "ignored")
+                .map(|(f, _)| (f.id, f.path.clone()))
+                .collect()
+        };
+
+        if files_to_unignore.is_empty() {
+            app.status_message = Some("No ignored files selected".to_string());
+            app.status_message_time = Some(std::time::Instant::now());
+            return;
+        }
+
+        // Perform the unignore
+        let audit = AuditService::new(db);
+        let user = AuditService::current_user();
+        let dir_id = app.current_directory_id.get();
+
+        let mut success_count = 0;
+        for (file_id, path) in &files_to_unignore {
+            if let Err(e) = db.update_file_status(*file_id, "tracked") {
+                tracing::warn!("Failed to unignore file {}: {}", path, e);
+                app.status_message = Some(format!("Unignore failed: {e}"));
+                app.status_message_time = Some(std::time::Instant::now());
+            } else {
+                success_count += 1;
+                // Record audit entry
+                if let Err(e) = audit.record(&user, AuditAction::Unignore, Some(path), None, dir_id)
+                {
+                    tracing::warn!("Failed to record audit entry for unignore: {}", e);
+                }
+            }
+        }
+
+        if success_count > 0 {
+            app.status_message = Some(format!("Unignored {success_count} file(s)"));
+            app.status_message_time = Some(std::time::Instant::now());
+        }
+        app.clear_selection();
     }
 
     /// Handle add path text input (characters/backspace/enter/esc).

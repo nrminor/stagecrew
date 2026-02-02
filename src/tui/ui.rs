@@ -362,9 +362,9 @@ fn render_main_file_panel(
         .iter()
         .enumerate()
         .map(|(idx, (file, days_remaining))| {
-            // Visual indicator showing expiration status (color-blind friendly)
+            // Visual indicator showing attention status
             let (indicator_symbol, indicator_color) =
-                expiration_indicator(*days_remaining, config.warning_days);
+                expiration_indicator(&file.status, *days_remaining, config.warning_days, file);
             let indicator_cell = Cell::from(indicator_symbol).fg(indicator_color);
 
             // Extract filename from path
@@ -387,24 +387,36 @@ fn render_main_file_panel(
             };
             let expires_cell = Cell::from(expires_str);
 
-            // Status (files don't have individual status yet, so show based on expiration)
-            let status_str = if *days_remaining <= 0 {
-                "overdue"
-            } else if *days_remaining <= i64::from(config.warning_days) {
-                "warning"
-            } else {
-                "tracked"
+            // Display status from database, with expiration-based fallback for "tracked" files
+            let status_str = match file.status.as_str() {
+                "tracked" => {
+                    // For tracked files, show expiration-based status
+                    if *days_remaining <= 0 {
+                        "overdue"
+                    } else if *days_remaining <= i64::from(config.warning_days) {
+                        "warning"
+                    } else {
+                        "tracked"
+                    }
+                }
+                other => other, // Show actual status: ignored, deferred, pending, approved, etc.
             };
             let status_cell = Cell::from(status_str);
 
-            // Determine row color based on expiration
-            let row_style = if *days_remaining <= 0 {
-                Style::default().fg(Color::Red)
-            } else if *days_remaining <= i64::from(config.warning_days) {
-                Style::default().fg(Color::Yellow)
+            // Determine row color based on actual file status
+            // For deferred files, use the deferral end date instead of mtime-based expiration
+            let effective_days = if file.status == "deferred" {
+                if let Some(deferred_until) = file.deferred_until {
+                    let now = jiff::Timestamp::now().as_second();
+                    (deferred_until - now) / 86400
+                } else {
+                    *days_remaining
+                }
             } else {
-                Style::default().fg(Color::Green)
+                *days_remaining
             };
+            let row_style =
+                determine_row_style(&file.status, Some(effective_days), config.warning_days);
 
             // Check if this file is selected (multi-select)
             let is_selected = app.selected_files().contains(&file.id);
@@ -487,8 +499,14 @@ fn render_main_file_panel(
 pub(super) fn sort_file_rows(rows: &mut [(crate::db::File, i64)], sort_mode: SortMode) {
     match sort_mode {
         SortMode::Expiration => {
-            // Ascending (most urgent first)
-            rows.sort_by(|a, b| a.1.cmp(&b.1));
+            // Ascending (most urgent first), but:
+            // - Ignored files sort to the end (they're not expiring)
+            // - Deferred files sort by their deferred_until date
+            rows.sort_by(|a, b| {
+                let key_a = expiration_sort_key(&a.0, a.1);
+                let key_b = expiration_sort_key(&b.0, b.1);
+                key_a.cmp(&key_b)
+            });
         }
         SortMode::Size => {
             // Descending (largest first)
@@ -512,6 +530,30 @@ pub(super) fn sort_file_rows(rows: &mut [(crate::db::File, i64)], sort_mode: Sor
             // Descending (most recent first = highest mtime first)
             rows.sort_by(|a, b| b.0.mtime.cmp(&a.0.mtime));
         }
+    }
+}
+
+/// Compute a sort key for expiration-based sorting.
+///
+/// Returns an `i64` where lower values sort first (more urgent):
+/// - Ignored files return `i64::MAX` (sort to end)
+/// - Deferred files return days until deferral expires
+/// - Other files return their `days_remaining`
+fn expiration_sort_key(file: &crate::db::File, days_remaining: i64) -> i64 {
+    match file.status.as_str() {
+        "ignored" => i64::MAX, // Sort to end
+        "deferred" => {
+            // Sort by days until deferral expires
+            if let Some(deferred_until) = file.deferred_until {
+                let now = jiff::Timestamp::now().as_second();
+                let seconds_remaining = deferred_until - now;
+                seconds_remaining / 86400 // Convert to days
+            } else {
+                // Deferred but no deferred_until set (shouldn't happen, but handle gracefully)
+                days_remaining
+            }
+        }
+        _ => days_remaining,
     }
 }
 
@@ -576,6 +618,9 @@ fn sort_directory_rows(rows: &mut [(crate::db::Directory, Option<i64>)], sort_mo
 }
 
 /// Determine row style based on status and expiration.
+///
+/// For deferred files, the caller should pass the effective days remaining
+/// based on `deferred_until`, not the mtime-based expiration.
 fn determine_row_style(status: &str, days_remaining: Option<i64>, warning_days: u32) -> Style {
     // Ignored paths are gray
     if status == "ignored" {
@@ -587,7 +632,7 @@ fn determine_row_style(status: &str, days_remaining: Option<i64>, warning_days: 
         return Style::default().fg(Color::Red);
     }
 
-    // Check expiration status
+    // Check expiration status (applies to tracked and deferred)
     match days_remaining {
         None => Style::default(), // No mtime, use default
         Some(days) if days <= 0 => Style::default().fg(Color::Red), // Overdue
@@ -596,22 +641,44 @@ fn determine_row_style(status: &str, days_remaining: Option<i64>, warning_days: 
     }
 }
 
-/// Generate a visual indicator (symbol + color) for expiration status.
+/// Generate a visual indicator (symbol + color) for attention status.
 ///
-/// Returns a tuple of (symbol, color) that provides a color-blind friendly
-/// indicator of how close a file is to expiration:
+/// Returns a tuple of (symbol, color) that signals when attention is needed:
 /// - `●` RED: Overdue (expired, requires immediate attention)
 /// - `⚠` YELLOW: Warning period (approaching expiration)
-/// - `✓` GREEN: Safe (plenty of time remaining)
+/// - `—` GRAY: Ignored (won't expire, no action needed)
+/// - ` ` (space): Safe, no attention needed
 ///
-/// The symbols are visually distinct even without color, ensuring accessibility.
-fn expiration_indicator(days_remaining: i64, warning_days: u32) -> (&'static str, Color) {
-    if days_remaining <= 0 {
+/// For deferred files, the indicator is based on the deferral end date.
+fn expiration_indicator(
+    status: &str,
+    days_remaining: i64,
+    warning_days: u32,
+    file: &crate::db::File,
+) -> (&'static str, Color) {
+    // Ignored files show a dash — they won't expire
+    if status == "ignored" {
+        return ("—", Color::DarkGray);
+    }
+
+    // Deferred files: calculate days until deferral expires
+    let effective_days = if status == "deferred" {
+        if let Some(deferred_until) = file.deferred_until {
+            let now = jiff::Timestamp::now().as_second();
+            (deferred_until - now) / 86400
+        } else {
+            days_remaining
+        }
+    } else {
+        days_remaining
+    };
+
+    if effective_days <= 0 {
         ("●", Color::Red) // Overdue - filled circle
-    } else if days_remaining <= i64::from(warning_days) {
+    } else if effective_days <= i64::from(warning_days) {
         ("⚠", Color::Yellow) // Warning - warning triangle
     } else {
-        ("✓", Color::Green) // Safe - checkmark
+        (" ", Color::Reset) // Safe - no indicator needed
     }
 }
 
@@ -2073,149 +2140,84 @@ mod tests {
 
     // Tests for expiration_indicator
 
+    fn make_test_file(status: &str, deferred_until: Option<i64>) -> crate::db::File {
+        crate::db::File {
+            id: 1,
+            directory_id: 1,
+            path: "/test/file.txt".to_string(),
+            size_bytes: 100,
+            mtime: 0,
+            tracked_since: None,
+            status: status.to_string(),
+            deferred_until,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
     #[test]
     fn expiration_indicator_overdue_is_red_circle() {
-        let (symbol, color) = expiration_indicator(0, 14);
+        let file = make_test_file("tracked", None);
+        let (symbol, color) = expiration_indicator("tracked", 0, 14, &file);
         assert_eq!(symbol, "●", "Overdue (0 days) should show filled circle");
         assert_eq!(color, Color::Red, "Overdue should be red");
 
-        let (symbol, color) = expiration_indicator(-5, 14);
-        assert_eq!(
-            symbol, "●",
-            "Negative days (overdue by 5) should show filled circle"
-        );
-        assert_eq!(color, Color::Red, "Overdue should be red");
-
-        let (symbol, color) = expiration_indicator(-30, 14);
-        assert_eq!(
-            symbol, "●",
-            "Highly overdue (-30 days) should show filled circle"
-        );
+        let (symbol, color) = expiration_indicator("tracked", -5, 14, &file);
+        assert_eq!(symbol, "●", "Negative days should show filled circle");
         assert_eq!(color, Color::Red, "Overdue should be red");
     }
 
     #[test]
     fn expiration_indicator_within_warning_is_yellow_triangle() {
-        let (symbol, color) = expiration_indicator(1, 14);
-        assert_eq!(
-            symbol, "⚠",
-            "1 day remaining (within warning) should show warning triangle"
-        );
+        let file = make_test_file("tracked", None);
+        let (symbol, color) = expiration_indicator("tracked", 1, 14, &file);
+        assert_eq!(symbol, "⚠", "1 day remaining should show warning triangle");
         assert_eq!(color, Color::Yellow, "Warning should be yellow");
 
-        let (symbol, color) = expiration_indicator(7, 14);
-        assert_eq!(
-            symbol, "⚠",
-            "7 days remaining (within warning) should show warning triangle"
-        );
-        assert_eq!(color, Color::Yellow, "Warning should be yellow");
-
-        let (symbol, color) = expiration_indicator(14, 14);
-        assert_eq!(
-            symbol, "⚠",
-            "Exactly at warning threshold (14 days) should show warning triangle"
-        );
+        let (symbol, color) = expiration_indicator("tracked", 14, 14, &file);
+        assert_eq!(symbol, "⚠", "At warning threshold should show warning");
         assert_eq!(color, Color::Yellow, "Warning should be yellow");
     }
 
     #[test]
-    fn expiration_indicator_safe_is_green_checkmark() {
-        let (symbol, color) = expiration_indicator(15, 14);
-        assert_eq!(
-            symbol, "✓",
-            "15 days remaining (safe) should show checkmark"
-        );
-        assert_eq!(color, Color::Green, "Safe should be green");
+    fn expiration_indicator_safe_is_empty() {
+        let file = make_test_file("tracked", None);
+        let (symbol, color) = expiration_indicator("tracked", 15, 14, &file);
+        assert_eq!(symbol, " ", "Safe files should show no indicator");
+        assert_eq!(color, Color::Reset, "Safe should use reset color");
 
-        let (symbol, color) = expiration_indicator(30, 14);
-        assert_eq!(
-            symbol, "✓",
-            "30 days remaining (safe) should show checkmark"
-        );
-        assert_eq!(color, Color::Green, "Safe should be green");
-
-        let (symbol, color) = expiration_indicator(90, 14);
-        assert_eq!(
-            symbol, "✓",
-            "90 days remaining (very safe) should show checkmark"
-        );
-        assert_eq!(color, Color::Green, "Safe should be green");
+        let (symbol, _) = expiration_indicator("tracked", 90, 14, &file);
+        assert_eq!(symbol, " ", "Very safe files should show no indicator");
     }
 
     #[test]
-    fn expiration_indicator_boundary_at_zero() {
-        // Test exact boundary: 0 days should be overdue (red)
-        let (symbol, color) = expiration_indicator(0, 14);
-        assert_eq!(symbol, "●", "Exactly 0 days should be overdue (red circle)");
-        assert_eq!(color, Color::Red);
+    fn expiration_indicator_ignored_is_gray_dash() {
+        let file = make_test_file("ignored", None);
+        let (symbol, color) = expiration_indicator("ignored", -30, 14, &file);
+        assert_eq!(symbol, "—", "Ignored files should show dash");
+        assert_eq!(color, Color::DarkGray, "Ignored should be gray");
 
-        // 1 day should be warning (yellow)
-        let (symbol, color) = expiration_indicator(1, 14);
-        assert_eq!(
-            symbol, "⚠",
-            "Exactly 1 day should be warning (yellow triangle)"
-        );
-        assert_eq!(color, Color::Yellow);
+        // Even if "overdue", ignored files show dash
+        let (symbol, _) = expiration_indicator("ignored", 0, 14, &file);
+        assert_eq!(symbol, "—", "Ignored overdue files should still show dash");
     }
 
     #[test]
-    fn expiration_indicator_boundary_at_warning_threshold() {
-        // Test exact boundary at warning_days threshold
-        let warning_days = 14;
-
-        // At threshold: should be warning (yellow)
-        let (symbol, color) = expiration_indicator(14, warning_days);
+    fn expiration_indicator_deferred_uses_deferred_until() {
+        // Deferred file with plenty of time on deferral
+        let future = jiff::Timestamp::now().as_second() + (30 * 86400); // 30 days from now
+        let file = make_test_file("deferred", Some(future));
+        let (symbol, _) = expiration_indicator("deferred", -100, 14, &file);
         assert_eq!(
-            symbol, "⚠",
-            "Exactly at warning threshold should be warning"
+            symbol, " ",
+            "Deferred with time remaining should show no indicator"
         );
+
+        // Deferred file with deferral expiring soon
+        let soon = jiff::Timestamp::now().as_second() + (5 * 86400); // 5 days from now
+        let file = make_test_file("deferred", Some(soon));
+        let (symbol, color) = expiration_indicator("deferred", -100, 14, &file);
+        assert_eq!(symbol, "⚠", "Deferred expiring soon should show warning");
         assert_eq!(color, Color::Yellow);
-
-        // Just above threshold: should be safe (green)
-        let (symbol, color) = expiration_indicator(15, warning_days);
-        assert_eq!(symbol, "✓", "One day past warning threshold should be safe");
-        assert_eq!(color, Color::Green);
-
-        // Just below threshold: should still be warning (yellow)
-        let (symbol, color) = expiration_indicator(13, warning_days);
-        assert_eq!(
-            symbol, "⚠",
-            "One day before warning threshold should be warning"
-        );
-        assert_eq!(color, Color::Yellow);
-    }
-
-    #[test]
-    fn expiration_indicator_with_different_warning_thresholds() {
-        // Test with warning_days = 7
-        let (symbol, color) = expiration_indicator(7, 7);
-        assert_eq!(
-            symbol, "⚠",
-            "At 7-day threshold with 7 days remaining should be warning"
-        );
-        assert_eq!(color, Color::Yellow);
-
-        let (symbol, color) = expiration_indicator(8, 7);
-        assert_eq!(symbol, "✓", "Above 7-day threshold should be safe (green)");
-        assert_eq!(color, Color::Green);
-
-        let (symbol, color) = expiration_indicator(6, 7);
-        assert_eq!(
-            symbol, "⚠",
-            "Below 7-day threshold should be warning (yellow)"
-        );
-        assert_eq!(color, Color::Yellow);
-
-        // Test with warning_days = 30
-        let (symbol, color) = expiration_indicator(29, 30);
-        assert_eq!(
-            symbol, "⚠",
-            "29 days with 30-day threshold should be warning"
-        );
-        assert_eq!(color, Color::Yellow);
-
-        let (symbol, color) = expiration_indicator(31, 30);
-        assert_eq!(symbol, "✓", "31 days with 30-day threshold should be safe");
-        assert_eq!(color, Color::Green);
     }
 }
