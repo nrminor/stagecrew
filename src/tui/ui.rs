@@ -481,15 +481,9 @@ fn render_main_file_panel(
                 }),
         )
         .header(
-            Row::new(vec![
-                Cell::from(""), // No header for indicator column
-                Cell::from("Filename"),
-                Cell::from("Size"),
-                Cell::from("Expires"),
-                Cell::from("Status"),
-            ])
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .bottom_margin(1),
+            Row::new(file_table_header_cells(app.sort_mode()))
+                .style(Style::default().add_modifier(Modifier::BOLD))
+                .bottom_margin(1),
         );
 
     frame.render_widget(table, area);
@@ -680,6 +674,45 @@ fn expiration_indicator(
     } else {
         (" ", Color::Reset) // Safe - no indicator needed
     }
+}
+
+/// Generate header cells for the file table with sort indicators.
+///
+/// The currently sorted column gets a triangle indicator:
+/// - `▲` for ascending sort (Name, Expiration)
+/// - `▼` for descending sort (Size, Modified)
+fn file_table_header_cells(sort_mode: SortMode) -> Vec<Cell<'static>> {
+    let indicator_asc = " ▲";
+    let indicator_desc = " ▼";
+
+    let filename_header = match sort_mode {
+        SortMode::Name => format!("Filename{indicator_asc}"),
+        _ => "Filename".to_string(),
+    };
+
+    let size_header = match sort_mode {
+        SortMode::Size => format!("Size{indicator_desc}"),
+        _ => "Size".to_string(),
+    };
+
+    let expires_header = match sort_mode {
+        SortMode::Expiration => format!("Expires{indicator_asc}"),
+        _ => "Expires".to_string(),
+    };
+
+    // Modified isn't a visible column, but if we're sorting by it, show in Status column
+    let status_header = match sort_mode {
+        SortMode::Modified => format!("Status (by mtime{indicator_desc})"),
+        _ => "Status".to_string(),
+    };
+
+    vec![
+        Cell::from(""), // No header for indicator column
+        Cell::from(filename_header),
+        Cell::from(size_header),
+        Cell::from(expires_header),
+        Cell::from(status_header),
+    ]
 }
 
 /// Format bytes as human-readable string (e.g., "1.2 KB", "523 MB").
