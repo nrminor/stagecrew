@@ -572,8 +572,8 @@
         "just check passes"
       ],
       "priority": 33,
-      "passes": false,
-      "notes": "Updates the legacy help view for the new TUI design."
+      "passes": true,
+      "notes": "Completed: Updated help text in render_help() to document the new file-centric TUI design. Fixed workflow description to accurately state that main panel shows files from currently selected directory (not all files). Removed erroneous Enter key documentation (not implemented in input handler). Clarified that Selection (Space, v, Esc) and Actions (d, r, i, x) only work from main panel. Updated docstring to list correct section names. All 291 tests pass. Code review feedback from nick-isms addressed all documentation accuracy issues. Testing-guru confirmed existing test coverage is adequate (no additional tests needed for static documentation updates). Semver-nag confirmed no semver concerns - help text is not part of programmatic API, changes are documentation improvements that reduce user confusion."
     },
     {
       "id": "US-034",

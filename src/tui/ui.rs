@@ -1042,6 +1042,11 @@ fn format_timestamp(timestamp: i64) -> String {
 ///
 /// Displays all available keybindings organized by category (Navigation, Views,
 /// Actions, Other). Any key press dismisses this view and returns to the directory list.
+/// Render the help view with keybinding reference.
+///
+/// Displays all available keybindings organized by sections: File-Centric Workflow,
+/// Navigation, Selection, Actions, Views, Sorting, and Other. Any key press dismisses
+/// this view and returns to the file list.
 fn render_help(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let block = Block::default()
         .title("Stagecrew - Keybinding Reference")
@@ -1049,23 +1054,36 @@ fn render_help(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default());
 
-    let help_text = r"Navigation:
-  j / ↓       Move selection down
-  k / ↑       Move selection up
-  g           Jump to top of list
-  G           Jump to bottom of list
+    let help_text = r"File-Centric Workflow:
+  The main panel shows files from the currently selected directory.
+  The left sidebar shows tracked directories for filtering.
+  Navigate the sidebar with j/k to change which directory's files are shown.
+
+Navigation:
+  j / ↓       Move selection down in focused panel
+  k / ↑       Move selection up in focused panel
+  g           Jump to top of focused panel
+  G           Jump to bottom of focused panel
+  Tab         Switch focus between sidebar and main panel
+  h           Switch focus to sidebar
+  l           Switch focus to main panel
   
+Selection (main panel only):
+  Space       Toggle selection on current file
+  v           Select all files in current view (visual mode)
+  Esc         Clear all selections
+
+Actions (main panel only - on focused file or all selected files):
+  d           Delete file(s) with confirmation
+  r           Defer file(s) expiration (reset clock, prompt for days)
+  i           Permanently ignore file(s)
+  x           Approve file(s) for daemon removal
+
 Views:
-  Enter / l   View directory details (from directory list)
-  h / Esc     Return to previous view
-  p           Show pending approvals
   a           Show audit log
   ?           Show this help screen
   
-Actions (Directory List & Pending Approvals):
-  x           Approve directory for removal
-  d           Defer directory expiration (reset clock)
-  i           Permanently ignore directory
+Sorting:
   s           Cycle sort mode (Expiration → Size → Name → Modified)
   
 Other:

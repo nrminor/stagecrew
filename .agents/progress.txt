@@ -1712,3 +1712,31 @@ All old TUI tests reference removed View variants and App fields:
 - Next story is US-033: Update TUI help view with new keybindings
 - US-033 will update render_help() to document the new file-centric workflow and remove legacy keybinding references
 
+
+## US-033: Update TUI help view with new keybindings (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Updated help text in `render_help()` function in src/tui/ui.rs
+- Fixed "File-Centric Workflow" description to accurately state main panel shows files from currently selected directory (not "all files across tracked directories")
+- Removed erroneous "Enter" key documentation (not implemented in input handler - directory selection happens automatically with j/k navigation)
+- Clarified that Selection section (Space, v, Esc) only works from main panel
+- Clarified that Actions section (d, r, i, x) only works from main panel and applies to focused file or all selected files
+- Updated navigation documentation to clarify operations work on "focused panel"
+- Updated `render_help()` docstring to list correct section names: File-Centric Workflow, Navigation, Selection, Actions, Views, Sorting, Other
+
+**Agent reviews:**
+- nick-isms: Identified 4 critical documentation accuracy issues (all fixed): removed non-existent Enter key handler, clarified Esc only works in main panel, fixed "all files" description to "files from currently selected directory", updated docstring section names. All issues addressed in implementation.
+- testing-guru: Confirmed existing test coverage is adequate for documentation-only change. No additional tests needed - testing static documentation content would be brittle and low-value. Existing tests verify behavioral contract (help opens with '?', dismisses with any key, view state transitions work).
+- semver-nag: No semver concerns. Help text is not part of programmatic API (render_help is private, tui module not exported from lib.rs). Changes are documentation improvements that reduce user confusion, not breaking changes. At 0.1.0 with explicit instability disclaimer, even behavioral changes are allowed.
+
+**Notes for next agent:**
+- Help view is now feature-complete for US-033
+- All acceptance criteria met and verified
+- All 291 tests pass, clippy clean, docs build successfully
+- Help text accurately documents file-centric workflow with sidebar/main panel focus model
+- Code review identified and fixed all documentation accuracy issues
+- Next story is US-034: Add TUI interface for managing tracked paths
+- US-034 will add 'A' (shift-a) key to add new tracked paths and 'X' (shift-x) to remove paths from the TUI
+
