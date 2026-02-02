@@ -4,6 +4,7 @@ mod input;
 mod ui;
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
@@ -24,10 +25,10 @@ use input::InputHandler;
 /// State for an in-progress deferral action.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingDeferral {
-    /// Directory ID being deferred.
+    /// Directory ID being deferred (or file ID for file deferrals - field name is misleading due to legacy code).
     pub directory_id: i64,
 
-    /// Path of the directory being deferred.
+    /// Path of the directory being deferred (or first path in multi-select).
     pub path: String,
 
     /// Accumulated input buffer for days to defer.
@@ -35,6 +36,9 @@ pub(crate) struct PendingDeferral {
 
     /// Default number of days to defer (from config).
     pub default_days: u32,
+
+    /// Additional file IDs for multi-select deferral (excludes `directory_id` which is included separately).
+    pub additional_file_ids: Vec<i64>,
 }
 
 /// Main TUI application state.
@@ -85,19 +89,22 @@ pub struct App {
     pub(crate) pending_ignore: Option<(i64, String)>,
 
     /// Pending file deletion confirmation state.
-    /// Contains the file ID and path awaiting user confirmation for deletion.
-    pub(crate) pending_file_delete: Option<(i64, String)>,
+    /// Contains a vector of (`file_id`, path) tuples awaiting user confirmation for deletion.
+    pub(crate) pending_file_delete: Option<Vec<(i64, String)>>,
 
     /// Pending file deferral input state.
     pub(crate) pending_file_deferral: Option<PendingDeferral>,
 
     /// Pending file ignore confirmation state.
-    /// Contains the file ID and path awaiting user confirmation for ignoring.
-    pub(crate) pending_file_ignore: Option<(i64, String)>,
+    /// Contains a vector of (`file_id`, path) tuples awaiting user confirmation for ignoring.
+    pub(crate) pending_file_ignore: Option<Vec<(i64, String)>>,
 
     /// Pending file approval confirmation state.
-    /// Contains the file ID and path awaiting user confirmation for approval.
-    pub(crate) pending_file_approval: Option<(i64, String)>,
+    /// Contains a vector of (`file_id`, path) tuples awaiting user confirmation for approval.
+    pub(crate) pending_file_approval: Option<Vec<(i64, String)>>,
+
+    /// Set of selected file IDs for multi-select operations.
+    pub(crate) selected_files: HashSet<i64>,
 }
 
 impl App {
@@ -154,7 +161,7 @@ impl App {
     }
 
     /// Get the pending file deletion confirmation state.
-    pub fn pending_file_delete(&self) -> Option<&(i64, String)> {
+    pub fn pending_file_delete(&self) -> Option<&Vec<(i64, String)>> {
         self.pending_file_delete.as_ref()
     }
 
@@ -164,13 +171,32 @@ impl App {
     }
 
     /// Get the pending file ignore confirmation state.
-    pub fn pending_file_ignore(&self) -> Option<&(i64, String)> {
+    pub fn pending_file_ignore(&self) -> Option<&Vec<(i64, String)>> {
         self.pending_file_ignore.as_ref()
     }
 
     /// Get the pending file approval confirmation state.
-    pub fn pending_file_approval(&self) -> Option<&(i64, String)> {
+    pub fn pending_file_approval(&self) -> Option<&Vec<(i64, String)>> {
         self.pending_file_approval.as_ref()
+    }
+
+    /// Get the set of selected file IDs.
+    pub fn selected_files(&self) -> &HashSet<i64> {
+        &self.selected_files
+    }
+
+    /// Clear all file selections.
+    pub(crate) fn clear_selection(&mut self) {
+        self.selected_files.clear();
+    }
+
+    /// Toggle selection of a file ID.
+    pub(crate) fn toggle_file_selection(&mut self, file_id: i64) {
+        if self.selected_files.contains(&file_id) {
+            self.selected_files.remove(&file_id);
+        } else {
+            self.selected_files.insert(file_id);
+        }
     }
 
     /// Select the last item in the sidebar.
@@ -297,6 +323,7 @@ impl App {
             pending_file_deferral: None,
             pending_file_ignore: None,
             pending_file_approval: None,
+            selected_files: HashSet::new(),
         }
     }
 
@@ -436,6 +463,10 @@ mod tests {
         assert_eq!(
             app.pending_file_approval, None,
             "App should start with no pending file approval"
+        );
+        assert!(
+            app.selected_files.is_empty(),
+            "App should start with no selected files"
         );
     }
 

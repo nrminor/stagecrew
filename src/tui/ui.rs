@@ -49,6 +49,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
             &deferral.path,
             &deferral.input,
             deferral.default_days,
+            1, // Directory-level deferral is always single item
         );
     }
 
@@ -58,28 +59,45 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     }
 
     // Render file deletion confirmation modal if pending file delete
-    if let Some((_, path)) = app.pending_file_delete() {
-        render_file_delete_modal(frame, path);
+    if let Some(files) = app.pending_file_delete() {
+        let count = files.len();
+        if count == 1 {
+            render_file_delete_modal(frame, &files[0].1);
+        } else {
+            render_file_delete_modal_multi(frame, count);
+        }
     }
 
     // Render file deferral input modal if pending file deferral
     if let Some(deferral) = app.pending_file_deferral() {
+        let count = 1 + deferral.additional_file_ids.len();
         render_deferral_modal(
             frame,
             &deferral.path,
             &deferral.input,
             deferral.default_days,
+            count,
         );
     }
 
     // Render file ignore confirmation modal if pending file ignore
-    if let Some((_, path)) = app.pending_file_ignore() {
-        render_ignore_modal(frame, path);
+    if let Some(files) = app.pending_file_ignore() {
+        let count = files.len();
+        if count == 1 {
+            render_ignore_modal(frame, &files[0].1);
+        } else {
+            render_ignore_modal_multi(frame, count);
+        }
     }
 
     // Render file approval confirmation modal if pending file approval
-    if let Some((_, path)) = app.pending_file_approval() {
-        render_confirmation_modal(frame, path);
+    if let Some(files) = app.pending_file_approval() {
+        let count = files.len();
+        if count == 1 {
+            render_confirmation_modal(frame, &files[0].1);
+        } else {
+            render_confirmation_modal_multi(frame, count);
+        }
     }
 }
 
@@ -359,8 +377,15 @@ fn render_main_file_panel(
                 Style::default().fg(Color::Green)
             };
 
+            // Check if this file is selected (multi-select)
+            let is_selected = app.selected_files().contains(&file.id);
+
             // Highlight selected row and show focus
-            let style = if idx == selected_idx {
+            let style = if is_selected {
+                // Selected files get magenta background
+                row_style.bg(Color::Magenta).add_modifier(Modifier::BOLD)
+            } else if idx == selected_idx {
+                // Currently focused file
                 if app.focus_panel() == FocusPanel::MainPanel {
                     row_style.add_modifier(Modifier::REVERSED).fg(Color::Cyan)
                 } else {
@@ -397,10 +422,16 @@ fn render_main_file_panel(
         SortMode::Modified => " (by modified)",
     };
 
+    let selection_info = if app.selected_files().is_empty() {
+        String::new()
+    } else {
+        format!(" | {} selected", app.selected_files().len())
+    };
+
     let table = Table::new(rows, widths)
         .block(
             Block::default()
-                .title(format!("Files{sort_indicator}"))
+                .title(format!("Files{sort_indicator}{selection_info}"))
                 .borders(Borders::ALL)
                 .border_style(if app.focus_panel() == FocusPanel::MainPanel {
                     Style::default().fg(Color::Cyan)
@@ -1110,7 +1141,14 @@ fn render_confirmation_modal(frame: &mut Frame, path: &str) {
 ///
 /// Displays a centered modal prompting the user to enter the number of days
 /// to defer expiration. Shows the current input and the default value.
-fn render_deferral_modal(frame: &mut Frame, path: &str, input: &str, default_days: u32) {
+/// The count parameter indicates how many files will be deferred.
+fn render_deferral_modal(
+    frame: &mut Frame,
+    path: &str,
+    input: &str,
+    default_days: u32,
+    count: usize,
+) {
     use ratatui::layout::{Alignment, Rect};
 
     // Calculate centered rectangle for modal (60% width, 9 lines height)
@@ -1128,14 +1166,23 @@ fn render_deferral_modal(frame: &mut Frame, path: &str, input: &str, default_day
     };
 
     // Create the modal content
-    let title = "Defer Expiration";
+    let title = if count > 1 {
+        format!("Defer Expiration ({count} files)")
+    } else {
+        "Defer Expiration".to_string()
+    };
     let display_input = if input.is_empty() {
         format!("[{default_days}]")
     } else {
         input.to_string()
     };
+    let path_display = if count > 1 {
+        format!("{count} selected files")
+    } else {
+        path.to_string()
+    };
     let message = format!(
-        "Defer expiration for:\n{path}\n\nDays to defer: {display_input}\n\n(Enter to confirm, Esc to cancel)"
+        "Defer expiration for:\n{path_display}\n\nDays to defer: {display_input}\n\n(Enter to confirm, Esc to cancel)"
     );
 
     let modal = Paragraph::new(message)
@@ -1237,6 +1284,120 @@ fn render_ignore_modal(frame: &mut Frame, path: &str) {
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
     // Clear the area behind the modal (create a simple background)
+    let background = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+
+    frame.render_widget(background, modal_area);
+    frame.render_widget(modal, modal_area);
+}
+
+/// Render a multi-file ignore confirmation modal.
+fn render_ignore_modal_multi(frame: &mut Frame, count: usize) {
+    use ratatui::layout::{Alignment, Rect};
+
+    let area = frame.area();
+    let modal_width = area.width / 2;
+    let modal_height = 7;
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    let title = format!("Ignore {count} Files Permanently");
+    let message = format!("Permanently ignore {count} files?\n\n(y/n)");
+
+    let modal = Paragraph::new(message)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    let background = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+
+    frame.render_widget(background, modal_area);
+    frame.render_widget(modal, modal_area);
+}
+
+/// Render a multi-file approval confirmation modal.
+fn render_confirmation_modal_multi(frame: &mut Frame, count: usize) {
+    use ratatui::layout::{Alignment, Rect};
+
+    let area = frame.area();
+    let modal_width = area.width / 2;
+    let modal_height = 7;
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    let title = format!("Approve {count} Files for Removal");
+    let message = format!("Approve {count} files for removal?\n\n(y/n)");
+
+    let modal = Paragraph::new(message)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    let background = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+
+    frame.render_widget(background, modal_area);
+    frame.render_widget(modal, modal_area);
+}
+
+/// Render a multi-file deletion confirmation modal.
+fn render_file_delete_modal_multi(frame: &mut Frame, count: usize) {
+    use ratatui::layout::{Alignment, Rect};
+
+    let area = frame.area();
+    let modal_width = area.width / 2;
+    let modal_height = 7;
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    let title = format!("Delete {count} Files");
+    let message = format!("Delete {count} files?\n\n(y/n)");
+
+    let modal = Paragraph::new(message)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
     let background = Block::default()
         .style(Style::default().bg(Color::Black))
         .borders(Borders::NONE);
