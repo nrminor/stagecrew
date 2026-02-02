@@ -1508,3 +1508,47 @@ All old TUI tests reference removed View variants and App fields:
 - Test coverage is comprehensive with no identified gaps
 - Next story is US-029: Add visual expiration indicator in TUI
 - Requires implementing color gradients or progress bars for expiration status
+
+## US-029: Add visual expiration indicator in TUI (COMPLETE)
+
+**Date:** 2026-02-01
+
+**Changes made:**
+- Implemented expiration_indicator() function returning (symbol, color) tuples for color-blind friendly visual feedback:
+  - `●` RED for overdue files (days_remaining <= 0)
+  - `⚠` YELLOW for warning period (0 < days_remaining <= warning_days)
+  - `✓` GREEN for safe files (days_remaining > warning_days)
+- Added indicator column to file table as first column (2-character width using Constraint::Length(2))
+- Updated table header to include empty cell for indicator column
+- Adjusted file table widths: indicator (2 chars), filename (42%), size (15%), expires (20%), status (20%)
+- Added import: `use ratatui::prelude::Stylize;` for .fg() method on Cell
+- Added 6 comprehensive unit tests covering all states, boundaries, and different warning_days values
+- Addresses user feedback about "virtually no control" and "text is all white" from US-027 TUI redesign
+
+**Agent reviews:**
+- nick-isms: APPROVED (ready to merge). Solid pure function design with good accessibility (distinct symbols + colors). Comprehensive test coverage of boundaries. Minor observation: code duplication with row coloring logic (acceptable since contexts differ - row vs cell). Test count was 6 not 7 as initially stated. Recommended documenting 2-character width choice in commit notes. Overall: Clean, functional, meets all acceptance criteria.
+- testing-guru: GRADE B+, adequate coverage. Tests cover all three states (overdue/warning/safe) and both boundary conditions (zero, warning threshold). Recommended optional edge cases: warning_days=0, large values, property-based testing with proptest (all low priority). No rendering integration tests needed - pure function is well-tested. Verdict: Test coverage is adequate for acceptance criteria.
+- semver-nag: APPROVED ✅. No semver concerns for binary crate. Function is private to ui.rs (not exposed via public API). Good design with &'static str return (no allocation). If function were public, would flag Color type coupling to ratatui. Current implementation is well-scoped. No breaking changes to existing behavior (additive only).
+
+**Technical notes:**
+- expiration_indicator() is pure function with no side effects (excellent for testability)
+- Symbol choices provide shape distinction even without color: filled circle vs triangle vs checkmark
+- Indicator cell uses .fg(color) method from Stylize trait to apply color
+- Both indicator and existing row coloring compute same thresholds (minor duplication acceptable per code review)
+- Comprehensive doc comment explains purpose and return values with examples
+
+**Notes for next agent:**
+- Visual expiration indicator is now feature-complete for US-029
+- All 280 tests pass (274 existing + 6 new), clippy clean, docs build successfully
+- All acceptance criteria met and verified:
+  1. ✅ Each file row has a visual indicator (new column at position 0)
+  2. ✅ Option B: Row color gradient (green/yellow/red) - enhanced with indicator column
+  3. ✅ Overdue files clearly distinguished (filled circle ● vs triangle ⚠ vs checkmark ✓)
+  4. ✅ Color-blind friendly (symbols are distinct shapes independent of color)
+  5. ✅ just check passes (all tests green)
+- Optional future improvements noted by reviewers:
+  1. Test edge cases: warning_days=0, large values (low priority)
+  2. Consider ExpirationUrgency enum to eliminate duplication with row coloring (nice-to-have for future refactor)
+  3. Property-based testing with proptest to verify invariants (low priority, would add ~10 lines)
+- Next story is US-030: Implement file-level actions in TUI
+- US-030 will add d/r/i/x keys for delete/defer/ignore/approve actions on individual files

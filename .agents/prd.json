@@ -505,8 +505,8 @@
         "just check passes"
       ],
       "priority": 29,
-      "passes": false,
-      "notes": "User feedback: 'virtually no control' and 'text is all white'. This addresses the visual feedback gap."
+      "passes": true,
+      "notes": "Completed: Implemented Option B (row color gradient) enhanced with color-blind friendly symbol column. Added expiration_indicator() function returning (symbol, color) tuples: ● RED (overdue), ⚠ YELLOW (warning), ✓ GREEN (safe). Indicator column is 2 characters wide using Constraint::Length(2). Added 6 comprehensive unit tests covering all states, boundaries, and different warning_days values. All 280 tests pass. Code reviews: nick-isms approved (noted minor duplication with row coloring, acceptable), testing-guru gave B+ (adequate coverage, suggested edge cases as optional future improvements), semver-nag approved (no concerns for 0.1.0). Addresses user feedback about visual clarity."
     },
     {
       "id": "US-030",

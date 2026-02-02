@@ -2,6 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
@@ -289,6 +290,11 @@ fn render_main_file_panel(
         .iter()
         .enumerate()
         .map(|(idx, (file, days_remaining))| {
+            // Visual indicator showing expiration status (color-blind friendly)
+            let (indicator_symbol, indicator_color) =
+                expiration_indicator(*days_remaining, config.warning_days);
+            let indicator_cell = Cell::from(indicator_symbol).fg(indicator_color);
+
             // Extract filename from path
             let filename = std::path::Path::new(&file.path)
                 .file_name()
@@ -339,13 +345,21 @@ fn render_main_file_panel(
                 row_style
             };
 
-            Row::new(vec![filename_cell, size_cell, expires_cell, status_cell]).style(style)
+            Row::new(vec![
+                indicator_cell,
+                filename_cell,
+                size_cell,
+                expires_cell,
+                status_cell,
+            ])
+            .style(style)
         })
         .collect();
 
     // Build table
     let widths = [
-        Constraint::Percentage(45), // Filename
+        Constraint::Length(2),      // Visual indicator (●/⚠/✓)
+        Constraint::Percentage(42), // Filename
         Constraint::Percentage(15), // Size
         Constraint::Percentage(20), // Expires
         Constraint::Percentage(20), // Status
@@ -371,6 +385,7 @@ fn render_main_file_panel(
         )
         .header(
             Row::new(vec![
+                Cell::from(""), // No header for indicator column
                 Cell::from("Filename"),
                 Cell::from("Size"),
                 Cell::from("Expires"),
@@ -493,6 +508,25 @@ fn determine_row_style(status: &str, days_remaining: Option<i64>, warning_days: 
         Some(days) if days <= 0 => Style::default().fg(Color::Red), // Overdue
         Some(days) if days <= i64::from(warning_days) => Style::default().fg(Color::Yellow), // Warning
         _ => Style::default().fg(Color::Green),                                              // Safe
+    }
+}
+
+/// Generate a visual indicator (symbol + color) for expiration status.
+///
+/// Returns a tuple of (symbol, color) that provides a color-blind friendly
+/// indicator of how close a file is to expiration:
+/// - `●` RED: Overdue (expired, requires immediate attention)
+/// - `⚠` YELLOW: Warning period (approaching expiration)
+/// - `✓` GREEN: Safe (plenty of time remaining)
+///
+/// The symbols are visually distinct even without color, ensuring accessibility.
+fn expiration_indicator(days_remaining: i64, warning_days: u32) -> (&'static str, Color) {
+    if days_remaining <= 0 {
+        ("●", Color::Red) // Overdue - filled circle
+    } else if days_remaining <= i64::from(warning_days) {
+        ("⚠", Color::Yellow) // Warning - warning triangle
+    } else {
+        ("✓", Color::Green) // Safe - checkmark
     }
 }
 
@@ -1657,5 +1691,153 @@ mod tests {
             2,
             "Should have exactly 2 colons for HH:MM:SS format, got: {result}"
         );
+    }
+
+    // Tests for expiration_indicator
+
+    #[test]
+    fn expiration_indicator_overdue_is_red_circle() {
+        let (symbol, color) = expiration_indicator(0, 14);
+        assert_eq!(symbol, "●", "Overdue (0 days) should show filled circle");
+        assert_eq!(color, Color::Red, "Overdue should be red");
+
+        let (symbol, color) = expiration_indicator(-5, 14);
+        assert_eq!(
+            symbol, "●",
+            "Negative days (overdue by 5) should show filled circle"
+        );
+        assert_eq!(color, Color::Red, "Overdue should be red");
+
+        let (symbol, color) = expiration_indicator(-30, 14);
+        assert_eq!(
+            symbol, "●",
+            "Highly overdue (-30 days) should show filled circle"
+        );
+        assert_eq!(color, Color::Red, "Overdue should be red");
+    }
+
+    #[test]
+    fn expiration_indicator_within_warning_is_yellow_triangle() {
+        let (symbol, color) = expiration_indicator(1, 14);
+        assert_eq!(
+            symbol, "⚠",
+            "1 day remaining (within warning) should show warning triangle"
+        );
+        assert_eq!(color, Color::Yellow, "Warning should be yellow");
+
+        let (symbol, color) = expiration_indicator(7, 14);
+        assert_eq!(
+            symbol, "⚠",
+            "7 days remaining (within warning) should show warning triangle"
+        );
+        assert_eq!(color, Color::Yellow, "Warning should be yellow");
+
+        let (symbol, color) = expiration_indicator(14, 14);
+        assert_eq!(
+            symbol, "⚠",
+            "Exactly at warning threshold (14 days) should show warning triangle"
+        );
+        assert_eq!(color, Color::Yellow, "Warning should be yellow");
+    }
+
+    #[test]
+    fn expiration_indicator_safe_is_green_checkmark() {
+        let (symbol, color) = expiration_indicator(15, 14);
+        assert_eq!(
+            symbol, "✓",
+            "15 days remaining (safe) should show checkmark"
+        );
+        assert_eq!(color, Color::Green, "Safe should be green");
+
+        let (symbol, color) = expiration_indicator(30, 14);
+        assert_eq!(
+            symbol, "✓",
+            "30 days remaining (safe) should show checkmark"
+        );
+        assert_eq!(color, Color::Green, "Safe should be green");
+
+        let (symbol, color) = expiration_indicator(90, 14);
+        assert_eq!(
+            symbol, "✓",
+            "90 days remaining (very safe) should show checkmark"
+        );
+        assert_eq!(color, Color::Green, "Safe should be green");
+    }
+
+    #[test]
+    fn expiration_indicator_boundary_at_zero() {
+        // Test exact boundary: 0 days should be overdue (red)
+        let (symbol, color) = expiration_indicator(0, 14);
+        assert_eq!(symbol, "●", "Exactly 0 days should be overdue (red circle)");
+        assert_eq!(color, Color::Red);
+
+        // 1 day should be warning (yellow)
+        let (symbol, color) = expiration_indicator(1, 14);
+        assert_eq!(
+            symbol, "⚠",
+            "Exactly 1 day should be warning (yellow triangle)"
+        );
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn expiration_indicator_boundary_at_warning_threshold() {
+        // Test exact boundary at warning_days threshold
+        let warning_days = 14;
+
+        // At threshold: should be warning (yellow)
+        let (symbol, color) = expiration_indicator(14, warning_days);
+        assert_eq!(
+            symbol, "⚠",
+            "Exactly at warning threshold should be warning"
+        );
+        assert_eq!(color, Color::Yellow);
+
+        // Just above threshold: should be safe (green)
+        let (symbol, color) = expiration_indicator(15, warning_days);
+        assert_eq!(symbol, "✓", "One day past warning threshold should be safe");
+        assert_eq!(color, Color::Green);
+
+        // Just below threshold: should still be warning (yellow)
+        let (symbol, color) = expiration_indicator(13, warning_days);
+        assert_eq!(
+            symbol, "⚠",
+            "One day before warning threshold should be warning"
+        );
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn expiration_indicator_with_different_warning_thresholds() {
+        // Test with warning_days = 7
+        let (symbol, color) = expiration_indicator(7, 7);
+        assert_eq!(
+            symbol, "⚠",
+            "At 7-day threshold with 7 days remaining should be warning"
+        );
+        assert_eq!(color, Color::Yellow);
+
+        let (symbol, color) = expiration_indicator(8, 7);
+        assert_eq!(symbol, "✓", "Above 7-day threshold should be safe (green)");
+        assert_eq!(color, Color::Green);
+
+        let (symbol, color) = expiration_indicator(6, 7);
+        assert_eq!(
+            symbol, "⚠",
+            "Below 7-day threshold should be warning (yellow)"
+        );
+        assert_eq!(color, Color::Yellow);
+
+        // Test with warning_days = 30
+        let (symbol, color) = expiration_indicator(29, 30);
+        assert_eq!(
+            symbol, "⚠",
+            "29 days with 30-day threshold should be warning"
+        );
+        assert_eq!(color, Color::Yellow);
+
+        let (symbol, color) = expiration_indicator(31, 30);
+        assert_eq!(symbol, "✓", "31 days with 30-day threshold should be safe");
+        assert_eq!(color, Color::Green);
     }
 }
