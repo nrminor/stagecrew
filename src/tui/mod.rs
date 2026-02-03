@@ -447,27 +447,24 @@ impl App {
 
                 // Clone what we need for the background task
                 let scanner = Scanner::new();
-                let tracked_paths = config.tracked_paths.clone();
+                let config_tracked_paths = config.tracked_paths.clone();
                 let expiration_days = config.expiration_days;
                 let warning_days = config.warning_days;
                 let task_db_path = db_path.to_path_buf();
                 let tx = scan_tx.clone();
 
-                // Spawn the scan as a background task
-                // We use a separate tokio task that runs the scan. The scan internally
-                // uses spawn_blocking for filesystem operations, so this is safe.
+                // Spawn the scan as a background task.
+                // The scan seeds config baseline paths into the DB, then queries
+                // all DB roots (config + user-added) for the full set to scan.
                 scan_handle = Some(tokio::spawn(async move {
-                    // Run the scan in a way that's compatible with the non-Send Database.
-                    // We create a new runtime context for the blocking database operations.
                     let scan_result = tokio::task::spawn_blocking(move || {
-                        // Create a new runtime for the async scan operation
                         let rt = tokio::runtime::Handle::current();
                         rt.block_on(async {
                             match Database::open(&task_db_path) {
                                 Ok(task_db) => scan_and_persist(
                                     &task_db,
                                     &scanner,
-                                    &tracked_paths,
+                                    &config_tracked_paths,
                                     expiration_days,
                                     warning_days,
                                 )
@@ -481,7 +478,6 @@ impl App {
                     .await
                     .unwrap_or_else(|e| Err(format!("Scan task panicked: {e}")));
 
-                    // Send result back (ignore send errors if receiver dropped)
                     let _ = tx.send(scan_result).await;
                 }));
             }

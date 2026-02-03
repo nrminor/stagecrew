@@ -224,11 +224,16 @@ pub struct TransitionSummary {
 /// Scan tracked paths and persist results to the database.
 ///
 /// This function orchestrates the full scan workflow:
-/// 1. Ensure each tracked path exists as a root in the database
-/// 2. Scan each tracked path using the scanner
-/// 3. Upsert both directory and file entries into the database
-/// 4. Update the stats table with aggregated totals and expiration counts
-/// 5. Record the scan action in the audit log
+/// 1. Seed config baseline paths as roots in the database
+/// 2. Query all roots from the database (config baseline + user-added)
+/// 3. Scan each root path using the scanner
+/// 4. Upsert both directory and file entries into the database
+/// 5. Update the stats table with aggregated totals and expiration counts
+/// 6. Record the scan action in the audit log
+///
+/// The database is the source of truth for which paths to scan. Config
+/// `tracked_paths` are a baseline that always get seeded as roots, but
+/// additional roots added via the CLI or TUI are also scanned.
 ///
 /// # Errors
 ///
@@ -248,16 +253,15 @@ pub struct TransitionSummary {
 /// let db = Database::open(std::path::Path::new("test.db"))?;
 /// let scanner = Scanner::new();
 /// let config = Config::default();
-/// let paths = vec![PathBuf::from("/data/staging")];
 ///
-/// scan_and_persist(&db, &scanner, &paths, config.expiration_days, config.warning_days).await?;
+/// scan_and_persist(&db, &scanner, &config.tracked_paths, config.expiration_days, config.warning_days).await?;
 /// # Ok::<(), stagecrew::error::Error>(())
 /// # }).unwrap();
 /// ```
 pub async fn scan_and_persist(
     db: &Database,
     scanner: &Scanner,
-    tracked_paths: &[PathBuf],
+    config_tracked_paths: &[PathBuf],
     expiration_days: u32,
     warning_days: u32,
 ) -> Result<ScanSummary> {
@@ -266,15 +270,23 @@ pub async fn scan_and_persist(
     let mut total_size_bytes = 0u64;
     let scan_timestamp = jiff::Timestamp::now().as_second();
 
-    // Scan each tracked path
-    for path in tracked_paths {
+    // Seed config baseline paths as roots in the database
+    for path in config_tracked_paths {
+        let path_str = path.to_string_lossy();
+        db.insert_root(&path_str)?;
+    }
+
+    // Query all roots from the database (config baseline + user-added)
+    let roots = db.list_roots()?;
+
+    // Scan each root
+    for root in &roots {
+        let path = PathBuf::from(&root.path);
         tracing::info!(?path, "Scanning path");
 
-        // Ensure the root exists in the database
-        let path_str = path.to_string_lossy();
-        let root_id = db.insert_root(&path_str)?;
+        let root_id = root.id;
 
-        let scan_result = scanner.scan(path).await?;
+        let scan_result = scanner.scan(&path).await?;
 
         // Upsert directory entries and file entries
         for dir_info in &scan_result.directories_found {
@@ -284,7 +296,7 @@ pub async fn scan_and_persist(
             let parent_path = dir_info
                 .path
                 .parent()
-                .map_or_else(|| path_str.to_string(), |p| p.to_string_lossy().to_string());
+                .map_or_else(|| root.path.clone(), |p| p.to_string_lossy().to_string());
 
             // Insert directory entry (is_dir=true, size_bytes=0, mtime=None)
             db.upsert_entry(root_id, &dir_path_str, &parent_path, true, 0, None)?;
@@ -354,7 +366,7 @@ pub async fn scan_and_persist(
         None, // System-wide scan, no specific target path
         Some(&format!(
             "Scanned {} paths: {} directories, {} files, {} bytes",
-            tracked_paths.len(),
+            roots.len(),
             total_directories,
             total_files,
             total_size_bytes

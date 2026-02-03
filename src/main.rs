@@ -37,14 +37,9 @@ async fn main() -> Result<()> {
     // Initialize paths
     let paths = AppPaths::new();
 
-    // Handle init and add commands separately since they may need to create/modify config
+    // Handle init separately since it may need to create config before loading it
     if matches!(command, Command::Init) {
         handle_init(&paths)?;
-        return Ok(());
-    }
-
-    if let Command::Add { path, scan } = command {
-        handle_add(&paths, path, scan).await?;
         return Ok(());
     }
 
@@ -76,8 +71,11 @@ async fn main() -> Result<()> {
             handle_scan(&config, &db, path).await?;
         }
 
+        Command::Add { path, scan } => {
+            handle_add(&config, &db, path, scan).await?;
+        }
+
         Command::Init => unreachable!("Init handled above"),
-        Command::Add { .. } => unreachable!("Add handled above"),
     }
 
     Ok(())
@@ -128,9 +126,9 @@ fn handle_init(paths: &AppPaths) -> Result<()> {
 
 /// Handle the add subcommand.
 ///
-/// Validates that the path exists and is a directory, adds it to the config's `tracked_paths`,
-/// saves the updated config, and optionally runs an initial scan if --scan flag is provided.
-async fn handle_add(paths: &AppPaths, path: PathBuf, run_scan: bool) -> Result<()> {
+/// Validates that the path exists and is a directory, adds it as a root in the
+/// database, and optionally runs an initial scan.
+async fn handle_add(config: &Config, db: &Database, path: PathBuf, run_scan: bool) -> Result<()> {
     use crate::error::Error;
 
     debug_assert!(!path.as_os_str().is_empty(), "path should not be empty");
@@ -140,7 +138,6 @@ async fn handle_add(paths: &AppPaths, path: PathBuf, run_scan: bool) -> Result<(
     let path = path
         .canonicalize()
         .map_err(|e| {
-            // Check if the path exists vs doesn't exist to provide better error messages
             if path.exists() {
                 Error::Io(e)
             } else {
@@ -154,48 +151,28 @@ async fn handle_add(paths: &AppPaths, path: PathBuf, run_scan: bool) -> Result<(
         return Err(Error::NotADirectory(path.clone()).into());
     }
 
-    // Load existing config or create default if missing
-    let config_path = paths.config_file()?;
-    let mut config = if config_path.exists() {
-        Config::load(paths).context("Failed to load existing configuration")?
-    } else {
-        Config::default()
-    };
-
-    debug_assert!(
-        config.expiration_days > 0,
-        "expiration_days must be positive"
-    );
-
-    // Check if path is already tracked (duplicate detection with canonicalized paths)
-    if config.tracked_paths.contains(&path) {
+    // Check if already tracked in the database
+    let path_str = path.to_string_lossy();
+    let existing_roots = db.list_roots().context("Failed to list roots")?;
+    if existing_roots.iter().any(|r| r.path == path_str.as_ref()) {
         println!("Path is already tracked: {}", path.display());
         return Ok(());
     }
 
-    // Add path to tracked_paths
-    config.tracked_paths.push(path.clone());
-
-    // Save updated config
-    config.save(paths).context("Failed to save configuration")?;
+    // Insert as a root in the database
+    db.insert_root(&path_str)
+        .context("Failed to add root to database")?;
 
     println!("Added tracked path: {}", path.display());
 
     // Optionally run initial scan
     if run_scan {
-        // Open database (path derived from config)
-        let db_path = paths
-            .database_file(&config)
-            .context("Failed to get database path")?;
-        let db = Database::open(&db_path).context("Failed to open database")?;
-
         println!("Running initial scan...");
         let scanner = Scanner::new();
-        // Use from_ref to create a single-element slice without allocation
         let summary = scan_and_persist(
-            &db,
+            db,
             &scanner,
-            std::slice::from_ref(&path),
+            &config.tracked_paths,
             config.expiration_days,
             config.warning_days,
         )
@@ -215,37 +192,56 @@ async fn handle_add(paths: &AppPaths, path: PathBuf, run_scan: bool) -> Result<(
 
 /// Handle the scan subcommand.
 ///
-/// Scans either all configured tracked paths or a specific path if provided via --path.
-/// Prints progress messages and a summary of scan results.
+/// Scans all tracked roots. Config `tracked_paths` are seeded as roots in the
+/// database, then all DB roots (config baseline + user-added) are scanned.
+/// If `--path` is provided, that path is added as a root before scanning.
 async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> Result<()> {
     let scanner = Scanner::new();
 
-    // Determine which paths to scan
-    let paths_to_scan = if let Some(specific_path) = path {
-        // Scan only the specified path
-        vec![specific_path]
-    } else if config.tracked_paths.is_empty() {
-        // No tracked paths configured and no --path given
-        return Err(color_eyre::eyre::eyre!(
-            "No tracked paths configured. Either add paths to config.toml or use --path to specify a path to scan."
-        ));
-    } else {
-        // Scan all configured tracked paths
-        config.tracked_paths.clone()
-    };
-
-    // Print progress message
-    if paths_to_scan.len() == 1 {
-        println!("Scanning {}...", paths_to_scan[0].display());
-    } else {
-        println!("Scanning {} paths...", paths_to_scan.len());
+    // If a specific path was provided, ensure it exists as a root in the DB
+    if let Some(ref specific_path) = path {
+        let path_str = specific_path.to_string_lossy();
+        db.insert_root(&path_str)
+            .context("Failed to add path as root")?;
+        println!("Scanning {}...", specific_path.display());
     }
 
-    // Run the scan
+    // Check that we'll have something to scan (config paths + DB roots)
+    let db_roots = db.list_roots().context("Failed to list roots")?;
+    if config.tracked_paths.is_empty() && db_roots.is_empty() && path.is_none() {
+        return Err(color_eyre::eyre::eyre!(
+            "No tracked paths configured. Add paths with `stagecrew add` or set tracked_paths in config.toml."
+        ));
+    }
+
+    if path.is_none() {
+        let total_roots = {
+            // Count unique roots: config paths that aren't already in DB + DB roots
+            let db_paths: std::collections::HashSet<_> =
+                db_roots.iter().map(|r| r.path.as_str()).collect();
+            let new_from_config = config
+                .tracked_paths
+                .iter()
+                .filter(|p| !db_paths.contains(p.to_string_lossy().as_ref()))
+                .count();
+            db_roots.len() + new_from_config
+        };
+        if total_roots == 1 {
+            let display_path = db_roots.first().map_or_else(
+                || config.tracked_paths[0].display().to_string(),
+                |r| r.path.clone(),
+            );
+            println!("Scanning {display_path}...");
+        } else {
+            println!("Scanning {total_roots} paths...");
+        }
+    }
+
+    // Run the scan — seeds config paths as roots, then scans all DB roots
     let summary = scan_and_persist(
         db,
         &scanner,
-        &paths_to_scan,
+        &config.tracked_paths,
         config.expiration_days,
         config.warning_days,
     )

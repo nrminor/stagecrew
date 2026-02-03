@@ -36,7 +36,7 @@ impl InputHandler {
             return;
         }
         if app.pending_remove_path.is_some() {
-            Self::handle_remove_path_confirmation(app, config, key);
+            Self::handle_remove_path_confirmation(app, db, key);
             return;
         }
         if app.pending_entry_delete.is_some() {
@@ -934,7 +934,7 @@ impl InputHandler {
     }
 
     /// Handle add path text input (characters/backspace/enter/esc).
-    fn handle_add_path_input(app: &mut App, config: &Config, _db: &Database, key: KeyEvent) {
+    fn handle_add_path_input(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) if !c.is_control() => {
                 // Append character to input buffer
@@ -984,27 +984,34 @@ impl InputHandler {
                         }
                     };
 
-                    // Check if already tracked
+                    // Check if already tracked in config or database
                     if config.tracked_paths.contains(&canonical_path) {
+                        tracing::warn!(
+                            "Path already tracked (in config): {}",
+                            canonical_path.display()
+                        );
+                        app.pending_add_path = None;
+                        return;
+                    }
+
+                    let path_str = canonical_path.to_string_lossy();
+                    if let Ok(roots) = db.list_roots()
+                        && roots.iter().any(|r| r.path == path_str.as_ref())
+                    {
                         tracing::warn!("Path already tracked: {}", canonical_path.display());
                         app.pending_add_path = None;
                         return;
                     }
 
-                    // Add to config
-                    let mut new_config = config.clone();
-                    new_config.tracked_paths.push(canonical_path.clone());
-
-                    // Save config
-                    let paths = crate::config::AppPaths::new();
-                    if let Err(e) = new_config.save(&paths) {
-                        tracing::warn!("Failed to save config: {}", e);
+                    // Insert as a root in the database
+                    if let Err(e) = db.insert_root(&path_str) {
+                        tracing::warn!("Failed to add root to database: {}", e);
                         app.pending_add_path = None;
                         return;
                     }
 
                     tracing::info!(
-                        "Added tracked path: {} (will be scanned on next daemon cycle or manual scan)",
+                        "Added tracked path: {} (will be scanned on next rescan)",
                         canonical_path.display()
                     );
                 }
@@ -1022,9 +1029,12 @@ impl InputHandler {
         }
     }
 
-    /// Initiate path removal by querying config for the selected sidebar root.
-    fn initiate_remove_path(app: &mut App, _config: &Config, db: &Database) {
-        // Get list of tracked roots from database
+    /// Initiate path removal by querying the database for the selected sidebar root.
+    ///
+    /// Roots defined in `config.tracked_paths` cannot be removed from the TUI
+    /// because they are re-seeded on every scan. The user must edit the config
+    /// file directly to remove those.
+    fn initiate_remove_path(app: &mut App, config: &Config, db: &Database) {
         let roots = match db.list_roots() {
             Ok(roots) => roots,
             Err(e) => {
@@ -1033,31 +1043,50 @@ impl InputHandler {
             }
         };
 
-        // Get the selected root path
         if let Some(root) = roots.get(app.sidebar_selected_index) {
-            app.pending_remove_path = Some(root.path.clone());
+            let is_config_root = config
+                .tracked_paths
+                .iter()
+                .any(|p| p.to_string_lossy() == root.path);
+
+            if is_config_root {
+                app.status_message =
+                    Some("This root is defined in config.toml — remove it there".to_string());
+                app.status_message_time = Some(std::time::Instant::now());
+            } else {
+                app.pending_remove_path = Some(root.path.clone());
+            }
         } else {
             tracing::warn!("No root selected for removal");
         }
     }
 
     /// Handle remove path confirmation (y/n/Esc).
-    fn handle_remove_path_confirmation(app: &mut App, config: &Config, key: KeyEvent) {
+    fn handle_remove_path_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
-                // User confirmed - remove the path
+                // User confirmed - remove the root from the database
                 if let Some(path_to_remove) = &app.pending_remove_path {
-                    let mut new_config = config.clone();
-
-                    // Remove from tracked_paths
-                    new_config.tracked_paths.retain(|p| p != path_to_remove);
-
-                    // Save config
-                    let paths = crate::config::AppPaths::new();
-                    if let Err(e) = new_config.save(&paths) {
-                        tracing::warn!("Failed to save config: {}", e);
-                    } else {
-                        tracing::info!("Removed tracked path: {}", path_to_remove);
+                    match db.get_root_by_path(path_to_remove) {
+                        Ok(Some(root)) => {
+                            if let Err(e) = db.delete_root(root.id) {
+                                tracing::warn!("Failed to remove root from database: {}", e);
+                            } else {
+                                tracing::info!("Removed tracked path: {}", path_to_remove);
+                                // If we were browsing this root, clear the view
+                                if app.current_path.starts_with(path_to_remove.as_str()) {
+                                    app.current_path.clear();
+                                    app.current_root_id.set(None);
+                                    app.focus_panel = FocusPanel::Sidebar;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::warn!("Root not found in database: {}", path_to_remove);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to look up root: {}", e);
+                        }
                     }
                 }
 
