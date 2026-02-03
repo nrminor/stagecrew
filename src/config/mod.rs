@@ -29,6 +29,15 @@ impl AppPaths {
         self.xdg.place_config_file("config.toml")
     }
 
+    /// Path to log file: `~/.cache/stagecrew/stagecrew.log`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be created.
+    pub fn log_file(&self) -> std::io::Result<PathBuf> {
+        self.xdg.place_cache_file("stagecrew.log")
+    }
+
     /// Determine the database file path based on configuration.
     ///
     /// Priority:

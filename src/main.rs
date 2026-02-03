@@ -10,6 +10,7 @@ mod removal;
 mod scanner;
 mod tui;
 
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -26,16 +27,25 @@ async fn main() -> Result<()> {
     // Initialize color_eyre for better error reports
     color_eyre::install()?;
 
-    // Initialize tracing
+    // Initialize paths (needed early for log file location)
+    let paths = AppPaths::new();
+
+    // Initialize tracing to an append-only log file so it never interferes
+    // with the TUI's terminal output. Defaults to warn; set RUST_LOG for more.
+    let log_path = paths.log_file().context("Failed to create log directory")?;
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .context("Failed to open log file")?;
     tracing_subscriber::fmt()
+        .with_writer(log_file)
+        .with_ansi(false)
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or_default();
-
-    // Initialize paths
-    let paths = AppPaths::new();
 
     // Handle init separately since it may need to create config before loading it
     if matches!(command, Command::Init) {
