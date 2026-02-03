@@ -142,25 +142,11 @@ fn render_file_list_view(
 fn render_file_view_header(
     app: &App,
     _config: &Config,
-    db: &Database,
+    _db: &Database,
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
-    // Fetch stats from database
-    let stats = match db.get_stats() {
-        Ok(s) => s,
-        Err(_) => {
-            // Use zeros if stats aren't available
-            crate::db::Stats {
-                total_files: 0,
-                total_size_bytes: 0,
-                files_within_warning: 0,
-                files_pending_approval: 0,
-                files_overdue: 0,
-                last_scan_completed: None,
-            }
-        }
-    };
+    let stats = app.cached_stats;
 
     // Allow: size values are guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
     #[allow(clippy::cast_sign_loss)]

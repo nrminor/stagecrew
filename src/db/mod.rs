@@ -634,6 +634,53 @@ impl Database {
             )
             .map_err(Into::into)
     }
+
+    /// Compute live statistics by querying the entries table directly.
+    ///
+    /// Unlike [`get_stats`](Self::get_stats), which reads pre-computed values
+    /// that are only refreshed during scans, this method always reflects the
+    /// current state of the entries table — including status changes from user
+    /// actions (ignore, approve, defer, etc.).
+    ///
+    /// The `last_scan_completed` field is still read from the stats table since
+    /// it is only meaningful as a scan-time value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn compute_live_stats(&self, expiration_days: u32, warning_days: u32) -> Result<Stats> {
+        let now = jiff::Timestamp::now().as_second();
+        let expiration_days_i64 = i64::from(expiration_days);
+        let warning_days_i64 = i64::from(warning_days);
+
+        self.conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status != 'removed'),
+                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries WHERE is_dir = 0 AND status != 'removed'),
+                    (SELECT COUNT(*) FROM entries
+                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
+                       AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?1 * 86400) - ?2) / 86400) <= ?3
+                       AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?1 * 86400) - ?2) / 86400) > 0),
+                    (SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status = 'pending'),
+                    (SELECT COUNT(*) FROM entries
+                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
+                       AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?1 * 86400) - ?2) / 86400) <= 0),
+                    (SELECT last_scan_completed FROM stats WHERE id = 1)",
+                (expiration_days_i64, now, warning_days_i64),
+                |row| {
+                    Ok(Stats {
+                        total_files: row.get(0)?,
+                        total_size_bytes: row.get(1)?,
+                        files_within_warning: row.get(2)?,
+                        files_pending_approval: row.get(3)?,
+                        files_overdue: row.get(4)?,
+                        last_scan_completed: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
 }
 
 #[cfg(test)]

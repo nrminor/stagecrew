@@ -130,6 +130,9 @@ pub struct App {
 
     /// When the status message was set (for auto-clearing after timeout).
     pub(crate) status_message_time: Option<std::time::Instant>,
+
+    /// Cached header stats, refreshed after actions and scans.
+    pub(crate) cached_stats: crate::db::Stats,
 }
 
 impl App {
@@ -379,6 +382,29 @@ impl App {
             scan_in_progress: false,
             status_message: None,
             status_message_time: None,
+            cached_stats: crate::db::Stats {
+                total_files: 0,
+                total_size_bytes: 0,
+                files_within_warning: 0,
+                files_pending_approval: 0,
+                files_overdue: 0,
+                last_scan_completed: None,
+            },
+        }
+    }
+
+    /// Refresh cached header stats from the entries table.
+    ///
+    /// Call this after any action that changes entry status (ignore, approve,
+    /// defer, unignore, delete) and after scan completion.
+    pub(crate) fn refresh_stats(
+        &mut self,
+        db: &crate::db::Database,
+        config: &crate::config::Config,
+    ) {
+        match db.compute_live_stats(config.expiration_days, config.warning_days) {
+            Ok(stats) => self.cached_stats = stats,
+            Err(e) => tracing::warn!("Failed to refresh stats: {}", e),
         }
     }
 
@@ -419,6 +445,9 @@ impl App {
 
         // Track the scan task handle so we can await it properly
         let mut scan_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+        // Load initial stats from the entries table
+        self.refresh_stats(db, config);
 
         // Main event loop
         loop {
@@ -508,6 +537,7 @@ impl App {
                     match result {
                         Ok(()) => {
                             self.status_message = Some("Scan complete".to_string());
+                            self.refresh_stats(db, config);
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Scan failed: {e}"));

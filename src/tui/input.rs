@@ -42,7 +42,7 @@ impl InputHandler {
             return;
         }
         if app.pending_entry_delete.is_some() {
-            Self::handle_entry_delete_confirmation(app, db, key);
+            Self::handle_entry_delete_confirmation(app, config, db, key);
             return;
         }
         if app.pending_entry_deferral.is_some() {
@@ -50,11 +50,11 @@ impl InputHandler {
             return;
         }
         if app.pending_entry_ignore.is_some() {
-            Self::handle_entry_ignore_confirmation(app, db, key);
+            Self::handle_entry_ignore_confirmation(app, config, db, key);
             return;
         }
         if app.pending_entry_approval.is_some() {
-            Self::handle_entry_approval_confirmation(app, db, key);
+            Self::handle_entry_approval_confirmation(app, config, db, key);
             return;
         }
 
@@ -440,7 +440,12 @@ impl InputHandler {
     }
 
     /// Handle entry deletion confirmation (y/n/Esc).
-    fn handle_entry_delete_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
+    fn handle_entry_delete_confirmation(
+        app: &mut App,
+        config: &Config,
+        db: &Database,
+        key: KeyEvent,
+    ) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 // User confirmed - perform the deletion for all pending entries
@@ -498,6 +503,7 @@ impl InputHandler {
                 // Clear pending deletion and selection
                 app.pending_entry_delete = None;
                 app.clear_selection();
+                app.refresh_stats(db, config);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel deletion
@@ -581,7 +587,7 @@ impl InputHandler {
     }
 
     /// Handle entry deferral input (digits/backspace/enter/esc).
-    fn handle_entry_deferral_input(app: &mut App, _config: &Config, db: &Database, key: KeyEvent) {
+    fn handle_entry_deferral_input(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 // Append digit to input buffer
@@ -655,6 +661,7 @@ impl InputHandler {
                 // Clear pending deferral and selection
                 app.pending_entry_deferral = None;
                 app.clear_selection();
+                app.refresh_stats(db, config);
             }
             KeyCode::Esc => {
                 // Cancel deferral input
@@ -734,7 +741,12 @@ impl InputHandler {
     }
 
     /// Handle entry ignore confirmation (y/n/Esc).
-    fn handle_entry_ignore_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
+    fn handle_entry_ignore_confirmation(
+        app: &mut App,
+        config: &Config,
+        db: &Database,
+        key: KeyEvent,
+    ) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 // User confirmed - perform the ignore for all pending entries
@@ -774,6 +786,7 @@ impl InputHandler {
                 // Clear pending ignore and selection
                 app.pending_entry_ignore = None;
                 app.clear_selection();
+                app.refresh_stats(db, config);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel ignore
@@ -853,7 +866,12 @@ impl InputHandler {
     }
 
     /// Handle entry approval confirmation (y/n/Esc).
-    fn handle_entry_approval_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
+    fn handle_entry_approval_confirmation(
+        app: &mut App,
+        config: &Config,
+        db: &Database,
+        key: KeyEvent,
+    ) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 // User confirmed - perform the approval for all pending entries
@@ -893,6 +911,7 @@ impl InputHandler {
                 // Clear pending approval and selection
                 app.pending_entry_approval = None;
                 app.clear_selection();
+                app.refresh_stats(db, config);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel approval
@@ -1014,6 +1033,7 @@ impl InputHandler {
         if success_count > 0 {
             app.status_message = Some(format!("Unignored {success_count} entry/entries"));
             app.status_message_time = Some(std::time::Instant::now());
+            app.refresh_stats(db, config);
         }
         app.clear_selection();
     }
