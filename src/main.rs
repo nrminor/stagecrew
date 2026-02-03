@@ -320,14 +320,14 @@ fn format_status_output(stats: &db::Stats) -> String {
         // Urgent: files need approval
         if files_within_warning > 0 {
             format!(
-                "stagecrew: {files_pending} files pending approval, {files_within_warning} within warning period"
+                "stagecrew: {files_pending} files pending approval, {files_within_warning} expiring soon"
             )
         } else {
             format!("stagecrew: {files_pending} files pending approval")
         }
     } else if files_within_warning > 0 {
         // Warning: files approaching expiration
-        format!("stagecrew: {files_within_warning} files within warning period")
+        format!("stagecrew: {files_within_warning} files expiring soon")
     } else {
         // All clear
         let formatted_size = format_bytes(
@@ -472,7 +472,7 @@ mod tests {
         };
         assert_eq!(
             format_status_output(&stats),
-            "stagecrew: 2 files pending approval, 4 within warning period"
+            "stagecrew: 2 files pending approval, 4 expiring soon"
         );
     }
 
@@ -504,7 +504,7 @@ mod tests {
         };
         assert_eq!(
             format_status_output(&stats),
-            "stagecrew: 5 files within warning period"
+            "stagecrew: 5 files expiring soon"
         );
     }
 

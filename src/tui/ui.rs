@@ -156,7 +156,7 @@ fn render_file_view_header(
     // Build header text, including status message if present
     let header_text = if let Some(status) = app.status_message.as_ref() {
         format!(
-            "Total: {} files, {} | Pending: {} | Within warning: {} | Overdue: {} | {}",
+            "Total: {} files, {} | Pending: {} | Expiring soon: {} | Overdue: {} | {}",
             stats.total_files,
             total_size_str,
             stats.files_pending_approval,
@@ -166,7 +166,7 @@ fn render_file_view_header(
         )
     } else {
         format!(
-            "Total: {} files, {} | Pending: {} | Within warning: {} | Overdue: {}",
+            "Total: {} files, {} | Pending: {} | Expiring soon: {} | Overdue: {}",
             stats.total_files,
             total_size_str,
             stats.files_pending_approval,

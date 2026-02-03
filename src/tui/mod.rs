@@ -466,8 +466,15 @@ impl App {
         config: &crate::config::Config,
     ) {
         match db.compute_live_stats(config.expiration_days, config.warning_days) {
-            Ok(stats) => self.cached_stats = stats,
-            Err(e) => tracing::warn!("Failed to refresh stats: {}", e),
+            Ok(stats) => {
+                tracing::debug!(
+                    total_files = stats.total_files,
+                    total_size = stats.total_size_bytes,
+                    "Refreshed live stats"
+                );
+                self.cached_stats = stats;
+            }
+            Err(e) => tracing::warn!("Failed to refresh stats: {e}"),
         }
     }
 

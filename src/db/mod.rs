@@ -660,12 +660,12 @@ impl Database {
                     (SELECT COALESCE(SUM(size_bytes), 0) FROM entries WHERE is_dir = 0 AND status != 'removed'),
                     (SELECT COUNT(*) FROM entries
                      WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
-                       AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?1 * 86400) - ?2) / 86400) <= ?3
-                       AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?1 * 86400) - ?2) / 86400) > 0),
+                       AND ((mtime + (?1 * 86400) - ?2) / 86400) <= ?3
+                       AND ((mtime + (?1 * 86400) - ?2) / 86400) > 0),
                     (SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status = 'pending'),
                     (SELECT COUNT(*) FROM entries
                      WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
-                       AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?1 * 86400) - ?2) / 86400) <= 0),
+                       AND ((mtime + (?1 * 86400) - ?2) / 86400) <= 0),
                     (SELECT last_scan_completed FROM stats WHERE id = 1)",
                 (expiration_days_i64, now, warning_days_i64),
                 |row| {
@@ -1375,5 +1375,65 @@ mod tests {
         assert_eq!(stats.files_pending_approval, 0);
         assert_eq!(stats.files_overdue, 0);
         assert_eq!(stats.last_scan_completed, None);
+    }
+
+    #[test]
+    fn compute_live_stats_counts_entries() {
+        let (_temp, db) = temp_database();
+        let root_id = db.insert_root("/data").expect("insert root");
+
+        // Insert a file entry
+        db.upsert_entry(
+            root_id,
+            "/data/file1.txt",
+            "/data",
+            false,
+            1024,
+            Some(1_700_000_000),
+        )
+        .expect("upsert");
+
+        let stats = db.compute_live_stats(90, 14).expect("compute_live_stats");
+        assert_eq!(stats.total_files, 1, "should count one file");
+        assert_eq!(stats.total_size_bytes, 1024, "should sum size");
+        // mtime is Nov 2023, well past 90-day expiration
+        assert_eq!(stats.files_overdue, 1, "old file should be overdue");
+    }
+
+    #[test]
+    fn compute_live_stats_cross_connection_visibility() {
+        let temp_file = NamedTempFile::new().expect("create temp file");
+        let path = temp_file.path();
+
+        // Connection 1: the "TUI" connection — opens first, stays open
+        let reader = Database::open(path).expect("open reader");
+
+        // Read stats before any data exists
+        let before = reader.compute_live_stats(90, 14).expect("stats before");
+        assert_eq!(before.total_files, 0);
+
+        // Connection 2: the "scan" connection — opens, writes, closes
+        {
+            let writer = Database::open(path).expect("open writer");
+            let root_id = writer.insert_root("/data").expect("insert root");
+            writer
+                .upsert_entry(
+                    root_id,
+                    "/data/file1.txt",
+                    "/data",
+                    false,
+                    1024,
+                    Some(1_700_000_000),
+                )
+                .expect("upsert");
+        } // writer dropped here, connection closed
+
+        // Connection 1 reads again — does it see the new data?
+        let after = reader.compute_live_stats(90, 14).expect("stats after");
+        eprintln!("AFTER: total_files={}", after.total_files);
+        assert_eq!(
+            after.total_files, 1,
+            "reader should see writer's committed data"
+        );
     }
 }
