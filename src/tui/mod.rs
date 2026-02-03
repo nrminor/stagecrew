@@ -6,6 +6,7 @@ mod ui;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
@@ -25,23 +26,28 @@ use crate::scanner::{Scanner, scan_and_persist};
 
 use input::InputHandler;
 
+/// An entry awaiting user confirmation for a pending action (delete, ignore, approve, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingEntry {
+    /// Database row ID.
+    pub id: i64,
+    /// Absolute filesystem path.
+    pub path: PathBuf,
+    /// Whether this entry is a directory (affects propagation to children).
+    pub is_dir: bool,
+}
+
 /// State for an in-progress deferral action.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingDeferral {
-    /// Entry ID being deferred (first entry in multi-select).
-    pub entry_id: i64,
-
-    /// Path of the entry being deferred (or first path in multi-select).
-    pub path: String,
+    /// Entries being deferred.
+    pub entries: Vec<PendingEntry>,
 
     /// Accumulated input buffer for days to defer.
     pub input: String,
 
     /// Default number of days to defer (from config).
     pub default_days: u32,
-
-    /// Additional entry IDs for multi-select deferral (excludes `entry_id` which is included separately).
-    pub additional_entry_ids: Vec<i64>,
 }
 
 /// Main TUI application state.
@@ -88,19 +94,16 @@ pub struct App {
     pub(crate) current_path: String,
 
     /// Pending entry deletion confirmation state.
-    /// Contains a vector of (`entry_id`, path, `is_dir`) tuples awaiting user confirmation.
-    pub(crate) pending_entry_delete: Option<Vec<(i64, String, bool)>>,
+    pub(crate) pending_entry_delete: Option<Vec<PendingEntry>>,
 
     /// Pending entry deferral input state.
     pub(crate) pending_entry_deferral: Option<PendingDeferral>,
 
     /// Pending entry ignore confirmation state.
-    /// Contains a vector of (`entry_id`, path) tuples awaiting user confirmation for ignoring.
-    pub(crate) pending_entry_ignore: Option<Vec<(i64, String)>>,
+    pub(crate) pending_entry_ignore: Option<Vec<PendingEntry>>,
 
     /// Pending entry approval confirmation state.
-    /// Contains a vector of (`entry_id`, path) tuples awaiting user confirmation for approval.
-    pub(crate) pending_entry_approval: Option<Vec<(i64, String)>>,
+    pub(crate) pending_entry_approval: Option<Vec<PendingEntry>>,
 
     /// Set of selected entry IDs for multi-select operations.
     pub(crate) selected_entries: HashSet<i64>,
@@ -175,7 +178,7 @@ impl App {
     }
 
     /// Get the pending entry deletion confirmation state.
-    pub fn pending_entry_delete(&self) -> Option<&Vec<(i64, String, bool)>> {
+    pub fn pending_entry_delete(&self) -> Option<&Vec<PendingEntry>> {
         self.pending_entry_delete.as_ref()
     }
 
@@ -185,12 +188,12 @@ impl App {
     }
 
     /// Get the pending entry ignore confirmation state.
-    pub fn pending_entry_ignore(&self) -> Option<&Vec<(i64, String)>> {
+    pub fn pending_entry_ignore(&self) -> Option<&Vec<PendingEntry>> {
         self.pending_entry_ignore.as_ref()
     }
 
     /// Get the pending entry approval confirmation state.
-    pub fn pending_entry_approval(&self) -> Option<&Vec<(i64, String)>> {
+    pub fn pending_entry_approval(&self) -> Option<&Vec<PendingEntry>> {
         self.pending_entry_approval.as_ref()
     }
 

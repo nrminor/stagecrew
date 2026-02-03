@@ -41,7 +41,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     if let Some(entries) = app.pending_entry_delete() {
         let count = entries.len();
         if count == 1 {
-            render_entry_delete_modal(frame, &entries[0].1, entries[0].2);
+            render_entry_delete_modal(frame, &entries[0].path.to_string_lossy(), entries[0].is_dir);
         } else {
             render_entry_delete_modal_multi(frame, count);
         }
@@ -49,10 +49,10 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
 
     // Render entry deferral input modal if pending entry deferral
     if let Some(deferral) = app.pending_entry_deferral() {
-        let count = 1 + deferral.additional_entry_ids.len();
+        let count = deferral.entries.len();
         render_deferral_modal(
             frame,
-            &deferral.path,
+            &deferral.entries[0].path.to_string_lossy(),
             &deferral.input,
             deferral.default_days,
             count,
@@ -63,7 +63,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     if let Some(entries) = app.pending_entry_ignore() {
         let count = entries.len();
         if count == 1 {
-            render_ignore_modal(frame, &entries[0].1);
+            render_ignore_modal(frame, &entries[0].path.to_string_lossy());
         } else {
             render_ignore_modal_multi(frame, count);
         }
@@ -73,7 +73,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     if let Some(entries) = app.pending_entry_approval() {
         let count = entries.len();
         if count == 1 {
-            render_confirmation_modal(frame, &entries[0].1);
+            render_confirmation_modal(frame, &entries[0].path.to_string_lossy());
         } else {
             render_confirmation_modal_multi(frame, count);
         }
@@ -379,33 +379,27 @@ fn render_main_entry_panel(
             };
             let size_cell = Cell::from(size_str);
 
-            // Format expiration (directories show as "-")
-            let expires_str = if entry.is_dir {
-                "-".to_string()
-            } else if *days_remaining >= 0 {
+            // Format expiration
+            let expires_str = if *days_remaining >= 0 {
                 format!("{days_remaining} days")
             } else {
                 format!("{} days ago", -days_remaining)
             };
             let expires_cell = Cell::from(expires_str);
 
-            // Display status from database, with expiration-based fallback for "tracked" entries
-            let status_str = if entry.is_dir {
-                "dir"
-            } else {
-                match entry.status.as_str() {
-                    "tracked" => {
-                        // For tracked entries, show expiration-based status
-                        if *days_remaining <= 0 {
-                            "overdue"
-                        } else if *days_remaining <= i64::from(config.warning_days) {
-                            "warning"
-                        } else {
-                            "tracked"
-                        }
+            // Display status from database, with expiration-based fallback for "tracked" entries.
+            // Directories show the same status as files based on their oldest child's mtime.
+            let status_str = match entry.status.as_str() {
+                "tracked" => {
+                    if *days_remaining <= 0 {
+                        "overdue"
+                    } else if *days_remaining <= i64::from(config.warning_days) {
+                        "warning"
+                    } else {
+                        "tracked"
                     }
-                    other => other, // Show actual status: ignored, deferred, pending, approved, etc.
                 }
+                other => other,
             };
             let status_cell = Cell::from(status_str);
 
@@ -421,11 +415,8 @@ fn render_main_entry_panel(
             } else {
                 *days_remaining
             };
-            let row_style = if entry.is_dir {
-                Style::default().fg(Color::Blue) // Directories are blue
-            } else {
-                determine_row_style(&entry.status, Some(effective_days), config.warning_days)
-            };
+            let row_style =
+                determine_row_style(&entry.status, Some(effective_days), config.warning_days);
 
             // Check if this entry is selected (multi-select)
             let is_selected = app.selected_entries().contains(&entry.id);
@@ -503,9 +494,9 @@ pub(super) fn sort_entry_rows(rows: &mut [(crate::db::Entry, i64)], sort_mode: S
     match sort_mode {
         SortMode::Expiration => {
             // Ascending (most urgent first), but:
-            // - Directories sort to the end (they don't have expiration)
             // - Ignored entries sort to the end (they're not expiring)
             // - Deferred entries sort by their deferred_until date
+            // - Directories sort by their oldest child's mtime
             rows.sort_by(|a, b| {
                 let key_a = expiration_sort_key_entry(&a.0, a.1);
                 let key_b = expiration_sort_key_entry(&b.0, b.1);
@@ -567,11 +558,6 @@ pub(super) fn sort_entry_rows(rows: &mut [(crate::db::Entry, i64)], sort_mode: S
 /// - Deferred entries return days until deferral expires
 /// - Other entries return their `days_remaining`
 fn expiration_sort_key_entry(entry: &crate::db::Entry, days_remaining: i64) -> i64 {
-    // Directories don't expire, sort near end
-    if entry.is_dir {
-        return i64::MAX - 1;
-    }
-
     match entry.status.as_str() {
         "ignored" => i64::MAX, // Sort to end
         "deferred" => {
@@ -629,11 +615,6 @@ fn expiration_indicator_entry(
     warning_days: u32,
     entry: &crate::db::Entry,
 ) -> (&'static str, Color) {
-    // Directories show a folder indicator
-    if entry.is_dir {
-        return (" ", Color::Blue);
-    }
-
     // Ignored entries show a dash — they won't expire
     if status == "ignored" {
         return ("—", Color::DarkGray);
@@ -1386,18 +1367,21 @@ mod tests {
     }
 
     #[test]
-    fn sort_entries_directories_sort_to_end_in_expiration() {
+    fn sort_entries_directories_sort_by_expiration_like_files() {
         let mut rows = vec![
-            (test_entry("/a.txt", 100, Some(1000)), 5),
-            (test_entry_dir("/subdir"), i64::MAX),
-            (test_entry("/b.txt", 100, Some(1000)), 10),
+            (test_entry("/a.txt", 100, Some(1000)), 10),
+            (test_entry_dir("/subdir"), 3),
+            (test_entry("/b.txt", 100, Some(1000)), 20),
         ];
 
         sort_entry_rows(&mut rows, SortMode::Expiration);
 
-        assert_eq!(rows[0].0.path, "/a.txt", "Most urgent file first");
-        assert_eq!(rows[1].0.path, "/b.txt", "Less urgent file second");
-        assert_eq!(rows[2].0.path, "/subdir", "Directory should sort to end");
+        assert_eq!(
+            rows[0].0.path, "/subdir",
+            "Most urgent (dir with 3 days) first"
+        );
+        assert_eq!(rows[1].0.path, "/a.txt", "File with 10 days second");
+        assert_eq!(rows[2].0.path, "/b.txt", "Least urgent (20 days) last");
     }
 
     #[test]
@@ -1419,7 +1403,7 @@ mod tests {
     fn sort_entries_by_name_alphabetical_dirs_first() {
         let mut rows = vec![
             (test_entry("/zebra.txt", 100, Some(1000)), 10),
-            (test_entry_dir("/alpha_dir"), i64::MAX),
+            (test_entry_dir("/alpha_dir"), 15),
             (test_entry("/mango.txt", 100, Some(1000)), 10),
         ];
 

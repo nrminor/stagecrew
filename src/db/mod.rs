@@ -540,6 +540,29 @@ impl Database {
         Ok(())
     }
 
+    /// Defer all entries whose path matches or is a child of the given prefix.
+    ///
+    /// This is the deferral counterpart to [`update_entries_by_path_prefix`](Self::update_entries_by_path_prefix),
+    /// setting both `status` and `deferred_until` in a single UPDATE.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub fn defer_entries_by_path_prefix(
+        &self,
+        path_prefix: &str,
+        deferred_until: i64,
+    ) -> Result<usize> {
+        let rows_affected = self.conn.execute(
+            "UPDATE entries
+             SET status = 'deferred', deferred_until = ?1, updated_at = strftime('%s', 'now')
+             WHERE path = ?2 OR path LIKE ?3",
+            (deferred_until, path_prefix, format!("{path_prefix}/%")),
+        )?;
+
+        Ok(rows_affected)
+    }
+
     /// Delete an entry from the filesystem and update its status.
     ///
     /// For files: removes the file from disk and marks as 'removed'.

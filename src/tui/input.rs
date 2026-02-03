@@ -1,5 +1,7 @@
 //! Vim-style keybinding handling.
 
+use std::path::PathBuf;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::ui::sort_entry_rows;
@@ -402,11 +404,15 @@ impl InputHandler {
             .collect();
         sort_entry_rows(&mut entry_rows, app.sort_mode());
 
-        // Determine which entries to delete (id, path, is_dir)
-        let entries_to_delete: Vec<(i64, String, bool)> = if app.selected_entries.is_empty() {
+        // Determine which entries to delete
+        let entries_to_delete: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
             // No selection - use currently focused entry
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
-                vec![(entry.id, entry.path.clone(), entry.is_dir)]
+                vec![super::PendingEntry {
+                    id: entry.id,
+                    path: PathBuf::from(&entry.path),
+                    is_dir: entry.is_dir,
+                }]
             } else {
                 tracing::warn!("No entry selected (index out of bounds)");
                 return;
@@ -416,7 +422,11 @@ impl InputHandler {
             entry_rows
                 .into_iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
-                .map(|(e, _)| (e.id, e.path.clone(), e.is_dir))
+                .map(|(e, _)| super::PendingEntry {
+                    id: e.id,
+                    path: PathBuf::from(&e.path),
+                    is_dir: e.is_dir,
+                })
                 .collect()
         };
 
@@ -443,16 +453,17 @@ impl InputHandler {
                     let mut fail_count = 0;
                     let total = entries.len();
 
-                    for (entry_id, path, is_dir) in entries {
-                        if let Err(e) = db.delete_entry(*entry_id, path, *is_dir) {
-                            tracing::warn!("Failed to delete entry {}: {}", path, e);
+                    for entry in entries {
+                        let path_str = entry.path.to_string_lossy();
+                        if let Err(e) = db.delete_entry(entry.id, &path_str, entry.is_dir) {
+                            tracing::warn!("Failed to delete entry {}: {}", path_str, e);
                             app.status_message = Some(format!("Delete failed: {e}"));
                             app.status_message_time = Some(std::time::Instant::now());
                             fail_count += 1;
                         } else {
                             success_count += 1;
                             // Record audit entry
-                            let detail = if *is_dir {
+                            let detail = if entry.is_dir {
                                 "Directory deleted by user"
                             } else {
                                 "File deleted by user"
@@ -460,7 +471,7 @@ impl InputHandler {
                             if let Err(e) = audit.record(
                                 &user,
                                 AuditAction::Remove,
-                                Some(path),
+                                Some(&*path_str),
                                 Some(detail),
                                 root_id,
                             ) {
@@ -531,10 +542,14 @@ impl InputHandler {
         sort_entry_rows(&mut entry_rows, app.sort_mode());
 
         // Determine which entries to defer
-        let entries_to_defer: Vec<i64> = if app.selected_entries.is_empty() {
+        let entries_to_defer: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
             // No selection - use currently focused entry
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
-                vec![entry.id]
+                vec![super::PendingEntry {
+                    id: entry.id,
+                    path: PathBuf::from(&entry.path),
+                    is_dir: entry.is_dir,
+                }]
             } else {
                 tracing::warn!("No entry selected (index out of bounds)");
                 return;
@@ -542,9 +557,13 @@ impl InputHandler {
         } else {
             // Use selected entries (selection is by ID, so sorting doesn't matter here)
             entry_rows
-                .iter()
+                .into_iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
-                .map(|(e, _)| e.id)
+                .map(|(e, _)| super::PendingEntry {
+                    id: e.id,
+                    path: PathBuf::from(&e.path),
+                    is_dir: e.is_dir,
+                })
                 .collect()
         };
 
@@ -553,19 +572,11 @@ impl InputHandler {
             return;
         }
 
-        // Get first entry path for display in modal
-        let first_entry_path = entry_rows
-            .iter()
-            .find(|(e, _)| entries_to_defer.contains(&e.id))
-            .map_or_else(|| "unknown".to_string(), |(e, _)| e.path.clone());
-
         // Set pending deferral state
         app.pending_entry_deferral = Some(super::PendingDeferral {
-            entry_id: entries_to_defer[0],
-            path: first_entry_path,
+            entries: entries_to_defer,
             input: String::new(),
             default_days: config.expiration_days,
-            additional_entry_ids: entries_to_defer[1..].to_vec(),
         });
     }
 
@@ -608,25 +619,31 @@ impl InputHandler {
                     let days_i64 = i64::from(days);
                     let deferred_until = now.as_second() + (days_i64 * 86400);
 
-                    // Update entry status to 'deferred' and set deferred_until for all entries
-                    let entry_ids_to_defer: Vec<i64> = std::iter::once(deferral.entry_id)
-                        .chain(deferral.additional_entry_ids.iter().copied())
-                        .collect();
-
                     let audit = AuditService::new(db);
                     let user = AuditService::current_user();
                     let details = Some(format!("Deferred for {days} days"));
                     let root_id = app.current_root_id.get();
 
-                    for entry_id in entry_ids_to_defer {
-                        if let Err(e) = db.defer_entry(entry_id, deferred_until) {
-                            tracing::warn!("Failed to defer entry with id {}: {}", entry_id, e);
+                    for entry in &deferral.entries {
+                        let path_str = entry.path.to_string_lossy();
+                        if let Err(e) = db.defer_entry(entry.id, deferred_until) {
+                            tracing::warn!("Failed to defer entry {}: {}", path_str, e);
                         } else {
-                            // Record audit entry (path is not available for all, using first entry's path)
+                            // Propagate to children if this is a directory
+                            if entry.is_dir
+                                && let Err(e) =
+                                    db.defer_entries_by_path_prefix(&path_str, deferred_until)
+                            {
+                                tracing::warn!(
+                                    "Failed to propagate deferral to children of {}: {}",
+                                    path_str,
+                                    e
+                                );
+                            }
                             if let Err(e) = audit.record(
                                 &user,
                                 AuditAction::Defer,
-                                Some(&deferral.path),
+                                Some(&*path_str),
                                 details.as_deref(),
                                 root_id,
                             ) {
@@ -682,10 +699,14 @@ impl InputHandler {
         sort_entry_rows(&mut entry_rows, app.sort_mode());
 
         // Determine which entries to ignore
-        let entries_to_ignore: Vec<(i64, String)> = if app.selected_entries.is_empty() {
+        let entries_to_ignore: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
             // No selection - use currently focused entry
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
-                vec![(entry.id, entry.path.clone())]
+                vec![super::PendingEntry {
+                    id: entry.id,
+                    path: PathBuf::from(&entry.path),
+                    is_dir: entry.is_dir,
+                }]
             } else {
                 tracing::warn!("No entry selected (index out of bounds)");
                 return;
@@ -695,7 +716,11 @@ impl InputHandler {
             entry_rows
                 .into_iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
-                .map(|(e, _)| (e.id, e.path.clone()))
+                .map(|(e, _)| super::PendingEntry {
+                    id: e.id,
+                    path: PathBuf::from(&e.path),
+                    is_dir: e.is_dir,
+                })
                 .collect()
         };
 
@@ -718,14 +743,29 @@ impl InputHandler {
                     let user = AuditService::current_user();
                     let root_id = app.current_root_id.get();
 
-                    for (entry_id, path) in entries {
-                        if let Err(e) = db.update_entry_status(*entry_id, "ignored") {
-                            tracing::warn!("Failed to ignore entry {}: {}", path, e);
+                    for entry in entries {
+                        let path_str = entry.path.to_string_lossy();
+                        if let Err(e) = db.update_entry_status(entry.id, "ignored") {
+                            tracing::warn!("Failed to ignore entry {}: {}", path_str, e);
                         } else {
-                            // Record audit entry
-                            if let Err(e) =
-                                audit.record(&user, AuditAction::Ignore, Some(path), None, root_id)
+                            // Propagate to children if this is a directory
+                            if entry.is_dir
+                                && let Err(e) =
+                                    db.update_entries_by_path_prefix(&path_str, "ignored")
                             {
+                                tracing::warn!(
+                                    "Failed to propagate ignore to children of {}: {}",
+                                    path_str,
+                                    e
+                                );
+                            }
+                            if let Err(e) = audit.record(
+                                &user,
+                                AuditAction::Ignore,
+                                Some(&*path_str),
+                                None,
+                                root_id,
+                            ) {
                                 tracing::warn!("Failed to record audit entry for ignore: {}", e);
                             }
                         }
@@ -778,10 +818,14 @@ impl InputHandler {
         sort_entry_rows(&mut entry_rows, app.sort_mode());
 
         // Determine which entries to approve
-        let entries_to_approve: Vec<(i64, String)> = if app.selected_entries.is_empty() {
+        let entries_to_approve: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
             // No selection - use currently focused entry
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
-                vec![(entry.id, entry.path.clone())]
+                vec![super::PendingEntry {
+                    id: entry.id,
+                    path: PathBuf::from(&entry.path),
+                    is_dir: entry.is_dir,
+                }]
             } else {
                 tracing::warn!("No entry selected (index out of bounds)");
                 return;
@@ -791,7 +835,11 @@ impl InputHandler {
             entry_rows
                 .into_iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
-                .map(|(e, _)| (e.id, e.path.clone()))
+                .map(|(e, _)| super::PendingEntry {
+                    id: e.id,
+                    path: PathBuf::from(&e.path),
+                    is_dir: e.is_dir,
+                })
                 .collect()
         };
 
@@ -814,14 +862,29 @@ impl InputHandler {
                     let user = AuditService::current_user();
                     let root_id = app.current_root_id.get();
 
-                    for (entry_id, path) in entries {
-                        if let Err(e) = db.update_entry_status(*entry_id, "approved") {
-                            tracing::warn!("Failed to approve entry {}: {}", path, e);
+                    for entry in entries {
+                        let path_str = entry.path.to_string_lossy();
+                        if let Err(e) = db.update_entry_status(entry.id, "approved") {
+                            tracing::warn!("Failed to approve entry {}: {}", path_str, e);
                         } else {
-                            // Record audit entry
-                            if let Err(e) =
-                                audit.record(&user, AuditAction::Approve, Some(path), None, root_id)
+                            // Propagate to children if this is a directory
+                            if entry.is_dir
+                                && let Err(e) =
+                                    db.update_entries_by_path_prefix(&path_str, "approved")
                             {
+                                tracing::warn!(
+                                    "Failed to propagate approval to children of {}: {}",
+                                    path_str,
+                                    e
+                                );
+                            }
+                            if let Err(e) = audit.record(
+                                &user,
+                                AuditAction::Approve,
+                                Some(&*path_str),
+                                None,
+                                root_id,
+                            ) {
                                 tracing::warn!("Failed to record audit entry for approval: {}", e);
                             }
                         }
@@ -874,12 +937,16 @@ impl InputHandler {
         sort_entry_rows(&mut entry_rows, app.sort_mode());
 
         // Determine which entries to unignore
-        let entries_to_unignore: Vec<(i64, String)> = if app.selected_entries.is_empty() {
+        let entries_to_unignore: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
             // No selection - use currently focused entry
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
                 // Only unignore if currently ignored
                 if entry.status == "ignored" {
-                    vec![(entry.id, entry.path.clone())]
+                    vec![super::PendingEntry {
+                        id: entry.id,
+                        path: PathBuf::from(&entry.path),
+                        is_dir: entry.is_dir,
+                    }]
                 } else {
                     app.status_message = Some("Entry is not ignored".to_string());
                     app.status_message_time = Some(std::time::Instant::now());
@@ -894,7 +961,11 @@ impl InputHandler {
             entry_rows
                 .into_iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id) && e.status == "ignored")
-                .map(|(e, _)| (e.id, e.path.clone()))
+                .map(|(e, _)| super::PendingEntry {
+                    id: e.id,
+                    path: PathBuf::from(&e.path),
+                    is_dir: e.is_dir,
+                })
                 .collect()
         };
 
@@ -910,17 +981,31 @@ impl InputHandler {
         let root_id = app.current_root_id.get();
 
         let mut success_count = 0;
-        for (entry_id, path) in &entries_to_unignore {
-            if let Err(e) = db.update_entry_status(*entry_id, "tracked") {
-                tracing::warn!("Failed to unignore entry {}: {}", path, e);
+        for entry in &entries_to_unignore {
+            let path_str = entry.path.to_string_lossy();
+            if let Err(e) = db.update_entry_status(entry.id, "tracked") {
+                tracing::warn!("Failed to unignore entry {}: {}", path_str, e);
                 app.status_message = Some(format!("Unignore failed: {e}"));
                 app.status_message_time = Some(std::time::Instant::now());
             } else {
                 success_count += 1;
-                // Record audit entry
-                if let Err(e) =
-                    audit.record(&user, AuditAction::Unignore, Some(path), None, root_id)
+                // Propagate to children if this is a directory
+                if entry.is_dir
+                    && let Err(e) = db.update_entries_by_path_prefix(&path_str, "tracked")
                 {
+                    tracing::warn!(
+                        "Failed to propagate unignore to children of {}: {}",
+                        path_str,
+                        e
+                    );
+                }
+                if let Err(e) = audit.record(
+                    &user,
+                    AuditAction::Unignore,
+                    Some(&*path_str),
+                    None,
+                    root_id,
+                ) {
                     tracing::warn!("Failed to record audit entry for unignore: {}", e);
                 }
             }
@@ -1109,7 +1194,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::db::Database;
-    use crate::tui::PendingDeferral;
+    use crate::tui::{PendingDeferral, PendingEntry};
     use tempfile::tempdir;
 
     fn make_key_event(code: KeyCode) -> KeyEvent {
@@ -1611,9 +1696,10 @@ mod tests {
             .as_ref()
             .expect("Expected pending delete");
         assert_eq!(files.len(), 1, "Should have one file pending deletion");
-        assert_eq!(files[0].0, file_ids[0], "Should be first file");
+        assert_eq!(files[0].id, file_ids[0], "Should be first file");
         assert_eq!(
-            files[0].1, "/test/dir/file1.txt",
+            files[0].path,
+            PathBuf::from("/test/dir/file1.txt"),
             "Path should match first file"
         );
     }
@@ -1665,8 +1751,11 @@ mod tests {
         app.current_root_id.set(Some(root_id));
 
         // Manually set pending delete (simulating 'd' key press)
-        // pending_entry_delete is Vec<(entry_id, path, is_dir)>
-        app.pending_entry_delete = Some(vec![(entry_id, file_path_str.to_string(), false)]);
+        app.pending_entry_delete = Some(vec![PendingEntry {
+            id: entry_id,
+            path: PathBuf::from(file_path_str),
+            is_dir: false,
+        }]);
 
         // Press 'y' to confirm
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));
@@ -1715,12 +1804,12 @@ mod tests {
         let (dir_id, file_ids) = setup_with_files(&db);
         app.current_root_id.set(Some(dir_id));
 
-        // Manually set pending delete (entry_id, path, is_dir)
-        app.pending_entry_delete = Some(vec![(
-            file_ids[0],
-            "/test/dir/file1.txt".to_string(),
-            false,
-        )]);
+        // Manually set pending delete
+        app.pending_entry_delete = Some(vec![PendingEntry {
+            id: file_ids[0],
+            path: PathBuf::from("/test/dir/file1.txt"),
+            is_dir: false,
+        }]);
 
         // Press 'n' to cancel
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('n')));
@@ -1772,7 +1861,11 @@ mod tests {
             .pending_entry_deferral
             .as_ref()
             .expect("Expected deferral");
-        assert_eq!(deferral.path, "/test/dir/file1.txt");
+        assert_eq!(deferral.entries.len(), 1);
+        assert_eq!(
+            deferral.entries[0].path,
+            PathBuf::from("/test/dir/file1.txt")
+        );
         assert_eq!(deferral.default_days, 90); // from test_config
     }
 
@@ -1788,11 +1881,13 @@ mod tests {
 
         // Manually set pending deferral (empty input means use default)
         app.pending_entry_deferral = Some(PendingDeferral {
-            entry_id: file_ids[0],
-            path: "/test/dir/file1.txt".to_string(),
+            entries: vec![PendingEntry {
+                id: file_ids[0],
+                path: PathBuf::from("/test/dir/file1.txt"),
+                is_dir: false,
+            }],
             input: String::new(),
             default_days: 90,
-            additional_entry_ids: Vec::new(),
         });
 
         // Press Enter to confirm
@@ -1834,11 +1929,13 @@ mod tests {
 
         // Manually set pending deferral with input
         app.pending_entry_deferral = Some(PendingDeferral {
-            entry_id: file_ids[0],
-            path: "/test/dir/file1.txt".to_string(),
+            entries: vec![PendingEntry {
+                id: file_ids[0],
+                path: PathBuf::from("/test/dir/file1.txt"),
+                is_dir: false,
+            }],
             input: "30".to_string(),
             default_days: 90,
-            additional_entry_ids: Vec::new(),
         });
 
         // Press Enter to confirm
@@ -1900,8 +1997,8 @@ mod tests {
             .as_ref()
             .expect("Expected pending ignore");
         assert_eq!(entries.len(), 1, "Should have one entry pending ignore");
-        assert_eq!(entries[0].0, file_ids[0]);
-        assert_eq!(entries[0].1, "/test/dir/file1.txt");
+        assert_eq!(entries[0].id, file_ids[0]);
+        assert_eq!(entries[0].path, PathBuf::from("/test/dir/file1.txt"));
     }
 
     #[test]
@@ -1915,7 +2012,11 @@ mod tests {
         app.current_root_id.set(Some(dir_id));
 
         // Manually set pending ignore
-        app.pending_entry_ignore = Some(vec![(file_ids[0], "/test/dir/file1.txt".to_string())]);
+        app.pending_entry_ignore = Some(vec![PendingEntry {
+            id: file_ids[0],
+            path: PathBuf::from("/test/dir/file1.txt"),
+            is_dir: false,
+        }]);
 
         // Press 'y' to confirm
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));
@@ -1965,8 +2066,8 @@ mod tests {
             .as_ref()
             .expect("Expected pending approval");
         assert_eq!(entries.len(), 1, "Should have one entry pending approval");
-        assert_eq!(entries[0].0, file_ids[0]);
-        assert_eq!(entries[0].1, "/test/dir/file1.txt");
+        assert_eq!(entries[0].id, file_ids[0]);
+        assert_eq!(entries[0].path, PathBuf::from("/test/dir/file1.txt"));
     }
 
     #[test]
@@ -1980,7 +2081,11 @@ mod tests {
         app.current_root_id.set(Some(dir_id));
 
         // Manually set pending approval
-        app.pending_entry_approval = Some(vec![(file_ids[0], "/test/dir/file1.txt".to_string())]);
+        app.pending_entry_approval = Some(vec![PendingEntry {
+            id: file_ids[0],
+            path: PathBuf::from("/test/dir/file1.txt"),
+            is_dir: false,
+        }]);
 
         // Press 'y' to confirm
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));

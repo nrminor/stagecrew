@@ -298,8 +298,10 @@ pub async fn scan_and_persist(
                 .parent()
                 .map_or_else(|| root.path.clone(), |p| p.to_string_lossy().to_string());
 
-            // Insert directory entry (is_dir=true, size_bytes=0, mtime=None)
-            db.upsert_entry(root_id, &dir_path_str, &parent_path, true, 0, None)?;
+            // Insert directory entry with oldest child mtime so directories
+            // sort meaningfully by expiration alongside files.
+            let dir_mtime = dir_info.oldest_mtime.map(jiff::Timestamp::as_second);
+            db.upsert_entry(root_id, &dir_path_str, &parent_path, true, 0, dir_mtime)?;
 
             // Insert file entries for this directory
             for entry in jwalk::WalkDir::new(&dir_info.path)
