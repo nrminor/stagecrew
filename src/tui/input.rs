@@ -86,12 +86,10 @@ impl InputHandler {
                 }
             }
             KeyCode::Char('h') => {
-                // Show sidebar if hidden, then focus it
-                app.sidebar_visible = true;
-                app.focus_panel = FocusPanel::Sidebar;
+                Self::handle_h_navigation(app, db);
             }
             KeyCode::Char('l') => {
-                app.focus_panel = FocusPanel::MainPanel;
+                Self::handle_l_navigation(app, config, db);
             }
 
             // Navigation (vim-style) - operates on focused panel
@@ -299,6 +297,77 @@ impl InputHandler {
         // Any key closes the help view
         let _ = key;
         app.view = View::FileList;
+    }
+
+    /// Handle `h` key: ranger-style navigate up or return to sidebar.
+    ///
+    /// - Main panel, inside a subdirectory: navigate up to parent
+    /// - Main panel, at root level: return focus to sidebar
+    /// - Sidebar: no-op
+    fn handle_h_navigation(app: &mut App, db: &Database) {
+        match app.focus_panel {
+            FocusPanel::Sidebar => {}
+            FocusPanel::MainPanel => {
+                if let Ok(roots) = db.list_roots() {
+                    let at_root_level = roots.iter().any(|r| r.path == app.current_path);
+                    if at_root_level {
+                        app.sidebar_visible = true;
+                        app.focus_panel = FocusPanel::Sidebar;
+                    } else {
+                        app.navigate_up();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle `l` key: ranger-style navigate into directory or enter root.
+    ///
+    /// - Sidebar: enter the selected root (same as Enter)
+    /// - Main panel, cursor on a directory: navigate into it
+    /// - Main panel, cursor on a file: no-op
+    fn handle_l_navigation(app: &mut App, config: &Config, db: &Database) {
+        match app.focus_panel {
+            FocusPanel::Sidebar => {
+                // Enter the selected root (same behavior as Enter)
+                if let Ok(roots) = db.list_roots() {
+                    let idx = app
+                        .sidebar_selected_index
+                        .min(roots.len().saturating_sub(1));
+                    if let Some(root) = roots.get(idx) {
+                        app.navigate_into(root.path.clone());
+                        app.focus_panel = FocusPanel::MainPanel;
+                    }
+                }
+            }
+            FocusPanel::MainPanel => {
+                if app.current_path.is_empty() {
+                    return;
+                }
+
+                // Look up the entry under the cursor
+                let Ok(entries) = db.list_entries_by_parent(app.current_path()) else {
+                    return;
+                };
+
+                let mut entry_rows: Vec<_> = entries
+                    .into_iter()
+                    .map(|entry| {
+                        let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
+                            calculate_expiration(m, config.expiration_days)
+                        });
+                        (entry, days_remaining)
+                    })
+                    .collect();
+                sort_entry_rows(&mut entry_rows, app.sort_mode());
+
+                if let Some((entry, _)) = entry_rows.get(app.entry_selected_index)
+                    && entry.is_dir
+                {
+                    app.navigate_into(entry.path.clone());
+                }
+            }
+        }
     }
 
     /// Initiate entry deletion by querying the database for the selected entry/entries.
@@ -1054,25 +1123,142 @@ mod tests {
     }
 
     #[test]
-    fn h_focuses_sidebar() {
+    fn h_at_root_level_returns_to_sidebar() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let config = test_config();
 
+        db.insert_root("/test/downloads")
+            .expect("Failed to create test root");
+
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/downloads".to_string();
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
+        assert!(app.sidebar_visible);
     }
 
     #[test]
-    fn l_focuses_main_panel() {
+    fn h_in_subdirectory_navigates_up() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        db.insert_root("/test/downloads")
+            .expect("Failed to create test root");
+
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/downloads/subdir".to_string();
+        app.entry_selected_index = 3;
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
+
+        assert_eq!(app.current_path, "/test/downloads");
+        assert_eq!(app.entry_selected_index, 0);
+        assert_eq!(app.focus_panel, FocusPanel::MainPanel);
+    }
+
+    #[test]
+    fn h_in_sidebar_is_noop() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let config = test_config();
 
         app.focus_panel = FocusPanel::Sidebar;
+        app.sidebar_selected_index = 2;
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
+
+        assert_eq!(app.focus_panel, FocusPanel::Sidebar);
+        assert_eq!(app.sidebar_selected_index, 2);
+    }
+
+    #[test]
+    fn l_from_sidebar_enters_root() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        db.insert_root("/test/downloads")
+            .expect("Failed to create test root");
+
+        app.focus_panel = FocusPanel::Sidebar;
+        app.sidebar_selected_index = 0;
+
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('l')));
+
+        assert_eq!(app.current_path, "/test/downloads");
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
+        assert_eq!(app.entry_selected_index, 0);
+    }
+
+    #[test]
+    fn l_on_directory_entry_navigates_into_it() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        let root_id = db
+            .insert_root("/test/downloads")
+            .expect("Failed to create test root");
+        db.upsert_entry(
+            root_id,
+            "/test/downloads/subdir",
+            "/test/downloads",
+            true,
+            0,
+            None,
+        )
+        .expect("Failed to create dir entry");
+        db.upsert_entry(
+            root_id,
+            "/test/downloads/file.txt",
+            "/test/downloads",
+            false,
+            100,
+            Some(1000),
+        )
+        .expect("Failed to create file entry");
+
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/downloads".to_string();
+        // Sort by name puts directories first, so index 0 should be the subdir
+        app.sort_mode = SortMode::Name;
+        app.entry_selected_index = 0;
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('l')));
+
+        assert_eq!(app.current_path, "/test/downloads/subdir");
+        assert_eq!(app.entry_selected_index, 0);
+    }
+
+    #[test]
+    fn l_on_file_entry_is_noop() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        let root_id = db
+            .insert_root("/test/downloads")
+            .expect("Failed to create test root");
+        db.upsert_entry(
+            root_id,
+            "/test/downloads/file.txt",
+            "/test/downloads",
+            false,
+            100,
+            Some(1000),
+        )
+        .expect("Failed to create file entry");
+
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/downloads".to_string();
+        app.entry_selected_index = 0;
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('l')));
+
+        // Should remain in the same directory
+        assert_eq!(app.current_path, "/test/downloads");
     }
 
     #[test]

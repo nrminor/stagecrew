@@ -253,8 +253,6 @@ impl App {
     /// Navigate up to the parent directory.
     ///
     /// If already at a root level, this is a no-op.
-    // TODO(cleanup): Will be used when implementing directory drill-down navigation.
-    #[allow(dead_code)]
     pub(crate) fn navigate_up(&mut self) {
         if let Some(parent) = std::path::Path::new(&self.current_path).parent() {
             self.current_path = parent.to_string_lossy().to_string();
