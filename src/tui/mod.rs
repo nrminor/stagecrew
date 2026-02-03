@@ -313,6 +313,23 @@ impl App {
         self.clear_search();
     }
 
+    /// Auto-enter the first root if no root is currently entered.
+    ///
+    /// Called at startup and after scan completion so the user sees files
+    /// immediately instead of the empty "Select a root" prompt. This is a
+    /// no-op when a root is already entered (i.e., `current_path` is non-empty).
+    pub(crate) fn auto_enter_first_root(&mut self, db: &crate::db::Database) {
+        if !self.current_path.is_empty() {
+            return;
+        }
+        if let Ok(roots) = db.list_roots()
+            && !roots.is_empty()
+        {
+            self.navigate_into(roots[0].path.clone());
+            self.current_root_id.set(Some(roots[0].id));
+        }
+    }
+
     /// Navigate up to the parent directory.
     ///
     /// If already at a root level, this is a no-op.
@@ -499,15 +516,9 @@ impl App {
         let mut terminal_manager = TerminalManager::setup().map_err(crate::error::Error::Io)?;
         let mut event_stream = EventStream::new();
 
-        // Auto-enter the root if there's exactly one tracked root.
-        // This is the common case and saves the user from having to Tab to the
-        // sidebar and press Enter just to see their files.
-        if let Ok(roots) = db.list_roots()
-            && roots.len() == 1
-        {
-            self.navigate_into(roots[0].path.clone());
-            self.current_root_id.set(Some(roots[0].id));
-        }
+        // Auto-enter the first root so the user sees files immediately
+        // instead of staring at "Select a root from the sidebar".
+        self.auto_enter_first_root(db);
 
         // Channel for receiving scan completion results
         let (scan_tx, mut scan_rx) =
@@ -608,6 +619,7 @@ impl App {
                         Ok(()) => {
                             self.status_message = Some("Scan complete".to_string());
                             self.refresh_stats(db, config);
+                            self.auto_enter_first_root(db);
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Scan failed: {e}"));
