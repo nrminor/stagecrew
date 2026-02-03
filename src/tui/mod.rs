@@ -51,8 +51,8 @@ pub(crate) struct PendingDeferral {
 }
 
 /// Main TUI application state.
-// Allow: The bools represent independent flags (quit, sidebar visibility, scan state)
-// that don't naturally form a state machine. Each has distinct semantics.
+// Allow: The bools represent independent flags (quit, sidebar visibility, scan state,
+// search input) that don't naturally form a state machine. Each has distinct semantics.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     /// Whether the app should quit.
@@ -133,6 +133,15 @@ pub struct App {
 
     /// Cached header stats, refreshed after actions and scans.
     pub(crate) cached_stats: crate::db::Stats,
+
+    /// Active search query. `Some` means a search is active (either typing or
+    /// navigating matches). `None` means normal mode with no search.
+    pub(crate) search_query: Option<String>,
+
+    /// Whether the user is currently typing into the search input.
+    /// When true, keystrokes go to the search buffer. When false (but
+    /// `search_query` is `Some`), the user can navigate matches with n/N.
+    pub(crate) search_input_active: bool,
 }
 
 impl App {
@@ -248,21 +257,31 @@ impl App {
         self.entry_selected_index = len.saturating_sub(1);
     }
 
+    /// Clear any active search state.
+    pub(crate) fn clear_search(&mut self) {
+        self.search_query = None;
+        self.search_input_active = false;
+    }
+
     /// Navigate into a directory entry.
     ///
     /// Sets the current path to the given directory path and resets entry selection.
+    /// Also clears any active search since results are directory-specific.
     pub(crate) fn navigate_into(&mut self, path: String) {
         self.current_path = path;
         self.entry_selected_index = 0;
+        self.clear_search();
     }
 
     /// Navigate up to the parent directory.
     ///
     /// If already at a root level, this is a no-op.
+    /// Clears any active search since results are directory-specific.
     pub(crate) fn navigate_up(&mut self) {
         if let Some(parent) = std::path::Path::new(&self.current_path).parent() {
             self.current_path = parent.to_string_lossy().to_string();
             self.entry_selected_index = 0;
+            self.clear_search();
         }
     }
 }
@@ -390,6 +409,8 @@ impl App {
                 files_overdue: 0,
                 last_scan_completed: None,
             },
+            search_query: None,
+            search_input_active: false,
         }
     }
 
@@ -689,6 +710,14 @@ mod tests {
         assert_eq!(
             app.pending_remove_path, None,
             "App should start with no pending remove path"
+        );
+        assert_eq!(
+            app.search_query, None,
+            "App should start with no search query"
+        );
+        assert!(
+            !app.search_input_active,
+            "App should start with search input inactive"
         );
     }
 

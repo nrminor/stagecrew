@@ -329,6 +329,17 @@ fn render_main_entry_panel(
         app.entry_selected_index().min(entry_rows.len() - 1)
     };
 
+    // Compute search matches for highlighting
+    let search_match_set: std::collections::HashSet<usize> = app
+        .search_query
+        .as_ref()
+        .map(|q| {
+            super::input::find_search_matches(&entry_rows, q)
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Build entry table rows
     let rows: Vec<Row> = entry_rows
         .iter()
@@ -406,9 +417,10 @@ fn render_main_entry_panel(
 
             // Check if this entry is selected (multi-select)
             let is_selected = app.selected_entries().contains(&entry.id);
+            let is_search_match = search_match_set.contains(&idx);
 
             // Highlight selected row and show focus
-            let style = if is_selected {
+            let mut style = if is_selected {
                 // Selected entries get dark gray background for contrast with all text colors
                 row_style.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
             } else if idx == selected_idx {
@@ -421,6 +433,11 @@ fn render_main_entry_panel(
             } else {
                 row_style
             };
+
+            // Underline search matches so they stand out
+            if is_search_match {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
 
             Row::new(vec![
                 indicator_cell,
@@ -455,10 +472,26 @@ fn render_main_entry_panel(
         format!(" | {} selected", app.selected_entries().len())
     };
 
+    let search_info = if let Some(query) = &app.search_query {
+        if query.is_empty() {
+            String::new()
+        } else {
+            let match_count = search_match_set.len();
+            format!(
+                " | /{query} ({match_count} match{plural})",
+                plural = if match_count == 1 { "" } else { "es" }
+            )
+        }
+    } else {
+        String::new()
+    };
+
     let table = Table::new(rows, widths)
         .block(
             Block::default()
-                .title(format!("Entries{sort_indicator}{selection_info}"))
+                .title(format!(
+                    "Entries{sort_indicator}{selection_info}{search_info}"
+                ))
                 .borders(Borders::ALL)
                 .border_style(if app.focus_panel() == FocusPanel::MainPanel {
                     Style::default().fg(Color::Cyan)
@@ -862,6 +895,15 @@ Press any key to close this help screen";
 
 /// Render the footer with context-sensitive keybinding hints.
 fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    // Search input bar takes over the footer when typing
+    if app.search_input_active {
+        let query = app.search_query.as_deref().unwrap_or("");
+        let search_bar = Paragraph::new(format!("/{query}█"))
+            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+        frame.render_widget(search_bar, area);
+        return;
+    }
+
     // Check if any modal is open (takes precedence over normal view hints)
     let modal_open = app.pending_entry_delete().is_some()
         || app.pending_entry_deferral().is_some()
@@ -885,7 +927,11 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
             View::FileList => {
                 let selection_count = app.selected_entries().len();
 
-                if selection_count > 0 {
+                if app.search_query.is_some() {
+                    // Search navigation mode
+                    "[n] Next match [N] Prev match [/] New search [Esc] Clear search [q] Quit"
+                        .to_string()
+                } else if selection_count > 0 {
                     // When files are selected, show multi-select action hints
                     format!(
                         "[d] Delete {selection_count} [r] Defer {selection_count} [i] Ignore {selection_count} [x] Approve {selection_count} [Esc] Clear [q] Quit"

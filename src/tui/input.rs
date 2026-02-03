@@ -14,6 +14,32 @@ use crate::scanner::calculate_expiration;
 /// Handles keyboard input with vim-style bindings.
 pub(crate) struct InputHandler;
 
+/// Find indices of entries whose filename contains the query (case-insensitive).
+///
+/// Operates on the already-sorted entry rows so indices correspond to what the
+/// user sees on screen.
+pub(super) fn find_search_matches(
+    entry_rows: &[(crate::db::Entry, i64)],
+    query: &str,
+) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query_lower = query.to_lowercase();
+    entry_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (entry, _))| {
+            let filename = std::path::Path::new(&entry.path).file_name().map_or_else(
+                || entry.path.to_lowercase(),
+                |f| f.to_string_lossy().to_lowercase(),
+            );
+            filename.contains(&query_lower)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 impl InputHandler {
     /// Process a key event and update app state.
     ///
@@ -32,6 +58,12 @@ impl InputHandler {
     // it into smaller functions would obscure the input handling flow.
     #[allow(clippy::too_many_lines)]
     fn handle_file_list(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+        // Check for search input mode first (highest priority text input)
+        if app.search_input_active {
+            Self::handle_search_input(app, config, db, key);
+            return;
+        }
+
         // Check for pending confirmations/inputs first
         if app.pending_add_path.is_some() {
             Self::handle_add_path_input(app, config, db, key);
@@ -148,7 +180,11 @@ impl InputHandler {
                 Self::enter_visual_mode(app, db);
             }
             KeyCode::Esc if app.focus_panel == FocusPanel::MainPanel => {
-                app.clear_selection();
+                if app.search_query.is_some() {
+                    app.clear_search();
+                } else {
+                    app.clear_selection();
+                }
             }
 
             // Entry-level actions (only when main panel is focused)
@@ -166,6 +202,18 @@ impl InputHandler {
             }
             KeyCode::Char('u') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::unignore_entry(app, config, db);
+            }
+
+            // Search
+            KeyCode::Char('/') if app.focus_panel == FocusPanel::MainPanel => {
+                app.search_query = Some(String::new());
+                app.search_input_active = true;
+            }
+            KeyCode::Char('n') if app.search_query.is_some() => {
+                Self::jump_to_next_match(app, config, db);
+            }
+            KeyCode::Char('N') if app.search_query.is_some() => {
+                Self::jump_to_prev_match(app, config, db);
             }
 
             // Views
@@ -1036,6 +1084,107 @@ impl InputHandler {
             app.refresh_stats(db, config);
         }
         app.clear_selection();
+    }
+
+    /// Handle search input mode (typing a search query).
+    ///
+    /// Characters append to the query, Backspace removes, Enter confirms and
+    /// jumps to the first match, Esc cancels the search entirely.
+    fn handle_search_input(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) if !c.is_control() => {
+                if let Some(ref mut query) = app.search_query {
+                    query.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(ref mut query) = app.search_query {
+                    query.pop();
+                }
+            }
+            KeyCode::Enter => {
+                // Confirm search and jump to first match
+                app.search_input_active = false;
+                Self::jump_to_first_match(app, config, db);
+            }
+            KeyCode::Esc => {
+                // Cancel search entirely
+                app.clear_search();
+            }
+            _ => {}
+        }
+    }
+
+    /// Jump the cursor to the first search match in the current entry list.
+    fn jump_to_first_match(app: &mut App, config: &Config, db: &Database) {
+        let matches = Self::compute_current_matches(app, config, db);
+        if let Some(&first) = matches.first() {
+            app.entry_selected_index = first;
+        }
+    }
+
+    /// Jump the cursor to the next search match after the current position.
+    fn jump_to_next_match(app: &mut App, config: &Config, db: &Database) {
+        let matches = Self::compute_current_matches(app, config, db);
+        if matches.is_empty() {
+            return;
+        }
+        // Find the first match index strictly after the current cursor position.
+        // If none found, wrap around to the first match.
+        let next = matches
+            .iter()
+            .find(|&&idx| idx > app.entry_selected_index)
+            .or_else(|| matches.first());
+        if let Some(&idx) = next {
+            app.entry_selected_index = idx;
+        }
+    }
+
+    /// Jump the cursor to the previous search match before the current position.
+    fn jump_to_prev_match(app: &mut App, config: &Config, db: &Database) {
+        let matches = Self::compute_current_matches(app, config, db);
+        if matches.is_empty() {
+            return;
+        }
+        // Find the last match index strictly before the current cursor position.
+        // If none found, wrap around to the last match.
+        let prev = matches
+            .iter()
+            .rev()
+            .find(|&&idx| idx < app.entry_selected_index)
+            .or_else(|| matches.last());
+        if let Some(&idx) = prev {
+            app.entry_selected_index = idx;
+        }
+    }
+
+    /// Compute search match indices for the current directory's sorted entry list.
+    fn compute_current_matches(app: &App, config: &Config, db: &Database) -> Vec<usize> {
+        let query = match &app.search_query {
+            Some(q) if !q.is_empty() => q,
+            _ => return Vec::new(),
+        };
+
+        if app.current_path.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(entries) = db.list_entries_by_parent(app.current_path()) else {
+            return Vec::new();
+        };
+
+        let mut entry_rows: Vec<_> = entries
+            .into_iter()
+            .map(|entry| {
+                let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
+                    calculate_expiration(m, config.expiration_days)
+                });
+                (entry, days_remaining)
+            })
+            .collect();
+        sort_entry_rows(&mut entry_rows, app.sort_mode());
+
+        find_search_matches(&entry_rows, query)
     }
 
     /// Handle add path text input (characters/backspace/enter/esc).
@@ -2127,6 +2276,394 @@ mod tests {
         assert_eq!(
             entry.status, "approved",
             "Entry status should be 'approved'"
+        );
+    }
+
+    // ===== Search Tests =====
+
+    /// Helper to set up a root with several distinctly-named files for search tests.
+    fn setup_search_files(db: &Database) -> i64 {
+        let root_id = db
+            .insert_root("/test/search")
+            .expect("Failed to create test root");
+
+        // Create files with distinct names so we can test matching.
+        // Default sort is by expiration (ascending), so mtime order matters.
+        // Use mtimes that produce a known sort order:
+        //   readme.md   mtime=100 (oldest, expires soonest)
+        //   data.csv    mtime=200
+        //   report.pdf  mtime=300
+        //   notes.txt   mtime=400 (newest, expires last)
+        for (name, mtime) in [
+            ("readme.md", 100),
+            ("data.csv", 200),
+            ("report.pdf", 300),
+            ("notes.txt", 400),
+        ] {
+            let path = format!("/test/search/{name}");
+            db.upsert_entry(root_id, &path, "/test/search", false, 1000, Some(mtime))
+                .unwrap_or_else(|_| panic!("Failed to create entry {name}"));
+        }
+
+        root_id
+    }
+
+    #[test]
+    fn find_search_matches_returns_matching_indices() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        let root_id = setup_search_files(&db);
+
+        let entries = db
+            .list_entries_by_parent("/test/search")
+            .expect("Failed to list entries");
+        let mut entry_rows: Vec<_> = entries
+            .into_iter()
+            .map(|entry| {
+                let days = entry.mtime.map_or(i64::MAX, |m| {
+                    calculate_expiration(m, config.expiration_days)
+                });
+                (entry, days)
+            })
+            .collect();
+        sort_entry_rows(&mut entry_rows, SortMode::Expiration);
+
+        // "re" should match "readme.md" and "report.pdf"
+        let matches = find_search_matches(&entry_rows, "re");
+        assert_eq!(matches.len(), 2);
+
+        // Verify the matched entries are the right ones
+        let matched_names: Vec<String> = matches
+            .iter()
+            .map(|&i| {
+                std::path::Path::new(&entry_rows[i].0.path)
+                    .file_name()
+                    .expect("entry should have filename")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert!(matched_names.iter().any(|n| n == "readme.md"));
+        assert!(matched_names.iter().any(|n| n == "report.pdf"));
+
+        // Verify no root_id warning by using it
+        let _ = root_id;
+    }
+
+    #[test]
+    fn find_search_matches_is_case_insensitive() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_search_files(&db);
+
+        let entries = db
+            .list_entries_by_parent("/test/search")
+            .expect("Failed to list entries");
+        let mut entry_rows: Vec<_> = entries
+            .into_iter()
+            .map(|entry| {
+                let days = entry.mtime.map_or(i64::MAX, |m| {
+                    calculate_expiration(m, config.expiration_days)
+                });
+                (entry, days)
+            })
+            .collect();
+        sort_entry_rows(&mut entry_rows, SortMode::Expiration);
+
+        // "README" should still match "readme.md"
+        let matches = find_search_matches(&entry_rows, "README");
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn find_search_matches_empty_query_returns_empty() {
+        let entry_rows: Vec<(crate::db::Entry, i64)> = Vec::new();
+        let matches = find_search_matches(&entry_rows, "");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_search_matches_no_matches_returns_empty() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_search_files(&db);
+
+        let entries = db
+            .list_entries_by_parent("/test/search")
+            .expect("Failed to list entries");
+        let mut entry_rows: Vec<_> = entries
+            .into_iter()
+            .map(|entry| {
+                let days = entry.mtime.map_or(i64::MAX, |m| {
+                    calculate_expiration(m, config.expiration_days)
+                });
+                (entry, days)
+            })
+            .collect();
+        sort_entry_rows(&mut entry_rows, SortMode::Expiration);
+
+        let matches = find_search_matches(&entry_rows, "zzzzz");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn slash_enters_search_mode() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        app.focus_panel = FocusPanel::MainPanel;
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('/')));
+
+        assert!(app.search_input_active, "Search input should be active");
+        assert_eq!(
+            app.search_query,
+            Some(String::new()),
+            "Search query should be initialized to empty string"
+        );
+    }
+
+    #[test]
+    fn slash_only_works_in_main_panel() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        app.focus_panel = FocusPanel::Sidebar;
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('/')));
+
+        assert!(
+            !app.search_input_active,
+            "Search should not activate from sidebar"
+        );
+        assert_eq!(app.search_query, None);
+    }
+
+    #[test]
+    fn search_input_appends_characters() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Enter search mode
+        app.search_query = Some(String::new());
+        app.search_input_active = true;
+
+        // Type "abc"
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('a')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('b')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('c')));
+
+        assert_eq!(app.search_query, Some("abc".to_string()));
+        assert!(app.search_input_active);
+    }
+
+    #[test]
+    fn search_input_backspace_removes_character() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        app.search_query = Some("abc".to_string());
+        app.search_input_active = true;
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Backspace));
+
+        assert_eq!(app.search_query, Some("ab".to_string()));
+    }
+
+    #[test]
+    fn search_input_esc_cancels_search() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        app.search_query = Some("test".to_string());
+        app.search_input_active = true;
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Esc));
+
+        assert_eq!(app.search_query, None, "Search query should be cleared");
+        assert!(
+            !app.search_input_active,
+            "Search input should be deactivated"
+        );
+    }
+
+    #[test]
+    fn search_enter_confirms_and_jumps_to_first_match() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        setup_search_files(&db);
+
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/search".to_string();
+        app.entry_selected_index = 0;
+
+        // Enter search mode and type "notes"
+        app.search_query = Some("notes".to_string());
+        app.search_input_active = true;
+
+        // Press Enter to confirm
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+
+        assert!(
+            !app.search_input_active,
+            "Search input should be deactivated after Enter"
+        );
+        assert_eq!(
+            app.search_query,
+            Some("notes".to_string()),
+            "Search query should be preserved after confirmation"
+        );
+
+        // Cursor should have moved to the matching entry.
+        // "notes.txt" has mtime=400, so in expiration sort it's last (index 3).
+        // We verify the cursor moved away from 0.
+        assert_ne!(
+            app.entry_selected_index, 0,
+            "Cursor should jump to matching entry (not stay at 0)"
+        );
+    }
+
+    #[test]
+    fn n_jumps_to_next_match() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        setup_search_files(&db);
+
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/search".to_string();
+
+        // Set up confirmed search for "re" (matches readme.md and report.pdf)
+        app.search_query = Some("re".to_string());
+        app.search_input_active = false;
+
+        // Verify matches exist
+        let matches = InputHandler::compute_current_matches(&app, &config, &db);
+        assert!(
+            matches.len() >= 2,
+            "Expected at least 2 matches for 're', got {matches:?}"
+        );
+
+        // Start at position 0
+        app.entry_selected_index = 0;
+
+        // Call jump_to_next_match directly to verify wrapping
+        InputHandler::jump_to_next_match(&mut app, &config, &db);
+        let first_jump = app.entry_selected_index;
+        assert!(
+            matches.contains(&first_jump),
+            "First jump ({first_jump}) should land on a match. Matches: {matches:?}"
+        );
+
+        // Jump again — should advance to next match or wrap
+        InputHandler::jump_to_next_match(&mut app, &config, &db);
+        let second_jump = app.entry_selected_index;
+        assert!(
+            matches.contains(&second_jump),
+            "Second jump ({second_jump}) should land on a match. Matches: {matches:?}"
+        );
+
+        // The two positions should be different (we have 2+ matches)
+        assert_ne!(
+            first_jump, second_jump,
+            "Consecutive jumps should land on different matches"
+        );
+    }
+
+    #[test]
+    fn capital_n_jumps_to_previous_match() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        setup_search_files(&db);
+
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/search".to_string();
+
+        // Set up confirmed search for "re" (matches readme.md and report.pdf)
+        app.search_query = Some("re".to_string());
+        app.search_input_active = false;
+
+        // Move to a position past the first match
+        app.entry_selected_index = 3;
+
+        // Press 'N' to go to previous match
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('N')));
+
+        // Should have moved to a match before position 3
+        assert!(
+            app.entry_selected_index < 3,
+            "N should jump to a match before current position"
+        );
+    }
+
+    #[test]
+    fn esc_clears_confirmed_search() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        app.focus_panel = FocusPanel::MainPanel;
+
+        // Set up confirmed search (not in input mode)
+        app.search_query = Some("test".to_string());
+        app.search_input_active = false;
+
+        // Press Esc
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Esc));
+
+        assert_eq!(app.search_query, None, "Esc should clear search query");
+        assert!(!app.search_input_active);
+    }
+
+    #[test]
+    fn navigate_into_clears_search() {
+        let mut app = App::new();
+        app.search_query = Some("test".to_string());
+        app.search_input_active = false;
+
+        app.navigate_into("/some/path".to_string());
+
+        assert_eq!(app.search_query, None, "Navigation should clear search");
+    }
+
+    #[test]
+    fn navigate_up_clears_search() {
+        let mut app = App::new();
+        app.current_path = "/some/path/child".to_string();
+        app.search_query = Some("test".to_string());
+        app.search_input_active = false;
+
+        app.navigate_up();
+
+        assert_eq!(app.search_query, None, "Navigation up should clear search");
+    }
+
+    #[test]
+    fn n_without_search_is_noop() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        app.focus_panel = FocusPanel::MainPanel;
+        app.entry_selected_index = 2;
+
+        // No search active — 'n' should not be intercepted as search navigation
+        // (it falls through to the default match arm)
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('n')));
+
+        assert_eq!(
+            app.entry_selected_index, 2,
+            "n without search should not move cursor"
         );
     }
 }
