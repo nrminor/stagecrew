@@ -163,7 +163,7 @@ impl App {
     }
 
     /// Get the current root ID selected in sidebar.
-    // Allow: Public API for TUI state access, will be used by upcoming directory navigation.
+    // Allow: Will be used by TUI-014 directory navigation to determine root boundaries.
     #[allow(dead_code)]
     pub fn current_root_id(&self) -> Option<i64> {
         self.current_root_id.get()
@@ -245,8 +245,6 @@ impl App {
     /// Navigate into a directory entry.
     ///
     /// Sets the current path to the given directory path and resets entry selection.
-    // TODO(cleanup): Will be used when implementing directory drill-down navigation.
-    #[allow(dead_code)]
     pub(crate) fn navigate_into(&mut self, path: String) {
         self.current_path = path;
         self.entry_selected_index = 0;
@@ -403,6 +401,16 @@ impl App {
     ) -> Result<()> {
         let mut terminal_manager = TerminalManager::setup().map_err(crate::error::Error::Io)?;
         let mut event_stream = EventStream::new();
+
+        // Auto-enter the root if there's exactly one tracked root.
+        // This is the common case and saves the user from having to Tab to the
+        // sidebar and press Enter just to see their files.
+        if let Ok(roots) = db.list_roots()
+            && roots.len() == 1
+        {
+            self.navigate_into(roots[0].path.clone());
+            self.current_root_id.set(Some(roots[0].id));
+        }
 
         // Channel for receiving scan completion results
         let (scan_tx, mut scan_rx) =

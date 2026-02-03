@@ -179,6 +179,29 @@ impl InputHandler {
                 }
             }
 
+            // Enter a root from the sidebar
+            KeyCode::Enter if app.focus_panel == FocusPanel::Sidebar => {
+                if let Ok(roots) = db.list_roots() {
+                    let idx = app
+                        .sidebar_selected_index
+                        .min(roots.len().saturating_sub(1));
+                    if let Some(root) = roots.get(idx) {
+                        app.navigate_into(root.path.clone());
+                        app.focus_panel = FocusPanel::MainPanel;
+                    }
+                }
+            }
+
+            // Return to sidebar from main panel at root level
+            KeyCode::Backspace if app.focus_panel == FocusPanel::MainPanel => {
+                if let Ok(roots) = db.list_roots() {
+                    let at_root_level = roots.iter().any(|r| r.path == app.current_path);
+                    if at_root_level {
+                        app.focus_panel = FocusPanel::Sidebar;
+                    }
+                }
+            }
+
             // Path management (A = add, X = remove from sidebar)
             KeyCode::Char('A') => {
                 // Initiate add path modal
@@ -1233,6 +1256,82 @@ mod tests {
             make_key_event_with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
         assert!(app.should_quit);
+    }
+
+    // ===== Root Entry/Exit Tests =====
+
+    #[test]
+    fn enter_in_sidebar_sets_current_path_and_focuses_main_panel() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        // Create a root in the database
+        db.insert_root("/test/downloads")
+            .expect("Failed to create test root");
+
+        // Focus sidebar and select the root
+        app.focus_panel = FocusPanel::Sidebar;
+        app.sidebar_selected_index = 0;
+
+        // Press Enter
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+
+        assert_eq!(app.current_path, "/test/downloads");
+        assert_eq!(app.focus_panel, FocusPanel::MainPanel);
+        assert_eq!(app.entry_selected_index, 0);
+    }
+
+    #[test]
+    fn enter_in_sidebar_with_no_roots_is_noop() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        app.focus_panel = FocusPanel::Sidebar;
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+
+        assert!(app.current_path.is_empty());
+        assert_eq!(app.focus_panel, FocusPanel::Sidebar);
+    }
+
+    #[test]
+    fn backspace_at_root_level_returns_to_sidebar() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        db.insert_root("/test/downloads")
+            .expect("Failed to create test root");
+
+        // Simulate being inside a root
+        app.current_path = "/test/downloads".to_string();
+        app.focus_panel = FocusPanel::MainPanel;
+
+        // Press Backspace
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Backspace));
+
+        assert_eq!(app.focus_panel, FocusPanel::Sidebar);
+    }
+
+    #[test]
+    fn backspace_not_at_root_level_is_noop() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        db.insert_root("/test/downloads")
+            .expect("Failed to create test root");
+
+        // Simulate being inside a subdirectory within a root
+        app.current_path = "/test/downloads/subdir".to_string();
+        app.focus_panel = FocusPanel::MainPanel;
+
+        // Press Backspace — should not switch to sidebar since we're not at root level
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Backspace));
+
+        assert_eq!(app.focus_panel, FocusPanel::MainPanel);
     }
 
     // ===== File-Level Action Tests =====
