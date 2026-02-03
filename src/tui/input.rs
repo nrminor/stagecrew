@@ -40,6 +40,33 @@ pub(super) fn find_search_matches(
         .collect()
 }
 
+/// Query entries for the current path, compute days remaining, and sort them.
+///
+/// Returns `None` if the current path is empty or the database query fails.
+/// The returned vec is sorted according to `sort_mode` and the indices match
+/// what the user sees on screen.
+pub(super) fn sorted_entry_rows(
+    app: &App,
+    config: &Config,
+    db: &Database,
+) -> Option<Vec<(crate::db::Entry, i64)>> {
+    if app.current_path.is_empty() {
+        return None;
+    }
+    let entries = db.list_entries_by_parent(app.current_path()).ok()?;
+    let mut rows: Vec<_> = entries
+        .into_iter()
+        .map(|entry| {
+            let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
+                calculate_expiration(m, config.expiration_days)
+            });
+            (entry, days_remaining)
+        })
+        .collect();
+    sort_entry_rows(&mut rows, app.sort_mode());
+    Some(rows)
+}
+
 impl InputHandler {
     /// Process a key event and update app state.
     ///
@@ -133,6 +160,7 @@ impl InputHandler {
                 }
                 FocusPanel::MainPanel => {
                     app.entry_selected_index = app.entry_selected_index.saturating_add(1);
+                    Self::update_visual_selection(app, config, db);
                 }
             },
             KeyCode::Char('k') | KeyCode::Up => match app.focus_panel {
@@ -141,13 +169,17 @@ impl InputHandler {
                 }
                 FocusPanel::MainPanel => {
                     app.entry_selected_index = app.entry_selected_index.saturating_sub(1);
+                    Self::update_visual_selection(app, config, db);
                 }
             },
             KeyCode::Char('g') => {
                 // Go to top of focused panel
                 match app.focus_panel {
                     FocusPanel::Sidebar => app.sidebar_selected_index = 0,
-                    FocusPanel::MainPanel => app.entry_selected_index = 0,
+                    FocusPanel::MainPanel => {
+                        app.entry_selected_index = 0;
+                        Self::update_visual_selection(app, config, db);
+                    }
                 }
             }
             KeyCode::Char('G') => {
@@ -158,6 +190,7 @@ impl InputHandler {
                     }
                     FocusPanel::MainPanel => {
                         app.select_last_entry(app.entry_list_len.get());
+                        Self::update_visual_selection(app, config, db);
                     }
                 }
             }
@@ -177,10 +210,12 @@ impl InputHandler {
                 Self::toggle_entry_selection(app, config, db);
             }
             KeyCode::Char('v') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::enter_visual_mode(app, db);
+                Self::toggle_visual_mode(app, config, db);
             }
             KeyCode::Esc if app.focus_panel == FocusPanel::MainPanel => {
-                if app.search_query.is_some() {
+                if app.is_visual_mode() {
+                    app.exit_visual_mode();
+                } else if app.search_query.is_some() {
                     app.clear_search();
                 } else {
                     app.clear_selection();
@@ -265,63 +300,69 @@ impl InputHandler {
 
     /// Toggle selection of the currently focused file.
     fn toggle_entry_selection(app: &mut App, config: &Config, db: &Database) {
-        // Get entries for current path
-        if app.current_path.is_empty() {
-            tracing::warn!("Cannot toggle selection: no path selected");
+        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+            tracing::warn!("Cannot toggle selection: no path selected or query failed");
             return;
-        }
-
-        // Query entries for current browsing path
-        let entries = match db.list_entries_by_parent(app.current_path()) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("Failed to query entries: {}", e);
-                return;
-            }
         };
 
-        // Sort entries the same way the UI does so indices match
-        let mut entry_rows: Vec<_> = entries
-            .into_iter()
-            .map(|entry| {
-                let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
-                });
-                (entry, days_remaining)
-            })
-            .collect();
-        sort_entry_rows(&mut entry_rows, app.sort_mode());
-
-        // Get the selected entry based on entry_selected_index
         let Some((entry, _)) = entry_rows.get(app.entry_selected_index) else {
             tracing::warn!("No entry selected (index out of bounds)");
             return;
         };
+
+        // Exit visual mode if active — Space is a manual override
+        app.exit_visual_mode();
 
         // Toggle selection and advance cursor for hold-to-multi-select behavior
         app.toggle_entry_selection(entry.id);
         app.entry_selected_index = app.entry_selected_index.saturating_add(1);
     }
 
-    /// Enter visual mode by selecting all visible entries in the current directory.
-    fn enter_visual_mode(app: &mut App, db: &Database) {
-        // Get entries for current path
-        if app.current_path.is_empty() {
-            tracing::warn!("Cannot enter visual mode: no path selected");
+    /// Recompute the visual selection after a cursor movement.
+    ///
+    /// No-op if visual mode is not active.
+    fn update_visual_selection(app: &mut App, config: &Config, db: &Database) {
+        if !app.is_visual_mode() {
+            return;
+        }
+        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+            return;
+        };
+        let entry_ids: Vec<i64> = entry_rows.iter().map(|(e, _)| e.id).collect();
+        app.recompute_visual_selection(&entry_ids);
+    }
+
+    /// Toggle visual mode on/off.
+    ///
+    /// On entry: snapshots the current selection, sets the anchor at the cursor,
+    /// and selects the entry under the cursor.
+    /// On exit (pressing `v` again): keeps the selection, clears visual state.
+    fn toggle_visual_mode(app: &mut App, config: &Config, db: &Database) {
+        if app.is_visual_mode() {
+            app.exit_visual_mode();
             return;
         }
 
-        // Query entries for current browsing path
-        let entries = match db.list_entries_by_parent(app.current_path()) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("Failed to query entries: {}", e);
-                return;
-            }
+        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+            tracing::warn!("Cannot enter visual mode: no path selected or query failed");
+            return;
         };
 
-        // Select all entry IDs
-        for entry in entries {
+        if entry_rows.is_empty() {
+            return;
+        }
+
+        // Snapshot current selection so visual range is additive
+        app.pre_visual_selection = app.selected_entries.clone();
+
+        // Set anchor at current cursor position
+        let cursor = app
+            .entry_selected_index
+            .min(entry_rows.len().saturating_sub(1));
+        app.visual_anchor = Some(cursor);
+
+        // Select the entry under the cursor
+        if let Some((entry, _)) = entry_rows.get(cursor) {
             app.selected_entries.insert(entry.id);
         }
     }
@@ -358,6 +399,7 @@ impl InputHandler {
         match app.focus_panel {
             FocusPanel::Sidebar => {}
             FocusPanel::MainPanel => {
+                app.exit_visual_mode();
                 if let Ok(roots) = db.list_roots() {
                     let at_root_level = roots.iter().any(|r| r.path == app.current_path);
                     if at_root_level {
@@ -391,29 +433,14 @@ impl InputHandler {
                 }
             }
             FocusPanel::MainPanel => {
-                if app.current_path.is_empty() {
-                    return;
-                }
-
-                // Look up the entry under the cursor
-                let Ok(entries) = db.list_entries_by_parent(app.current_path()) else {
+                let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
                     return;
                 };
-
-                let mut entry_rows: Vec<_> = entries
-                    .into_iter()
-                    .map(|entry| {
-                        let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
-                            calculate_expiration(m, config.expiration_days)
-                        });
-                        (entry, days_remaining)
-                    })
-                    .collect();
-                sort_entry_rows(&mut entry_rows, app.sort_mode());
 
                 if let Some((entry, _)) = entry_rows.get(app.entry_selected_index)
                     && entry.is_dir
                 {
+                    app.exit_visual_mode();
                     app.navigate_into(entry.path.clone());
                 }
             }
@@ -548,8 +575,9 @@ impl InputHandler {
                     app.status_message = Some("No files pending delete".to_string());
                     app.status_message_time = Some(std::time::Instant::now());
                 }
-                // Clear pending deletion and selection
+                // Clear pending deletion, visual mode, and selection
                 app.pending_entry_delete = None;
+                app.exit_visual_mode();
                 app.clear_selection();
                 app.refresh_stats(db, config);
             }
@@ -706,8 +734,9 @@ impl InputHandler {
                         }
                     }
                 }
-                // Clear pending deferral and selection
+                // Clear pending deferral, visual mode, and selection
                 app.pending_entry_deferral = None;
+                app.exit_visual_mode();
                 app.clear_selection();
                 app.refresh_stats(db, config);
             }
@@ -831,8 +860,9 @@ impl InputHandler {
                         }
                     }
                 }
-                // Clear pending ignore and selection
+                // Clear pending ignore, visual mode, and selection
                 app.pending_entry_ignore = None;
+                app.exit_visual_mode();
                 app.clear_selection();
                 app.refresh_stats(db, config);
             }
@@ -956,8 +986,9 @@ impl InputHandler {
                         }
                     }
                 }
-                // Clear pending approval and selection
+                // Clear pending approval, visual mode, and selection
                 app.pending_entry_approval = None;
+                app.exit_visual_mode();
                 app.clear_selection();
                 app.refresh_stats(db, config);
             }
@@ -1083,6 +1114,7 @@ impl InputHandler {
             app.status_message_time = Some(std::time::Instant::now());
             app.refresh_stats(db, config);
         }
+        app.exit_visual_mode();
         app.clear_selection();
     }
 
@@ -2665,5 +2697,328 @@ mod tests {
             app.entry_selected_index, 2,
             "n without search should not move cursor"
         );
+    }
+
+    // ===== Visual Mode Tests =====
+
+    /// Helper to set up a root with 5 files for visual mode tests.
+    /// Returns the `root_id`. Entries are sorted by expiration (ascending mtime).
+    /// Sorted order: alpha (100), bravo (200), charlie (300), delta (400), echo (500).
+    fn setup_visual_files(db: &Database) -> i64 {
+        let root_id = db
+            .insert_root("/test/visual")
+            .expect("Failed to create test root");
+
+        for (name, mtime) in [
+            ("alpha", 100),
+            ("bravo", 200),
+            ("charlie", 300),
+            ("delta", 400),
+            ("echo", 500),
+        ] {
+            let path = format!("/test/visual/{name}");
+            db.upsert_entry(root_id, &path, "/test/visual", false, 1000, Some(mtime))
+                .unwrap_or_else(|_| panic!("Failed to create entry {name}"));
+        }
+
+        root_id
+    }
+
+    /// Helper to get sorted entry IDs for the visual test directory.
+    fn visual_entry_ids(db: &Database, config: &Config) -> Vec<i64> {
+        let app = {
+            let mut a = App::new();
+            a.current_path = "/test/visual".to_string();
+            a
+        };
+        sorted_entry_rows(&app, config, db)
+            .expect("should have entries")
+            .iter()
+            .map(|(e, _)| e.id)
+            .collect()
+    }
+
+    #[test]
+    fn v_enters_visual_mode_with_anchor_at_cursor() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual".to_string();
+        app.entry_selected_index = 2; // charlie
+
+        assert!(!app.is_visual_mode());
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+
+        assert!(app.is_visual_mode());
+        assert_eq!(app.visual_anchor, Some(2));
+        // The entry at index 2 should be selected
+        let ids = visual_entry_ids(&db, &config);
+        assert!(app.selected_entries.contains(&ids[2]));
+        assert_eq!(app.selected_entries.len(), 1);
+    }
+
+    #[test]
+    fn v_again_exits_visual_mode_keeping_selection() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual".to_string();
+        app.entry_selected_index = 1;
+
+        // Enter visual mode
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        assert!(app.is_visual_mode());
+
+        let ids = visual_entry_ids(&db, &config);
+        assert!(app.selected_entries.contains(&ids[1]));
+
+        // Exit visual mode with v again
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        assert!(!app.is_visual_mode());
+        // Selection should be preserved
+        assert!(app.selected_entries.contains(&ids[1]));
+    }
+
+    #[test]
+    fn visual_mode_j_extends_selection_downward() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual".to_string();
+        app.entry_list_len.set(5);
+        app.entry_selected_index = 1; // bravo
+
+        // Enter visual mode at index 1
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+
+        // Move down to index 3
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+
+        let ids = visual_entry_ids(&db, &config);
+        // Should have indices 1, 2, 3 selected (bravo, charlie, delta)
+        assert!(app.selected_entries.contains(&ids[1]));
+        assert!(app.selected_entries.contains(&ids[2]));
+        assert!(app.selected_entries.contains(&ids[3]));
+        assert!(!app.selected_entries.contains(&ids[0]));
+        assert!(!app.selected_entries.contains(&ids[4]));
+    }
+
+    #[test]
+    fn visual_mode_k_extends_selection_upward() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual".to_string();
+        app.entry_list_len.set(5);
+        app.entry_selected_index = 3; // delta
+
+        // Enter visual mode at index 3
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+
+        // Move up to index 1
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('k')));
+
+        let ids = visual_entry_ids(&db, &config);
+        // Should have indices 1, 2, 3 selected
+        assert!(app.selected_entries.contains(&ids[1]));
+        assert!(app.selected_entries.contains(&ids[2]));
+        assert!(app.selected_entries.contains(&ids[3]));
+        assert!(!app.selected_entries.contains(&ids[0]));
+        assert!(!app.selected_entries.contains(&ids[4]));
+    }
+
+    #[test]
+    fn visual_mode_preserves_pre_existing_space_selections() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual".to_string();
+        app.entry_list_len.set(5);
+        app.entry_selected_index = 0;
+
+        let ids = visual_entry_ids(&db, &config);
+
+        // Space-select item 0 (alpha) — Space also advances cursor to 1
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char(' ')));
+        assert!(app.selected_entries.contains(&ids[0]));
+        assert_eq!(app.entry_selected_index, 1);
+
+        // Now enter visual mode at index 1 (bravo)
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+
+        // Move down to index 3 (delta)
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+
+        // Alpha (pre-visual) + bravo, charlie, delta (visual range) should all be selected
+        assert!(
+            app.selected_entries.contains(&ids[0]),
+            "pre-visual Space selection should be preserved"
+        );
+        assert!(app.selected_entries.contains(&ids[1]));
+        assert!(app.selected_entries.contains(&ids[2]));
+        assert!(app.selected_entries.contains(&ids[3]));
+        assert!(!app.selected_entries.contains(&ids[4]));
+    }
+
+    #[test]
+    fn visual_mode_shrinks_when_cursor_reverses() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual".to_string();
+        app.entry_list_len.set(5);
+        app.entry_selected_index = 1; // bravo
+
+        // Enter visual mode
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+
+        // Extend down to index 3
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+
+        let ids = visual_entry_ids(&db, &config);
+        assert_eq!(app.selected_entries.len(), 3); // 1, 2, 3
+
+        // Now reverse: move back up to index 2
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('k')));
+
+        // Range should shrink to [1, 2]
+        assert!(app.selected_entries.contains(&ids[1]));
+        assert!(app.selected_entries.contains(&ids[2]));
+        assert!(
+            !app.selected_entries.contains(&ids[3]),
+            "delta should be deselected after cursor moved back"
+        );
+    }
+
+    #[test]
+    fn esc_exits_visual_mode_but_keeps_selection() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual".to_string();
+        app.entry_list_len.set(5);
+        app.entry_selected_index = 1;
+
+        // Enter visual mode and extend
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+
+        let ids = visual_entry_ids(&db, &config);
+        assert_eq!(app.selected_entries.len(), 2);
+
+        // Esc exits visual mode
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Esc));
+        assert!(!app.is_visual_mode());
+        // Selection preserved
+        assert!(app.selected_entries.contains(&ids[1]));
+        assert!(app.selected_entries.contains(&ids[2]));
+    }
+
+    #[test]
+    fn space_exits_visual_mode() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual".to_string();
+        app.entry_list_len.set(5);
+        app.entry_selected_index = 2;
+
+        // Enter visual mode
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        assert!(app.is_visual_mode());
+
+        // Space should exit visual mode
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char(' ')));
+        assert!(!app.is_visual_mode());
+    }
+
+    #[test]
+    fn h_navigation_exits_visual_mode() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual/subdir".to_string();
+        app.entry_selected_index = 0;
+
+        // Manually enter visual mode state
+        app.visual_anchor = Some(0);
+
+        // h navigates up and should exit visual mode
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
+        assert!(!app.is_visual_mode());
+    }
+
+    #[test]
+    fn visual_mode_g_extends_to_top() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/visual".to_string();
+        app.entry_list_len.set(5);
+        app.entry_selected_index = 3; // delta
+
+        // Enter visual mode at index 3
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+
+        // g jumps to top
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('g')));
+
+        let ids = visual_entry_ids(&db, &config);
+        // Range should be [0, 3] inclusive
+        assert!(app.selected_entries.contains(&ids[0]));
+        assert!(app.selected_entries.contains(&ids[1]));
+        assert!(app.selected_entries.contains(&ids[2]));
+        assert!(app.selected_entries.contains(&ids[3]));
+        assert_eq!(app.selected_entries.len(), 4);
+    }
+
+    #[test]
+    fn v_on_empty_directory_is_noop() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        db.insert_root("/test/empty")
+            .expect("Failed to create test root");
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = "/test/empty".to_string();
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        assert!(!app.is_visual_mode());
     }
 }

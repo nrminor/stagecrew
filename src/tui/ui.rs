@@ -4,6 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
 use crate::audit::AuditService;
@@ -420,7 +421,14 @@ fn render_main_entry_panel(
             let is_search_match = search_match_set.contains(&idx);
 
             // Highlight selected row and show focus
-            let mut style = if is_selected {
+            let is_cursor = idx == selected_idx && app.focus_panel() == FocusPanel::MainPanel;
+            let mut style = if is_selected && is_cursor {
+                // Cursor on a selected row: combine both indicators
+                row_style
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    .fg(Color::Cyan)
+            } else if is_selected {
                 // Selected entries get dark gray background for contrast with all text colors
                 row_style.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
             } else if idx == selected_idx {
@@ -864,9 +872,9 @@ Navigation:
   B           Toggle sidebar visibility
   
 Selection (main panel only):
-  Space       Toggle selection on current file
-  v           Select all files in current view (visual mode)
-  Esc         Clear all selections
+  Space       Toggle selection on current file and advance cursor
+  v           Enter/exit visual mode (range select from anchor)
+  Esc         Exit visual mode / clear search / clear selection
 
 Actions (main panel only - on focused file or all selected files):
   d           Delete file(s) with confirmation
@@ -893,14 +901,54 @@ Press any key to close this help screen";
     frame.render_widget(text, area);
 }
 
-/// Render the footer with context-sensitive keybinding hints.
+/// Render the footer with mode badge and context-sensitive keybinding hints.
 fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    // Search input bar takes over the footer when typing
+    // Determine current mode for the badge
+    let (mode_label, mode_style) = if app.search_input_active || app.search_query.is_some() {
+        (
+            " SEARCH ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if app.is_visual_mode() {
+        (
+            " VISUAL ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            " NORMAL ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+
+    // Split footer: fixed-width badge on left, hints fill the rest
+    let badge_width: u16 = 9; // " VISUAL " + 1 space separator
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(badge_width), Constraint::Min(0)])
+        .split(area);
+
+    // Render mode badge
+    let badge = Paragraph::new(Span::styled(mode_label, mode_style));
+    frame.render_widget(badge, chunks[0]);
+
+    // Search input bar replaces hints when typing
     if app.search_input_active {
         let query = app.search_query.as_deref().unwrap_or("");
-        let search_bar = Paragraph::new(format!("/{query}█"))
-            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
-        frame.render_widget(search_bar, area);
+        let search_bar = Paragraph::new(Line::from(vec![Span::styled(
+            format!("/{query}█"),
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        )]));
+        frame.render_widget(search_bar, chunks[1]);
         return;
     }
 
@@ -913,7 +961,6 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         || app.pending_remove_path().is_some();
 
     let hints = if modal_open {
-        // When a modal is open, show appropriate modal controls
         if app.pending_entry_deferral().is_some() {
             "[0-9] Enter days [Backspace] Delete [Enter] Confirm [Esc] Cancel".to_string()
         } else if app.pending_add_path().is_some() {
@@ -922,22 +969,22 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
             "[y] Yes [n] No [Esc] Cancel".to_string()
         }
     } else {
-        // Show context-sensitive hints based on current view and state
         match app.view() {
             View::FileList => {
                 let selection_count = app.selected_entries().len();
 
                 if app.search_query.is_some() {
-                    // Search navigation mode
                     "[n] Next match [N] Prev match [/] New search [Esc] Clear search [q] Quit"
                         .to_string()
+                } else if app.is_visual_mode() {
+                    format!(
+                        "[j/k] Extend [g/G] Extend to top/bottom [Esc] Keep & exit [v] Keep & exit [d/r/i/x] Act on {selection_count} [q] Quit"
+                    )
                 } else if selection_count > 0 {
-                    // When files are selected, show multi-select action hints
                     format!(
                         "[d] Delete {selection_count} [r] Defer {selection_count} [i] Ignore {selection_count} [x] Approve {selection_count} [Esc] Clear [q] Quit"
                     )
                 } else {
-                    // Show hints based on which panel is focused
                     match app.focus_panel() {
                         FocusPanel::Sidebar => {
                             "[j/k] Navigate [g/G] Top/Bottom [X] Remove [A] Add [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
@@ -955,8 +1002,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     };
 
     let footer = Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(Color::Gray));
-
-    frame.render_widget(footer, area);
+    frame.render_widget(footer, chunks[1]);
 }
 
 /// Render a confirmation modal for approval actions.

@@ -108,6 +108,16 @@ pub struct App {
     /// Set of selected entry IDs for multi-select operations.
     pub(crate) selected_entries: HashSet<i64>,
 
+    /// Visual mode anchor index. `Some(idx)` means visual mode is active,
+    /// anchored at position `idx` in the sorted entry list. `None` means
+    /// normal mode.
+    pub(crate) visual_anchor: Option<usize>,
+
+    /// Snapshot of selected entries taken when visual mode was entered.
+    /// Preserves pre-existing Space selections so the visual range is
+    /// additive rather than replacing them.
+    pub(crate) pre_visual_selection: HashSet<i64>,
+
     /// Pending add path text input state.
     /// Contains the accumulated input buffer for the new path to add.
     pub(crate) pending_add_path: Option<String>,
@@ -240,6 +250,36 @@ impl App {
             self.selected_entries.remove(&entry_id);
         } else {
             self.selected_entries.insert(entry_id);
+        }
+    }
+
+    /// Whether visual mode is active.
+    pub fn is_visual_mode(&self) -> bool {
+        self.visual_anchor.is_some()
+    }
+
+    /// Exit visual mode, keeping the current selection intact.
+    pub(crate) fn exit_visual_mode(&mut self) {
+        self.visual_anchor = None;
+        self.pre_visual_selection.clear();
+    }
+
+    /// Recompute `selected_entries` from the visual range plus the pre-visual snapshot.
+    ///
+    /// The visual range spans from the anchor to the cursor (inclusive) in the
+    /// sorted entry list. The result is the union of that range with whatever
+    /// was selected before visual mode was entered.
+    pub(crate) fn recompute_visual_selection(&mut self, entry_ids: &[i64]) {
+        let Some(anchor) = self.visual_anchor else {
+            return;
+        };
+        let cursor = self.entry_selected_index;
+        let lo = anchor.min(cursor);
+        let hi = anchor.max(cursor).min(entry_ids.len().saturating_sub(1));
+
+        self.selected_entries = self.pre_visual_selection.clone();
+        for &id in &entry_ids[lo..=hi] {
+            self.selected_entries.insert(id);
         }
     }
 
@@ -394,6 +434,8 @@ impl App {
             pending_entry_ignore: None,
             pending_entry_approval: None,
             selected_entries: HashSet::new(),
+            visual_anchor: None,
+            pre_visual_selection: HashSet::new(),
             pending_add_path: None,
             pending_remove_path: None,
             sidebar_visible: true,
