@@ -890,7 +890,7 @@ Sorting:
   s           Cycle sort mode (Expiration → Size → Name → Modified)
   
 Other:
-  R           Rescan tracked paths (refresh)
+  R           Refresh tracked paths
   q           Quit application
   Ctrl+C      Quit application
 

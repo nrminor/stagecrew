@@ -20,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 use cli::{Cli, Command};
 use config::{AppPaths, Config};
 use db::Database;
-use scanner::{Scanner, scan_and_persist};
+use scanner::{Scanner, refresh};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -175,26 +175,39 @@ async fn handle_add(config: &Config, db: &Database, path: PathBuf, run_scan: boo
 
     println!("Added tracked path: {}", path.display());
 
-    // Optionally run initial scan
+    // Optionally run initial refresh (scan + transition)
     if run_scan {
-        println!("Running initial scan...");
+        println!("Refreshing...");
         let scanner = Scanner::new();
-        let summary = scan_and_persist(
+        let summary = refresh(
             db,
             &scanner,
             &config.tracked_paths,
             config.expiration_days,
             config.warning_days,
+            config.auto_remove,
         )
         .await
-        .context("Failed to scan and persist path")?;
+        .context("Failed to refresh tracked paths")?;
 
         println!(
-            "Scan complete: {} directories, {} files, {}",
-            summary.total_directories,
-            summary.total_files,
-            format_bytes(summary.total_size_bytes)
+            "Refresh complete: {} directories, {} files, {}",
+            summary.scan.total_directories,
+            summary.scan.total_files,
+            format_bytes(summary.scan.total_size_bytes)
         );
+        if summary.transitions.expired_to_pending > 0 {
+            println!(
+                "  {} files expired \u{2192} pending approval",
+                summary.transitions.expired_to_pending
+            );
+        }
+        if summary.transitions.expired_to_approved > 0 {
+            println!(
+                "  {} files expired \u{2192} approved for removal",
+                summary.transitions.expired_to_approved
+            );
+        }
     }
 
     Ok(())
@@ -202,9 +215,10 @@ async fn handle_add(config: &Config, db: &Database, path: PathBuf, run_scan: boo
 
 /// Handle the scan subcommand.
 ///
-/// Scans all tracked roots. Config `tracked_paths` are seeded as roots in the
-/// database, then all DB roots (config baseline + user-added) are scanned.
-/// If `--path` is provided, that path is added as a root before scanning.
+/// Refreshes all tracked roots by scanning the filesystem and transitioning
+/// expired files. Config `tracked_paths` are seeded as roots in the database,
+/// then all DB roots (config baseline + user-added) are refreshed.
+/// If `--path` is provided, that path is added as a root before refreshing.
 async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> Result<()> {
     let scanner = Scanner::new();
 
@@ -247,24 +261,43 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
         }
     }
 
-    // Run the scan — seeds config paths as roots, then scans all DB roots
-    let summary = scan_and_persist(
+    // Refresh: scan filesystem then transition expired files
+    let summary = refresh(
         db,
         &scanner,
         &config.tracked_paths,
         config.expiration_days,
         config.warning_days,
+        config.auto_remove,
     )
     .await
-    .context("Failed to scan and persist paths")?;
+    .context("Failed to refresh tracked paths")?;
 
     // Print summary
     println!(
-        "Scan complete: {} directories, {} files, {}",
-        summary.total_directories,
-        summary.total_files,
-        format_bytes(summary.total_size_bytes)
+        "Refresh complete: {} directories, {} files, {}",
+        summary.scan.total_directories,
+        summary.scan.total_files,
+        format_bytes(summary.scan.total_size_bytes)
     );
+    if summary.transitions.expired_to_pending > 0 {
+        println!(
+            "  {} files expired \u{2192} pending approval",
+            summary.transitions.expired_to_pending
+        );
+    }
+    if summary.transitions.expired_to_approved > 0 {
+        println!(
+            "  {} files expired \u{2192} approved for removal",
+            summary.transitions.expired_to_approved
+        );
+    }
+    if summary.transitions.deferred_reset > 0 {
+        println!(
+            "  {} deferred files reset to tracked",
+            summary.transitions.deferred_reset
+        );
+    }
 
     Ok(())
 }

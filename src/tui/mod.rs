@@ -22,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::config::Config;
 use crate::db::Database;
 use crate::error::Result;
-use crate::scanner::{Scanner, scan_and_persist};
+use crate::scanner::{Scanner, refresh};
 
 use input::InputHandler;
 
@@ -129,10 +129,10 @@ pub struct App {
     /// Whether the sidebar is visible.
     pub(crate) sidebar_visible: bool,
 
-    /// Whether a scan has been requested (set by R keybind, cleared by main loop).
+    /// Whether a refresh has been requested (set by R keybind, cleared by main loop).
     pub(crate) scan_requested: bool,
 
-    /// Whether a scan is currently in progress.
+    /// Whether a refresh is currently in progress.
     pub(crate) scan_in_progress: bool,
 
     /// Status message to display (e.g., "Scanning...", "Scan complete").
@@ -141,7 +141,7 @@ pub struct App {
     /// When the status message was set (for auto-clearing after timeout).
     pub(crate) status_message_time: Option<std::time::Instant>,
 
-    /// Cached header stats, refreshed after actions and scans.
+    /// Cached header stats, updated after actions and refreshes.
     pub(crate) cached_stats: crate::db::Stats,
 
     /// Active search query. `Some` means a search is active (either typing or
@@ -315,7 +315,7 @@ impl App {
 
     /// Auto-enter the first root if no root is currently entered.
     ///
-    /// Called at startup and after scan completion so the user sees files
+    /// Called at startup and after refresh completion so the user sees files
     /// immediately instead of the empty "Select a root" prompt. This is a
     /// no-op when a root is already entered (i.e., `current_path` is non-empty).
     pub(crate) fn auto_enter_first_root(&mut self, db: &crate::db::Database) {
@@ -476,7 +476,7 @@ impl App {
     /// Refresh cached header stats from the entries table.
     ///
     /// Call this after any action that changes entry status (ignore, approve,
-    /// defer, unignore, delete) and after scan completion.
+    /// defer, unignore, delete) and after refresh completion.
     pub(crate) fn refresh_stats(
         &mut self,
         db: &crate::db::Database,
@@ -551,35 +551,36 @@ impl App {
                 self.status_message_time = None;
             }
 
-            // Check if a scan was requested and none is in progress
+            // Check if a refresh was requested and none is in progress
             if self.scan_requested && !self.scan_in_progress {
                 self.scan_requested = false;
                 self.scan_in_progress = true;
-                self.status_message = Some("Scanning...".to_string());
-                // Don't set timestamp for "Scanning..." - we want it to persist until done
+                self.status_message = Some("Refreshing...".to_string());
+                // Don't set timestamp for "Refreshing..." - we want it to persist until done
 
                 // Clone what we need for the background task
                 let scanner = Scanner::new();
                 let config_tracked_paths = config.tracked_paths.clone();
                 let expiration_days = config.expiration_days;
                 let warning_days = config.warning_days;
+                let auto_remove = config.auto_remove;
                 let task_db_path = db_path.to_path_buf();
                 let tx = scan_tx.clone();
 
-                // Spawn the scan as a background task.
-                // The scan seeds config baseline paths into the DB, then queries
-                // all DB roots (config + user-added) for the full set to scan.
+                // Spawn the refresh as a background task.
+                // Scans the filesystem then transitions expired files.
                 scan_handle = Some(tokio::spawn(async move {
                     let scan_result = tokio::task::spawn_blocking(move || {
                         let rt = tokio::runtime::Handle::current();
                         rt.block_on(async {
                             match Database::open(&task_db_path) {
-                                Ok(task_db) => scan_and_persist(
+                                Ok(task_db) => refresh(
                                     &task_db,
                                     &scanner,
                                     &config_tracked_paths,
                                     expiration_days,
                                     warning_days,
+                                    auto_remove,
                                 )
                                 .await
                                 .map(|_| ())
@@ -589,7 +590,7 @@ impl App {
                         })
                     })
                     .await
-                    .unwrap_or_else(|e| Err(format!("Scan task panicked: {e}")));
+                    .unwrap_or_else(|e| Err(format!("Refresh task panicked: {e}")));
 
                     let _ = tx.send(scan_result).await;
                 }));
@@ -610,19 +611,19 @@ impl App {
                     }
                 }
 
-                // Handle scan completion
+                // Handle refresh completion
                 Some(result) = scan_rx.recv() => {
                     self.scan_in_progress = false;
                     scan_handle = None;
                     self.status_message_time = Some(std::time::Instant::now());
                     match result {
                         Ok(()) => {
-                            self.status_message = Some("Scan complete".to_string());
+                            self.status_message = Some("Refresh complete".to_string());
                             self.refresh_stats(db, config);
                             self.auto_enter_first_root(db);
                         }
                         Err(e) => {
-                            self.status_message = Some(format!("Scan failed: {e}"));
+                            self.status_message = Some(format!("Refresh failed: {e}"));
                         }
                     }
                 }

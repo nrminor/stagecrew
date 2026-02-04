@@ -221,6 +221,70 @@ pub struct TransitionSummary {
     pub deferred_reset: u64,
 }
 
+/// Combined result of a full refresh operation (scan + transition).
+///
+/// This struct is `#[non_exhaustive]` so new fields can be added in
+/// minor versions. Use `..` when destructuring to remain forward-compatible.
+#[derive(Debug, Clone, Default)]
+#[must_use = "refresh summary should be logged or displayed"]
+#[non_exhaustive]
+pub struct RefreshSummary {
+    /// Results from the filesystem scan phase.
+    pub scan: ScanSummary,
+    /// Results from the expiration transition phase.
+    pub transitions: TransitionSummary,
+}
+
+/// Refresh the database by scanning tracked paths and transitioning expired files.
+///
+/// This is the primary entry point for bringing the database up to date. It
+/// composes two operations: scanning the filesystem to discover and upsert
+/// entries, then transitioning any expired files to the appropriate status
+/// (pending approval or auto-approved, depending on configuration).
+///
+/// All call sites that need a "full refresh" should use this function rather
+/// than calling `scan_and_persist` and `transition_expired_paths` separately,
+/// which risks forgetting the transition step.
+///
+/// # Errors
+///
+/// Returns an error if either the scan or the transition phase fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use stagecrew::scanner::{refresh, Scanner};
+/// # use stagecrew::db::Database;
+/// # use stagecrew::config::Config;
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let db = Database::open(std::path::Path::new("test.db"))?;
+/// let scanner = Scanner::new();
+/// let config = Config::default();
+///
+/// let summary = refresh(&db, &scanner, &config.tracked_paths, config.expiration_days, config.warning_days, config.auto_remove).await?;
+/// # Ok::<(), stagecrew::error::Error>(())
+/// # }).unwrap();
+/// ```
+pub async fn refresh(
+    db: &Database,
+    scanner: &Scanner,
+    config_tracked_paths: &[PathBuf],
+    expiration_days: u32,
+    warning_days: u32,
+    auto_remove: bool,
+) -> Result<RefreshSummary> {
+    let scan = scan_and_persist(
+        db,
+        scanner,
+        config_tracked_paths,
+        expiration_days,
+        warning_days,
+    )
+    .await?;
+    let transitions = transition_expired_paths(db, expiration_days, auto_remove)?;
+    Ok(RefreshSummary { scan, transitions })
+}
+
 /// Scan tracked paths and persist results to the database.
 ///
 /// This function orchestrates the full scan workflow:
@@ -481,9 +545,9 @@ fn update_stats(
 }
 
 /// Summary of a scan-and-persist operation.
-#[derive(Debug, Clone)]
 // Allow: The `total_` prefix provides clarity that these are aggregate counts
 // across the entire scan operation, not per-directory values.
+#[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_field_names)]
 #[must_use = "scan summary should be logged or displayed"]
 #[non_exhaustive]

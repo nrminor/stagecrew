@@ -255,7 +255,7 @@ impl InputHandler {
             KeyCode::Char('a') => app.view = View::AuditLog,
             KeyCode::Char('?') => app.view = View::Help,
 
-            // Refresh/rescan (R = rescan tracked paths)
+            // Refresh tracked paths (scan filesystem + transition expired files)
             KeyCode::Char('R') => {
                 if !app.scan_in_progress {
                     app.scan_requested = true;
@@ -1297,7 +1297,7 @@ impl InputHandler {
                     }
 
                     tracing::info!(
-                        "Added tracked path: {} (will be scanned on next rescan)",
+                        "Added tracked path: {} (will be included on next refresh)",
                         canonical_path.display()
                     );
                 }
@@ -1318,7 +1318,7 @@ impl InputHandler {
     /// Initiate path removal by querying the database for the selected sidebar root.
     ///
     /// Roots defined in `config.tracked_paths` cannot be removed from the TUI
-    /// because they are re-seeded on every scan. The user must edit the config
+    /// because they are re-seeded on every refresh. The user must edit the config
     /// file directly to remove those.
     fn initiate_remove_path(app: &mut App, config: &Config, db: &Database) {
         let roots = match db.list_roots() {

@@ -8,7 +8,7 @@ use crate::config::{AppPaths, Config};
 use crate::db::Database;
 use crate::error::Result;
 use crate::removal::remove_approved;
-use crate::scanner::{Scanner, scan_and_persist, transition_expired_paths};
+use crate::scanner::{Scanner, refresh};
 
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -123,62 +123,52 @@ impl Daemon {
         Ok(())
     }
 
-    /// Execute one complete scan/transition/removal cycle.
+    /// Execute one complete refresh/removal cycle.
     ///
     /// This function:
-    /// 1. Scans all tracked paths
-    /// 2. Transitions expired paths based on expiration policy
-    /// 3. Removes approved paths
+    /// 1. Refreshes the database (scan filesystem + transition expired files)
+    /// 2. Removes approved paths
     ///
-    /// Errors are logged but do not stop the daemon. All three steps are attempted
+    /// Errors are logged but do not stop the daemon. Both steps are attempted
     /// even if one fails, ensuring maximum progress on each cycle.
     async fn run_cycle(&self, db: &Database, scanner: &Scanner) {
-        // Step 1: Scan tracked paths
-        tracing::info!("Starting scan cycle");
-        match scan_and_persist(
+        // Step 1: Refresh (scan + transition expired files)
+        tracing::info!("Starting refresh cycle");
+        match refresh(
             db,
             scanner,
             &self.config.tracked_paths,
             self.config.expiration_days,
             self.config.warning_days,
+            self.config.auto_remove,
         )
         .await
         {
             Ok(summary) => {
                 tracing::info!(
-                    total_directories = summary.total_directories,
-                    total_files = summary.total_files,
-                    total_size_bytes = summary.total_size_bytes,
+                    total_directories = summary.scan.total_directories,
+                    total_files = summary.scan.total_files,
+                    total_size_bytes = summary.scan.total_size_bytes,
                     "Scan completed successfully"
                 );
-            }
-            Err(e) => {
-                tracing::warn!(error = ?e, "Scan failed, continuing to next step");
-            }
-        }
-
-        // Step 2: Transition expired paths
-        tracing::info!("Checking for expired paths");
-        match transition_expired_paths(db, self.config.expiration_days, self.config.auto_remove) {
-            Ok(summary) => {
-                if summary.expired_to_pending > 0
-                    || summary.expired_to_approved > 0
-                    || summary.deferred_reset > 0
+                if summary.transitions.expired_to_pending > 0
+                    || summary.transitions.expired_to_approved > 0
+                    || summary.transitions.deferred_reset > 0
                 {
                     tracing::info!(
-                        expired_to_pending = summary.expired_to_pending,
-                        expired_to_approved = summary.expired_to_approved,
-                        deferred_reset = summary.deferred_reset,
+                        expired_to_pending = summary.transitions.expired_to_pending,
+                        expired_to_approved = summary.transitions.expired_to_approved,
+                        deferred_reset = summary.transitions.deferred_reset,
                         "State transitions completed"
                     );
                 }
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "State transition failed, continuing to next step");
+                tracing::warn!(error = ?e, "Refresh failed, continuing to removal step");
             }
         }
 
-        // Step 3: Remove approved paths
+        // Step 2: Remove approved paths
         tracing::info!("Removing approved paths");
         match remove_approved(db) {
             Ok(summary) => {
