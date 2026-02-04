@@ -471,6 +471,13 @@ mod tests {
             files_pending_approval: 2,
             files_overdue: 3,
             last_scan_completed: None,
+            files_healthy: 0,
+            bytes_healthy: 0,
+            bytes_within_warning: 0,
+            bytes_pending_approval: 0,
+            bytes_overdue: 0,
+            files_ignored: 0,
+            bytes_ignored: 0,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -487,6 +494,13 @@ mod tests {
             files_pending_approval: 0,
             files_overdue: 3,
             last_scan_completed: None,
+            files_healthy: 0,
+            bytes_healthy: 0,
+            bytes_within_warning: 0,
+            bytes_pending_approval: 0,
+            bytes_overdue: 0,
+            files_ignored: 0,
+            bytes_ignored: 0,
         };
         assert_eq!(format_status_output(&stats), "stagecrew: 3 files overdue");
     }
@@ -500,6 +514,13 @@ mod tests {
             files_pending_approval: 2,
             files_overdue: 0,
             last_scan_completed: None,
+            files_healthy: 0,
+            bytes_healthy: 0,
+            bytes_within_warning: 0,
+            bytes_pending_approval: 0,
+            bytes_overdue: 0,
+            files_ignored: 0,
+            bytes_ignored: 0,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -516,6 +537,13 @@ mod tests {
             files_pending_approval: 2,
             files_overdue: 0,
             last_scan_completed: None,
+            files_healthy: 0,
+            bytes_healthy: 0,
+            bytes_within_warning: 0,
+            bytes_pending_approval: 0,
+            bytes_overdue: 0,
+            files_ignored: 0,
+            bytes_ignored: 0,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -532,6 +560,13 @@ mod tests {
             files_pending_approval: 0,
             files_overdue: 0,
             last_scan_completed: None,
+            files_healthy: 0,
+            bytes_healthy: 0,
+            bytes_within_warning: 0,
+            bytes_pending_approval: 0,
+            bytes_overdue: 0,
+            files_ignored: 0,
+            bytes_ignored: 0,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -548,6 +583,13 @@ mod tests {
             files_pending_approval: 0,
             files_overdue: 0,
             last_scan_completed: None,
+            files_healthy: 0,
+            bytes_healthy: 0,
+            bytes_within_warning: 0,
+            bytes_pending_approval: 0,
+            bytes_overdue: 0,
+            files_ignored: 0,
+            bytes_ignored: 0,
         };
         assert_eq!(
             format_status_output(&stats),
@@ -564,6 +606,13 @@ mod tests {
             files_pending_approval: 0,
             files_overdue: 0,
             last_scan_completed: None,
+            files_healthy: 0,
+            bytes_healthy: 0,
+            bytes_within_warning: 0,
+            bytes_pending_approval: 0,
+            bytes_overdue: 0,
+            files_ignored: 0,
+            bytes_ignored: 0,
         };
         assert_eq!(
             format_status_output(&stats),

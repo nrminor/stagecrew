@@ -74,6 +74,20 @@ pub struct Stats {
     pub files_overdue: i64,
     /// Unix timestamp of the last completed scan.
     pub last_scan_completed: Option<i64>,
+    /// Number of healthy files (tracked, not in warning or overdue).
+    pub files_healthy: i64,
+    /// Total bytes of healthy files.
+    pub bytes_healthy: i64,
+    /// Total bytes of files within the warning period.
+    pub bytes_within_warning: i64,
+    /// Total bytes of files pending approval.
+    pub bytes_pending_approval: i64,
+    /// Total bytes of overdue files.
+    pub bytes_overdue: i64,
+    /// Number of ignored files.
+    pub files_ignored: i64,
+    /// Total bytes of ignored files.
+    pub bytes_ignored: i64,
 }
 
 /// Database handle for stagecrew state.
@@ -637,6 +651,16 @@ impl Database {
                         files_pending_approval: row.get(3)?,
                         files_overdue: row.get(4)?,
                         last_scan_completed: row.get(5)?,
+                        // get_stats reads from the pre-computed stats table which
+                        // doesn't have per-category breakdowns. Default to zero;
+                        // callers needing breakdowns should use compute_live_stats.
+                        files_healthy: 0,
+                        bytes_healthy: 0,
+                        bytes_within_warning: 0,
+                        bytes_pending_approval: 0,
+                        bytes_overdue: 0,
+                        files_ignored: 0,
+                        bytes_ignored: 0,
                     })
                 },
             )
@@ -664,17 +688,51 @@ impl Database {
         self.conn
             .query_row(
                 "SELECT
-                    (SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status != 'removed'),
-                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries WHERE is_dir = 0 AND status != 'removed'),
+                    -- 0: total files (excludes removed and ignored)
+                    (SELECT COUNT(*) FROM entries
+                     WHERE is_dir = 0 AND status NOT IN ('removed', 'ignored')),
+                    -- 1: total size bytes (excludes removed and ignored)
+                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
+                     WHERE is_dir = 0 AND status NOT IN ('removed', 'ignored')),
+                    -- 2: files within warning period
                     (SELECT COUNT(*) FROM entries
                      WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
                        AND ((mtime + (?1 * 86400) - ?2) / 86400) <= ?3
                        AND ((mtime + (?1 * 86400) - ?2) / 86400) > 0),
+                    -- 3: files pending approval
                     (SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status = 'pending'),
+                    -- 4: files overdue
                     (SELECT COUNT(*) FROM entries
                      WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
                        AND ((mtime + (?1 * 86400) - ?2) / 86400) <= 0),
-                    (SELECT last_scan_completed FROM stats WHERE id = 1)",
+                    -- 5: last scan completed
+                    (SELECT last_scan_completed FROM stats WHERE id = 1),
+                    -- 6: healthy files (tracked, outside warning period)
+                    (SELECT COUNT(*) FROM entries
+                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
+                       AND ((mtime + (?1 * 86400) - ?2) / 86400) > ?3),
+                    -- 7: healthy bytes
+                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
+                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
+                       AND ((mtime + (?1 * 86400) - ?2) / 86400) > ?3),
+                    -- 8: warning bytes
+                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
+                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
+                       AND ((mtime + (?1 * 86400) - ?2) / 86400) <= ?3
+                       AND ((mtime + (?1 * 86400) - ?2) / 86400) > 0),
+                    -- 9: pending bytes
+                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
+                     WHERE is_dir = 0 AND status = 'pending'),
+                    -- 10: overdue bytes
+                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
+                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
+                       AND ((mtime + (?1 * 86400) - ?2) / 86400) <= 0),
+                    -- 11: ignored files
+                    (SELECT COUNT(*) FROM entries
+                     WHERE is_dir = 0 AND status = 'ignored'),
+                    -- 12: ignored bytes
+                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
+                     WHERE is_dir = 0 AND status = 'ignored')",
                 (expiration_days_i64, now, warning_days_i64),
                 |row| {
                     Ok(Stats {
@@ -684,6 +742,13 @@ impl Database {
                         files_pending_approval: row.get(3)?,
                         files_overdue: row.get(4)?,
                         last_scan_completed: row.get(5)?,
+                        files_healthy: row.get(6)?,
+                        bytes_healthy: row.get(7)?,
+                        bytes_within_warning: row.get(8)?,
+                        bytes_pending_approval: row.get(9)?,
+                        bytes_overdue: row.get(10)?,
+                        files_ignored: row.get(11)?,
+                        bytes_ignored: row.get(12)?,
                     })
                 },
             )

@@ -106,17 +106,19 @@ fn render_file_list_view(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
-    // Split vertically: header | content area
+    // Split vertically: overview widget | content area
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header with stats
+            Constraint::Length(7), // Overview: summary + divider + bars + divider inside bordered block
             Constraint::Min(0),    // Content area (sidebar + main panel)
         ])
         .split(area);
 
-    // Render header with stats
-    render_file_view_header(app, config, db, frame, v_chunks[0]);
+    // Render combined overview widget (header stats + lifecycle bars)
+    render_overview_widget(app, frame, v_chunks[0]);
+
+    let content_area = v_chunks[1];
 
     if app.sidebar_visible() {
         // Split content area horizontally: sidebar | main panel
@@ -126,7 +128,7 @@ fn render_file_list_view(
                 Constraint::Percentage(20), // Sidebar for directories
                 Constraint::Percentage(80), // Main panel for files
             ])
-            .split(v_chunks[1]);
+            .split(content_area);
 
         // Render sidebar with tracked directories
         render_sidebar(app, db, frame, h_chunks[0]);
@@ -135,51 +137,328 @@ fn render_file_list_view(
         render_main_entry_panel(app, config, db, frame, h_chunks[1]);
     } else {
         // Sidebar hidden - main panel takes full width
-        render_main_entry_panel(app, config, db, frame, v_chunks[1]);
+        render_main_entry_panel(app, config, db, frame, content_area);
     }
 }
 
-/// Render the header showing stats for the current file view.
-fn render_file_view_header(
-    app: &App,
-    _config: &Config,
-    _db: &Database,
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-) {
-    let stats = app.cached_stats;
+/// A single lifecycle category's file count and byte total, converted to unsigned.
+struct LifecycleTally {
+    files: u64,
+    bytes: u64,
+}
 
-    // Allow: size values are guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
-    #[allow(clippy::cast_sign_loss)]
-    let total_size_str = format_bytes(stats.total_size_bytes as u64);
+impl LifecycleTally {
+    fn label(&self) -> String {
+        format!("{} ({})", self.files, format_bytes(self.bytes))
+    }
+}
 
-    // Build header text, including status message if present
-    let header_text = if let Some(status) = app.status_message.as_ref() {
-        format!(
-            "Total: {} files, {} | Pending: {} | Expiring soon: {} | Overdue: {} | {}",
-            stats.total_files,
-            total_size_str,
-            stats.files_pending_approval,
-            stats.files_within_warning,
-            stats.files_overdue,
-            status
-        )
+/// Pre-computed unsigned view of `Stats` for the overview widget, with pending
+/// and overdue merged into a single "overdue" bucket for display purposes.
+struct LifecycleView {
+    total_files: u64,
+    total_bytes: u64,
+    healthy: LifecycleTally,
+    warning: LifecycleTally,
+    overdue: LifecycleTally,
+}
+
+impl From<&crate::db::Stats> for LifecycleView {
+    fn from(stats: &crate::db::Stats) -> Self {
+        // Clamp to zero before casting — the schema guarantees non-negative values,
+        // but defensive conversion avoids wrapping on corrupt data. The max(0) makes
+        // the cast safe; clippy can't prove this statically.
+        #[allow(clippy::cast_sign_loss)]
+        let clamp = |v: i64| -> u64 { v.max(0) as u64 };
+
+        Self {
+            total_files: clamp(stats.total_files),
+            total_bytes: clamp(stats.total_size_bytes),
+            healthy: LifecycleTally {
+                files: clamp(stats.files_healthy),
+                bytes: clamp(stats.bytes_healthy),
+            },
+            warning: LifecycleTally {
+                files: clamp(stats.files_within_warning),
+                bytes: clamp(stats.bytes_within_warning),
+            },
+            overdue: LifecycleTally {
+                files: clamp(stats.files_overdue) + clamp(stats.files_pending_approval),
+                bytes: clamp(stats.bytes_overdue) + clamp(stats.bytes_pending_approval),
+            },
+        }
+    }
+}
+
+/// Render the combined overview widget inside a single bordered block.
+///
+/// Layout (7 rows total = border + 5 content + border):
+///   Row 0: Top border with "Overview" title
+///   Row 1: Summary — total in white, then colored lifecycle tallies (full width)
+///   Row 2: Thin divider line (full width)
+///   Row 3: Files lifecycle bar (left half only)
+///   Row 4: Thin divider line (left half only)
+///   Row 5: Bytes lifecycle bar (left half only)
+///   Row 6: Bottom border
+///
+/// The right half of rows 3–5 is currently empty, reserved for future widgets.
+/// Ignored files are excluded from lifecycle bar computations.
+fn render_overview_widget(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let view = LifecycleView::from(&app.cached_stats);
+
+    // Render the outer block and get the inner rect
+    let block = Block::default().borders(Borders::ALL).title("Overview");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Split inner area: summary + divider on top (2 rows), bars below (3 rows)
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(3)])
+        .split(inner);
+
+    let summary_area = v_chunks[0];
+    let bars_area = v_chunks[1];
+
+    let summary_line = build_summary_line(&view, app.status_message.as_deref());
+
+    let full_divider = Line::from(Span::styled(
+        "─".repeat(usize::from(summary_area.width)),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let summary_widget = Paragraph::new(vec![summary_line, full_divider]);
+    frame.render_widget(summary_widget, summary_area);
+
+    // Split bars area horizontally: left half for bars, right half reserved
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(bars_area);
+
+    let bars_left = h_chunks[0];
+
+    // Build lifecycle bars sized to the left half. The "Files " / "Bytes " prefix is 6 chars.
+    let prefix_width: u16 = 6;
+    let bar_width = bars_left.width.saturating_sub(prefix_width);
+
+    let files_segments = [
+        BarSegment {
+            value: view.healthy.files,
+            label: view.healthy.files.to_string(),
+            color: Color::Green,
+        },
+        BarSegment {
+            value: view.warning.files,
+            label: view.warning.files.to_string(),
+            color: Color::Yellow,
+        },
+        BarSegment {
+            value: view.overdue.files,
+            label: view.overdue.files.to_string(),
+            color: Color::Red,
+        },
+    ];
+    let bytes_segments = [
+        BarSegment {
+            value: view.healthy.bytes,
+            label: format_bytes(view.healthy.bytes),
+            color: Color::Green,
+        },
+        BarSegment {
+            value: view.warning.bytes,
+            label: format_bytes(view.warning.bytes),
+            color: Color::Yellow,
+        },
+        BarSegment {
+            value: view.overdue.bytes,
+            label: format_bytes(view.overdue.bytes),
+            color: Color::Red,
+        },
+    ];
+
+    let files_bar = build_lifecycle_bar(&files_segments, bar_width);
+    let bytes_bar = build_lifecycle_bar(&bytes_segments, bar_width);
+
+    let mut files_spans = vec![Span::styled(
+        "Files ",
+        Style::default().add_modifier(Modifier::DIM),
+    )];
+    files_spans.extend(files_bar);
+    let files_line = Line::from(files_spans);
+
+    let bar_divider = Line::from(Span::styled(
+        "─".repeat(usize::from(bars_left.width)),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let mut bytes_spans = vec![Span::styled(
+        "Bytes ",
+        Style::default().add_modifier(Modifier::DIM),
+    )];
+    bytes_spans.extend(bytes_bar);
+    let bytes_line = Line::from(bytes_spans);
+
+    let bars_widget = Paragraph::new(vec![files_line, bar_divider, bytes_line]);
+    frame.render_widget(bars_widget, bars_left);
+}
+
+/// Build the summary line showing total in white, then colored lifecycle tallies.
+fn build_summary_line<'a>(view: &LifecycleView, status_message: Option<&str>) -> Line<'a> {
+    let mut spans = vec![
+        Span::styled(
+            format!(
+                "Total: {} files, {}",
+                view.total_files,
+                format_bytes(view.total_bytes)
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "Healthy: ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(view.healthy.label(), Style::default().fg(Color::Green)),
+        Span::raw("  "),
+        Span::styled(
+            "Expiring soon: ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(view.warning.label(), Style::default().fg(Color::Yellow)),
+        Span::raw("  "),
+        Span::styled(
+            "Overdue: ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(view.overdue.label(), Style::default().fg(Color::Red)),
+    ];
+
+    if let Some(status) = status_message {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            status.to_owned(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+/// Build a proportional lifecycle bar as colored spans.
+///
+/// Each segment is rendered as a colored background band with the label centered
+/// in dark text. When a segment is too narrow for its label, it shows as a solid
+/// colored band. An empty bar (all zeros) renders as a solid dark gray band.
+///
+/// A single segment of a lifecycle bar: a proportional value, display label, and color.
+struct BarSegment {
+    value: u64,
+    label: String,
+    color: Color,
+}
+
+/// Build a proportional lifecycle bar as colored spans from a slice of segments.
+///
+/// Each segment is rendered as a colored background band with the label centered
+/// in dark text. When a segment is too narrow for its label, it shows as a solid
+/// colored band. An empty bar (all zeros) renders as a solid dark gray band.
+fn build_lifecycle_bar(segments: &[BarSegment], width: u16) -> Vec<Span<'static>> {
+    let w = usize::from(width);
+    let total: u64 = segments.iter().map(|s| s.value).sum();
+
+    if total == 0 || w == 0 {
+        return vec![Span::styled(
+            " ".repeat(w),
+            Style::default().bg(Color::DarkGray),
+        )];
+    }
+
+    let values: Vec<u64> = segments.iter().map(|s| s.value).collect();
+    let widths = proportional_widths(&values, total, w);
+
+    let mut spans = Vec::new();
+    for (seg, &seg_width) in segments.iter().zip(&widths) {
+        if seg_width > 0 {
+            spans.push(build_bar_segment(seg_width, seg.color, &seg.label));
+        }
+    }
+
+    spans
+}
+
+/// Build a single colored bar segment as a background-colored band with centered text.
+///
+/// The segment is spaces with a colored background. If the segment is wide enough
+/// for the label, the label is centered within it in dark text. Otherwise the
+/// segment is a solid colored band with no text.
+fn build_bar_segment(width: usize, color: Color, label: &str) -> Span<'static> {
+    let label_len = label.len();
+    let content = if width >= label_len {
+        // Center the label within spaces
+        let total_padding = width - label_len;
+        let left_pad = total_padding / 2;
+        let right_pad = total_padding - left_pad;
+        format!("{}{}{}", " ".repeat(left_pad), label, " ".repeat(right_pad),)
     } else {
-        format!(
-            "Total: {} files, {} | Pending: {} | Expiring soon: {} | Overdue: {}",
-            stats.total_files,
-            total_size_str,
-            stats.files_pending_approval,
-            stats.files_within_warning,
-            stats.files_overdue
-        )
+        " ".repeat(width)
     };
 
-    let header = Paragraph::new(header_text)
-        .block(Block::default().borders(Borders::ALL).title("Overview"))
-        .style(Style::default());
+    Span::styled(content, Style::default().bg(color).fg(Color::Black))
+}
 
-    frame.render_widget(header, area);
+/// Distribute `width` characters proportionally across segments using integer math.
+///
+/// Non-zero values get at least 1 character. The returned widths sum to exactly
+/// `width`. Uses u128 intermediates to avoid overflow on large byte totals.
+fn proportional_widths(values: &[u64], total: u64, width: usize) -> Vec<usize> {
+    let total_128 = u128::from(total);
+    let width_128 = width as u128;
+
+    // Initial proportional assignment via integer division with rounding
+    let mut widths: Vec<usize> = values
+        .iter()
+        .map(|&v| {
+            if total_128 == 0 {
+                0
+            } else {
+                // Round to nearest: (v * width + total/2) / total.
+                // Result is bounded by width (a usize), so truncation is safe.
+                #[allow(clippy::cast_possible_truncation)]
+                let w = (u128::from(v) * width_128 + total_128 / 2) / total_128;
+                w as usize
+            }
+        })
+        .collect();
+
+    // Guarantee at least 1 char for non-zero values
+    for (i, &v) in values.iter().enumerate() {
+        if v > 0 && widths[i] == 0 {
+            widths[i] = 1;
+        }
+    }
+
+    // Adjust to sum to exactly width by modifying the largest segment
+    let sum: usize = widths.iter().sum();
+    if sum != width
+        && let Some(max_idx) = widths
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &w)| w)
+            .map(|(i, _)| i)
+    {
+        if sum > width {
+            widths[max_idx] = widths[max_idx].saturating_sub(sum - width);
+        } else {
+            widths[max_idx] += width - sum;
+        }
+    }
+
+    widths
 }
 
 /// Render the sidebar showing tracked roots.
