@@ -233,11 +233,11 @@ async fn add_with_scan_flag() {
     // Verify database contains the scanned data
     let roots = db.list_roots().expect("failed to list roots");
     assert_eq!(roots.len(), 1);
-    assert_eq!(roots[0].path, canonical_path.to_string_lossy());
+    assert_eq!(roots[0].path, canonical_path);
 
     // List entries under the root - should have 2 file entries
     let entries = db
-        .list_entries_by_parent(&canonical_path.to_string_lossy())
+        .list_entries_by_parent(&canonical_path)
         .expect("failed to list entries");
     assert_eq!(entries.len(), 2, "should have 2 file entries under root");
 

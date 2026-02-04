@@ -1,5 +1,7 @@
 //! Audit trail logging and queries.
 
+use std::path::Path;
+
 use rusqlite::params;
 
 use crate::db::Database;
@@ -65,14 +67,21 @@ impl<'a> AuditService<'a> {
         &self,
         user: &str,
         action: AuditAction,
-        target_path: Option<&str>,
+        target_path: Option<&Path>,
         details: Option<&str>,
         entry_id: Option<i64>,
     ) -> Result<()> {
+        let target_path_str = target_path.map(|p| p.to_string_lossy());
         self.db.conn().execute(
             "INSERT INTO audit_log (user, action, target_path, details, entry_id)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![user, action.as_str(), target_path, details, entry_id],
+            params![
+                user,
+                action.as_str(),
+                target_path_str.as_deref(),
+                details,
+                entry_id
+            ],
         )?;
         Ok(())
     }
@@ -136,7 +145,8 @@ impl<'a> AuditService<'a> {
     // Allow: Part of the public audit API. May be used by future TUI detail view
     // to show path-specific history. Currently unused but part of the stable API.
     #[allow(dead_code)]
-    pub fn list_by_path(&self, path: &str) -> Result<Vec<AuditEntry>> {
+    pub fn list_by_path(&self, path: &Path) -> Result<Vec<AuditEntry>> {
+        let path_str = path.to_string_lossy();
         let mut stmt = self.db.conn().prepare(
             "SELECT id, timestamp, user, action, target_path, details, entry_id
              FROM audit_log
@@ -145,7 +155,7 @@ impl<'a> AuditService<'a> {
         )?;
 
         let entries = stmt
-            .query_map(params![path], |row| {
+            .query_map(params![&*path_str], |row| {
                 Ok(AuditEntry {
                     id: row.get(0)?,
                     timestamp: row.get(1)?,
@@ -185,6 +195,8 @@ pub struct AuditEntry {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::db::Database;
     use tempfile::TempDir;
@@ -209,7 +221,7 @@ mod tests {
             .record(
                 "alice",
                 AuditAction::Approve,
-                Some("/data/test"),
+                Some(Path::new("/data/test")),
                 None,
                 None,
             )
@@ -270,13 +282,13 @@ mod tests {
 
         // Create a root and entry first so we have a valid foreign key
         let root_id = db
-            .insert_root("/data")
+            .insert_root(Path::new("/data"))
             .expect("failed to insert root to database - connection may be lost or disk full");
         let entry_id = db
             .upsert_entry(
                 root_id,
-                "/data/important",
-                "/data",
+                Path::new("/data/important"),
+                Path::new("/data"),
                 false,
                 1024,
                 Some(1_700_000_000),
@@ -287,7 +299,7 @@ mod tests {
             .record(
                 "bob",
                 AuditAction::Defer,
-                Some("/data/important"),
+                Some(Path::new("/data/important")),
                 Some("Deferred for 30 days"),
                 Some(entry_id),
             )
@@ -322,7 +334,7 @@ mod tests {
 
         for (action, _expected_str) in &actions {
             audit
-                .record("user", *action, Some("/test"), None, None)
+                .record("user", *action, Some(Path::new("/test")), None, None)
                 .expect(
                 "failed to record audit entry to database - connection may be lost or disk full",
             );
@@ -362,7 +374,13 @@ mod tests {
         let audit = AuditService::new(&db);
 
         audit
-            .record("user", AuditAction::Scan, Some("/test"), None, None)
+            .record(
+                "user",
+                AuditAction::Scan,
+                Some(Path::new("/test")),
+                None,
+                None,
+            )
             .expect(
                 "failed to record audit entry to database - connection may be lost or disk full",
             );
@@ -380,11 +398,12 @@ mod tests {
 
         // Record 10 entries
         for i in 0..10 {
+            let p = format!("/path/{i}");
             audit
                 .record(
                     "user",
                     AuditAction::Scan,
-                    Some(&format!("/path/{i}")),
+                    Some(Path::new(&p)),
                     None,
                     None,
                 )
@@ -408,21 +427,39 @@ mod tests {
 
         // Record entries with slight delays to ensure different timestamps
         audit
-            .record("user", AuditAction::Scan, Some("/first"), None, None)
+            .record(
+                "user",
+                AuditAction::Scan,
+                Some(Path::new("/first")),
+                None,
+                None,
+            )
             .expect(
                 "failed to record audit entry to database - connection may be lost or disk full",
             );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         audit
-            .record("user", AuditAction::Approve, Some("/second"), None, None)
+            .record(
+                "user",
+                AuditAction::Approve,
+                Some(Path::new("/second")),
+                None,
+                None,
+            )
             .expect(
                 "failed to record audit entry to database - connection may be lost or disk full",
             );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         audit
-            .record("user", AuditAction::Remove, Some("/third"), None, None)
+            .record(
+                "user",
+                AuditAction::Remove,
+                Some(Path::new("/third")),
+                None,
+                None,
+            )
             .expect(
                 "failed to record audit entry to database - connection may be lost or disk full",
             );
@@ -452,7 +489,7 @@ mod tests {
             .record(
                 "alice",
                 AuditAction::Scan,
-                Some("/data/project1"),
+                Some(Path::new("/data/project1")),
                 None,
                 None,
             )
@@ -463,7 +500,7 @@ mod tests {
             .record(
                 "bob",
                 AuditAction::Approve,
-                Some("/data/project2"),
+                Some(Path::new("/data/project2")),
                 None,
                 None,
             )
@@ -474,7 +511,7 @@ mod tests {
             .record(
                 "charlie",
                 AuditAction::Remove,
-                Some("/data/project1"),
+                Some(Path::new("/data/project1")),
                 None,
                 None,
             )
@@ -485,7 +522,7 @@ mod tests {
             .record(
                 "dave",
                 AuditAction::Defer,
-                Some("/data/project1"),
+                Some(Path::new("/data/project1")),
                 None,
                 None,
             )
@@ -494,7 +531,7 @@ mod tests {
             );
 
         let entries = audit
-            .list_by_path("/data/project1")
+            .list_by_path(Path::new("/data/project1"))
             .expect("failed to query audit entries by path - database connection may be lost");
         assert_eq!(entries.len(), 3, "Expected 3 entries for /data/project1");
 
@@ -515,13 +552,19 @@ mod tests {
         let audit = AuditService::new(&db);
 
         audit
-            .record("user", AuditAction::Scan, Some("/data/exists"), None, None)
+            .record(
+                "user",
+                AuditAction::Scan,
+                Some(Path::new("/data/exists")),
+                None,
+                None,
+            )
             .expect(
                 "failed to record audit entry to database - connection may be lost or disk full",
             );
 
         let entries = audit
-            .list_by_path("/data/nonexistent")
+            .list_by_path(Path::new("/data/nonexistent"))
             .expect("failed to query audit entries by path - database connection may be lost");
         assert!(
             entries.is_empty(),

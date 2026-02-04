@@ -117,7 +117,7 @@ pub fn transition_expired_paths(
 
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
-        let path: String = row.get(1)?;
+        let path = PathBuf::from(row.get::<_, String>(1)?);
         let mtime: Option<i64> = row.get(2)?;
         let tracked_since: Option<i64> = row.get(3)?;
         let status: String = row.get(4)?;
@@ -192,7 +192,7 @@ pub fn transition_expired_paths(
         audit.record(
             &user,
             AuditAction::Scan,
-            Some(&path),
+            Some(path.as_path()),
             Some(action_desc),
             Some(id),
         )?;
@@ -336,8 +336,7 @@ pub async fn scan_and_persist(
 
     // Seed config baseline paths as roots in the database
     for path in config_tracked_paths {
-        let path_str = path.to_string_lossy();
-        db.insert_root(&path_str)?;
+        db.insert_root(path)?;
     }
 
     // Query all roots from the database (config baseline + user-added)
@@ -345,7 +344,7 @@ pub async fn scan_and_persist(
 
     // Scan each root
     for root in &roots {
-        let path = PathBuf::from(&root.path);
+        let path = root.path.clone();
         tracing::info!(?path, "Scanning path");
 
         let root_id = root.id;
@@ -354,18 +353,16 @@ pub async fn scan_and_persist(
 
         // Upsert directory entries and file entries
         for dir_info in &scan_result.directories_found {
-            let dir_path_str = dir_info.path.to_string_lossy();
-
             // Determine parent_path for this directory
             let parent_path = dir_info
                 .path
                 .parent()
-                .map_or_else(|| root.path.clone(), |p| p.to_string_lossy().to_string());
+                .map_or_else(|| root.path.clone(), Path::to_path_buf);
 
             // Insert directory entry with oldest child mtime so directories
             // sort meaningfully by expiration alongside files.
             let dir_mtime = dir_info.oldest_mtime.map(jiff::Timestamp::as_second);
-            db.upsert_entry(root_id, &dir_path_str, &parent_path, true, 0, dir_mtime)?;
+            db.upsert_entry(root_id, &dir_info.path, &parent_path, true, 0, dir_mtime)?;
 
             // Insert file entries for this directory
             for entry in jwalk::WalkDir::new(&dir_info.path)
@@ -385,15 +382,14 @@ pub async fn scan_and_persist(
                 if let Ok(metadata) = get_metadata(&file_path)
                     && metadata.is_file
                 {
-                    let file_path_str = file_path.to_string_lossy();
                     let mtime_unix = metadata.mtime.map(jiff::Timestamp::as_second);
 
                     // Allow: size_bytes is a realistic file size that won't exceed i64::MAX.
                     #[allow(clippy::cast_possible_wrap)]
                     db.upsert_entry(
                         root_id,
-                        &file_path_str,
-                        &dir_path_str,
+                        &file_path,
+                        &dir_info.path,
                         false,
                         metadata.size_bytes as i64,
                         mtime_unix,
@@ -1230,12 +1226,12 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
             .upsert_entry(
                 root_id,
-                "/data/expired",
-                "/data",
+                Path::new("/data/expired"),
+                Path::new("/data"),
                 false,
                 1024,
                 Some(hundred_days_ago.as_second()),
@@ -1252,7 +1248,7 @@ mod tests {
 
         // Verify initial status is 'tracked'
         let entry_before = db
-            .get_entry_by_path("/data/expired")
+            .get_entry_by_path(Path::new("/data/expired"))
             .expect("failed to query entry from database - connection may be lost")
             .expect(
                 "expected entry to exist after insert - verify database persisted data correctly",
@@ -1269,7 +1265,7 @@ mod tests {
 
         // Verify status changed to 'pending'
         let entry_after = db
-            .get_entry_by_path("/data/expired")
+            .get_entry_by_path(Path::new("/data/expired"))
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after transition - verify scanner persisted data correctly");
         assert_eq!(entry_after.status, "pending");
@@ -1277,7 +1273,7 @@ mod tests {
         // Verify audit entry was created
         let audit = crate::audit::AuditService::new(&db);
         let entries = audit
-            .list_by_path("/data/expired")
+            .list_by_path(Path::new("/data/expired"))
             .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(entries.len(), 1);
         assert!(
@@ -1299,12 +1295,12 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
             .upsert_entry(
                 root_id,
-                "/data/expired",
-                "/data",
+                Path::new("/data/expired"),
+                Path::new("/data"),
                 false,
                 1024,
                 Some(hundred_days_ago.as_second()),
@@ -1329,7 +1325,7 @@ mod tests {
 
         // Verify status changed to 'approved'
         let entry = db
-            .get_entry_by_path("/data/expired")
+            .get_entry_by_path(Path::new("/data/expired"))
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after transition - verify scanner persisted data correctly");
         assert_eq!(entry.status, "approved");
@@ -1345,11 +1341,11 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(10 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         db.upsert_entry(
             root_id,
-            "/data/recent",
-            "/data",
+            Path::new("/data/recent"),
+            Path::new("/data"),
             false,
             1024,
             Some(ten_days_ago.as_second()),
@@ -1366,7 +1362,7 @@ mod tests {
 
         // Verify status unchanged
         let entry = db
-            .get_entry_by_path("/data/recent")
+            .get_entry_by_path(Path::new("/data/recent"))
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after transition - verify scanner persisted data correctly");
         assert_eq!(entry.status, "tracked");
@@ -1382,9 +1378,16 @@ mod tests {
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         // Insert a root and file entry with deferred status
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
-            .upsert_entry(root_id, "/data/deferred", "/data", false, 1024, None)
+            .upsert_entry(
+                root_id,
+                Path::new("/data/deferred"),
+                Path::new("/data"),
+                false,
+                1024,
+                None,
+            )
             .expect("failed to insert test entry - database connection may be lost");
 
         // Set status to 'deferred' with deferred_until in the past
@@ -1397,7 +1400,7 @@ mod tests {
 
         // Verify initial state
         let entry_before = db
-            .get_entry_by_path("/data/deferred")
+            .get_entry_by_path(Path::new("/data/deferred"))
             .expect("failed to query entry from database - connection may be lost")
             .expect(
                 "expected entry to exist after insert - verify scanner persisted data correctly",
@@ -1415,7 +1418,7 @@ mod tests {
 
         // Verify status reset to 'tracked' and deferred_until cleared
         let entry_after = db
-            .get_entry_by_path("/data/deferred")
+            .get_entry_by_path(Path::new("/data/deferred"))
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after transition - verify scanner persisted data correctly");
         assert_eq!(entry_after.status, "tracked");
@@ -1432,9 +1435,16 @@ mod tests {
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
         // Insert a root and file entry with deferred status
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
-            .upsert_entry(root_id, "/data/deferred", "/data", false, 1024, None)
+            .upsert_entry(
+                root_id,
+                Path::new("/data/deferred"),
+                Path::new("/data"),
+                false,
+                1024,
+                None,
+            )
             .expect("failed to insert test entry - database connection may be lost");
 
         // Set status to 'deferred' with deferred_until in the future
@@ -1455,7 +1465,7 @@ mod tests {
 
         // Verify status unchanged
         let entry = db
-            .get_entry_by_path("/data/deferred")
+            .get_entry_by_path(Path::new("/data/deferred"))
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after transition - verify scanner persisted data correctly");
         assert_eq!(entry.status, "deferred");
@@ -1472,12 +1482,12 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
             .upsert_entry(
                 root_id,
-                "/data/ignored",
-                "/data",
+                Path::new("/data/ignored"),
+                Path::new("/data"),
                 false,
                 1024,
                 Some(hundred_days_ago.as_second()),
@@ -1498,7 +1508,7 @@ mod tests {
 
         // Verify status unchanged
         let entry = db
-            .get_entry_by_path("/data/ignored")
+            .get_entry_by_path(Path::new("/data/ignored"))
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after transition - verify scanner persisted data correctly");
         assert_eq!(entry.status, "ignored");
@@ -1519,14 +1529,14 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
         // Expired tracked file
         let expired1_id = db
             .upsert_entry(
                 root_id,
-                "/data/expired1",
-                "/data",
+                Path::new("/data/expired1"),
+                Path::new("/data"),
                 false,
                 1024,
                 Some(hundred_days_ago.as_second()),
@@ -1537,8 +1547,8 @@ mod tests {
         let expired2_id = db
             .upsert_entry(
                 root_id,
-                "/data/expired2",
-                "/data",
+                Path::new("/data/expired2"),
+                Path::new("/data"),
                 false,
                 2048,
                 Some(hundred_days_ago.as_second()),
@@ -1556,8 +1566,8 @@ mod tests {
         // Non-expired tracked file
         db.upsert_entry(
             root_id,
-            "/data/recent",
-            "/data",
+            Path::new("/data/recent"),
+            Path::new("/data"),
             false,
             512,
             Some(ten_days_ago.as_second()),
@@ -1566,7 +1576,14 @@ mod tests {
 
         // Expired deferral
         let deferred_id = db
-            .upsert_entry(root_id, "/data/deferred", "/data", false, 256, None)
+            .upsert_entry(
+                root_id,
+                Path::new("/data/deferred"),
+                Path::new("/data"),
+                false,
+                256,
+                None,
+            )
             .expect("failed to insert test entry - database connection may be lost");
         db.conn()
             .execute(
@@ -1585,28 +1602,28 @@ mod tests {
 
         // Verify each entry
         assert_eq!(
-            db.get_entry_by_path("/data/expired1")
+            db.get_entry_by_path(Path::new("/data/expired1"))
                 .expect("failed to query entry from database - connection may be lost")
                 .expect("expected entry to exist after transition - verify scanner persisted data correctly")
                 .status,
             "pending"
         );
         assert_eq!(
-            db.get_entry_by_path("/data/expired2")
+            db.get_entry_by_path(Path::new("/data/expired2"))
                 .expect("failed to query entry from database - connection may be lost")
                 .expect("expected entry to exist after transition - verify scanner persisted data correctly")
                 .status,
             "pending"
         );
         assert_eq!(
-            db.get_entry_by_path("/data/recent")
+            db.get_entry_by_path(Path::new("/data/recent"))
                 .expect("failed to query entry from database - connection may be lost")
                 .expect("expected entry to exist after transition - verify scanner persisted data correctly")
                 .status,
             "tracked"
         );
         assert_eq!(
-            db.get_entry_by_path("/data/deferred")
+            db.get_entry_by_path(Path::new("/data/deferred"))
                 .expect("failed to query entry from database - connection may be lost")
                 .expect("expected entry to exist after transition - verify scanner persisted data correctly")
                 .status,
@@ -1619,9 +1636,16 @@ mod tests {
         let (_temp, db) = temp_database();
 
         // File entry with no mtime
-        let root_id = db.insert_root("/data").expect("insert root");
-        db.upsert_entry(root_id, "/data/no_mtime", "/data", false, 0, None)
-            .expect("failed to insert test entry - database connection may be lost");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/no_mtime"),
+            Path::new("/data"),
+            false,
+            0,
+            None,
+        )
+        .expect("failed to insert test entry - database connection may be lost");
 
         // Run transition
         let summary = super::transition_expired_paths(&db, 90, false)
@@ -1634,7 +1658,7 @@ mod tests {
 
         // Verify status unchanged
         let entry = db
-            .get_entry_by_path("/data/no_mtime")
+            .get_entry_by_path(Path::new("/data/no_mtime"))
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after transition - verify scanner persisted data correctly");
         assert_eq!(entry.status, "tracked");
@@ -1645,9 +1669,16 @@ mod tests {
         let (_temp, db) = temp_database();
 
         // Create a directory entry (is_dir=true) - directories should not expire
-        let root_id = db.insert_root("/data").expect("insert root");
-        db.upsert_entry(root_id, "/data/subdir", "/data", true, 0, None)
-            .expect("failed to insert test entry - database connection may be lost");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/subdir"),
+            Path::new("/data"),
+            true,
+            0,
+            None,
+        )
+        .expect("failed to insert test entry - database connection may be lost");
 
         // Run transition
         let summary = super::transition_expired_paths(&db, 90, false)
@@ -1669,7 +1700,7 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed for test data - check duration values");
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
         // Create file entries with various statuses that should NOT be transitioned
         for (path, status) in [
@@ -1681,8 +1712,8 @@ mod tests {
             let entry_id = db
                 .upsert_entry(
                     root_id,
-                    path,
-                    "/data",
+                    Path::new(path),
+                    Path::new("/data"),
                     false,
                     1024,
                     Some(hundred_days_ago.as_second()),
@@ -1706,7 +1737,7 @@ mod tests {
             ("/data/removed", "removed"),
             ("/data/blocked", "blocked"),
         ] {
-            let entry = db.get_entry_by_path(path).expect("failed to query entry from database - connection may be lost").expect("expected entry to exist after transition - verify scanner persisted data correctly");
+            let entry = db.get_entry_by_path(Path::new(path)).expect("failed to query entry from database - connection may be lost").expect("expected entry to exist after transition - verify scanner persisted data correctly");
             assert_eq!(
                 entry.status, expected_status,
                 "Status for {path} should be unchanged"
@@ -1718,9 +1749,16 @@ mod tests {
     fn transition_expired_paths_handles_deferred_with_null_deferred_until() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
-            .upsert_entry(root_id, "/data/deferred-null", "/data", false, 1024, None)
+            .upsert_entry(
+                root_id,
+                Path::new("/data/deferred-null"),
+                Path::new("/data"),
+                false,
+                1024,
+                None,
+            )
             .expect("failed to insert test entry - database connection may be lost");
 
         // Set status to deferred but leave deferred_until as NULL
@@ -1738,7 +1776,7 @@ mod tests {
         assert_eq!(summary.deferred_reset, 0);
 
         let entry = db
-            .get_entry_by_path("/data/deferred-null")
+            .get_entry_by_path(Path::new("/data/deferred-null"))
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after transition - verify scanner persisted data correctly");
         assert_eq!(entry.status, "deferred");
@@ -1799,12 +1837,12 @@ mod tests {
         // Verify root was created
         let roots = db.list_roots().expect("failed to list roots");
         assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].path, project_dir.to_string_lossy());
+        assert_eq!(roots[0].path, project_dir);
         assert!(roots[0].last_scanned.is_some());
 
         // Verify directory entry was created
         let dir_entry = db
-            .get_entry_by_path(&project_dir.to_string_lossy())
+            .get_entry_by_path(&project_dir)
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected directory entry to exist after scan");
         assert!(dir_entry.is_dir);
@@ -1813,7 +1851,7 @@ mod tests {
         // Verify file entry was created
         let file_path = project_dir.join("file1.txt");
         let file_entry = db
-            .get_entry_by_path(&file_path.to_string_lossy())
+            .get_entry_by_path(&file_path)
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected file entry to exist after scan");
         assert!(!file_entry.is_dir);
@@ -1856,7 +1894,7 @@ mod tests {
 
         // Verify files were persisted as entries
         let entries = db
-            .list_entries_by_parent(&project_dir.to_string_lossy())
+            .list_entries_by_parent(&project_dir)
             .expect("failed to list entries from database - connection may be lost");
         assert_eq!(entries.len(), 2, "Expected 2 file entries");
 
@@ -2002,12 +2040,12 @@ mod tests {
 
         // Verify entries exist for both
         assert!(
-            db.get_entry_by_path(&dir1.to_string_lossy())
+            db.get_entry_by_path(&dir1)
                 .expect("failed to query entry from database - connection may be lost")
                 .is_some()
         );
         assert!(
-            db.get_entry_by_path(&dir2.to_string_lossy())
+            db.get_entry_by_path(&dir2)
                 .expect("failed to query entry from database - connection may be lost")
                 .is_some()
         );
@@ -2043,7 +2081,7 @@ mod tests {
         // Change entry status manually (simulating user action)
         let file_path = project_dir.join("file1.txt");
         let entry = db
-            .get_entry_by_path(&file_path.to_string_lossy())
+            .get_entry_by_path(&file_path)
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after scan");
         db.update_entry_status(entry.id, "approved")
@@ -2062,7 +2100,7 @@ mod tests {
 
         // Verify entry was updated but status preserved
         let updated_entry = db
-            .get_entry_by_path(&file_path.to_string_lossy())
+            .get_entry_by_path(&file_path)
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after scan");
 
@@ -2166,7 +2204,7 @@ mod tests {
         // Manually set status to 'pending'
         let file_path = pending_dir.join("file.txt");
         let entry = db
-            .get_entry_by_path(&file_path.to_string_lossy())
+            .get_entry_by_path(&file_path)
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after scan");
         db.update_entry_status(entry.id, "pending")
@@ -2333,7 +2371,7 @@ mod tests {
         // Mark warning file as 'pending'
         let warning_file_path = warning_dir.join("warning.txt");
         let entry = db
-            .get_entry_by_path(&warning_file_path.to_string_lossy())
+            .get_entry_by_path(&warning_file_path)
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after scan");
         db.update_entry_status(entry.id, "pending")
@@ -2400,7 +2438,7 @@ mod tests {
         // Mark as ignored
         let file_path = ignored_dir.join("old.txt");
         let entry = db
-            .get_entry_by_path(&file_path.to_string_lossy())
+            .get_entry_by_path(&file_path)
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected entry to exist after scan");
         db.update_entry_status(entry.id, "ignored")
@@ -2606,7 +2644,7 @@ mod tests {
 
         // Query the file entry
         let entry = db
-            .get_entry_by_path(&file_path.to_string_lossy())
+            .get_entry_by_path(&file_path)
             .expect("failed to query entry")
             .expect("entry should exist");
 
@@ -2661,7 +2699,7 @@ mod tests {
 
         // Get the entry from first scan
         let entry_before = db
-            .get_entry_by_path(&file_path.to_string_lossy())
+            .get_entry_by_path(&file_path)
             .expect("failed to query entry")
             .expect("entry should exist");
         let tracked_since_original = entry_before
@@ -2688,7 +2726,7 @@ mod tests {
 
         // Verify tracked_since was NOT changed by the update
         let entry_after = db
-            .get_entry_by_path(&file_path.to_string_lossy())
+            .get_entry_by_path(&file_path)
             .expect("failed to query entry after second scan")
             .expect("entry should exist");
         assert_eq!(
@@ -2753,7 +2791,7 @@ mod tests {
 
         // Query entry
         let entry = db
-            .get_entry_by_path(&file_path.to_string_lossy())
+            .get_entry_by_path(&file_path)
             .expect("failed to query entry")
             .expect("entry should exist");
 

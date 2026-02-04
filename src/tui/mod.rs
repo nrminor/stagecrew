@@ -6,7 +6,7 @@ mod ui;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
@@ -91,7 +91,7 @@ pub struct App {
 
     /// The current path being browsed within the selected root.
     /// This enables hierarchical navigation within a root.
-    pub(crate) current_path: String,
+    pub(crate) current_path: PathBuf,
 
     /// Pending entry deletion confirmation state.
     pub(crate) pending_entry_delete: Option<Vec<PendingEntry>>,
@@ -124,7 +124,7 @@ pub struct App {
 
     /// Pending remove path confirmation state.
     /// Contains the path awaiting user confirmation for removal from config.
-    pub(crate) pending_remove_path: Option<String>,
+    pub(crate) pending_remove_path: Option<PathBuf>,
 
     /// Whether the sidebar is visible.
     pub(crate) sidebar_visible: bool,
@@ -195,7 +195,7 @@ impl App {
     }
 
     /// Get the current path being browsed.
-    pub fn current_path(&self) -> &str {
+    pub fn current_path(&self) -> &Path {
         &self.current_path
     }
 
@@ -230,7 +230,7 @@ impl App {
     }
 
     /// Get the pending remove path confirmation state.
-    pub fn pending_remove_path(&self) -> Option<&str> {
+    pub fn pending_remove_path(&self) -> Option<&Path> {
         self.pending_remove_path.as_deref()
     }
 
@@ -307,7 +307,7 @@ impl App {
     ///
     /// Sets the current path to the given directory path and resets entry selection.
     /// Also clears any active search since results are directory-specific.
-    pub(crate) fn navigate_into(&mut self, path: String) {
+    pub(crate) fn navigate_into(&mut self, path: PathBuf) {
         self.current_path = path;
         self.entry_selected_index = 0;
         self.clear_search();
@@ -319,7 +319,7 @@ impl App {
     /// immediately instead of the empty "Select a root" prompt. This is a
     /// no-op when a root is already entered (i.e., `current_path` is non-empty).
     pub(crate) fn auto_enter_first_root(&mut self, db: &crate::db::Database) {
-        if !self.current_path.is_empty() {
+        if !self.current_path.as_os_str().is_empty() {
             return;
         }
         if let Ok(roots) = db.list_roots()
@@ -335,8 +335,8 @@ impl App {
     /// If already at a root level, this is a no-op.
     /// Clears any active search since results are directory-specific.
     pub(crate) fn navigate_up(&mut self) {
-        if let Some(parent) = std::path::Path::new(&self.current_path).parent() {
-            self.current_path = parent.to_string_lossy().to_string();
+        if let Some(parent) = self.current_path.parent() {
+            self.current_path = parent.to_path_buf();
             self.entry_selected_index = 0;
             self.clear_search();
         }
@@ -445,7 +445,7 @@ impl App {
             sidebar_len: Cell::new(0),
             entry_list_len: Cell::new(0),
             current_root_id: Cell::new(None),
-            current_path: String::new(),
+            current_path: PathBuf::new(),
             pending_entry_delete: None,
             pending_entry_deferral: None,
             pending_entry_ignore: None,
@@ -742,7 +742,7 @@ mod tests {
             "App should start with no root selected"
         );
         assert!(
-            app.current_path.is_empty(),
+            app.current_path.as_os_str().is_empty(),
             "App should start with empty current_path"
         );
         assert_eq!(
@@ -847,29 +847,29 @@ mod tests {
     fn app_navigate_into_sets_path_and_resets_index() {
         let mut app = App::new();
         app.entry_selected_index = 5;
-        app.navigate_into("/test/path".to_string());
-        assert_eq!(app.current_path, "/test/path");
+        app.navigate_into(PathBuf::from("/test/path"));
+        assert_eq!(app.current_path, PathBuf::from("/test/path"));
         assert_eq!(app.entry_selected_index, 0);
     }
 
     #[test]
     fn app_navigate_up_goes_to_parent() {
         let mut app = App::new();
-        app.current_path = "/test/path/child".to_string();
+        app.current_path = PathBuf::from("/test/path/child");
         app.entry_selected_index = 5;
         app.navigate_up();
-        assert_eq!(app.current_path, "/test/path");
+        assert_eq!(app.current_path, PathBuf::from("/test/path"));
         assert_eq!(app.entry_selected_index, 0);
     }
 
     #[test]
     fn app_navigate_up_at_root_is_noop() {
         let mut app = App::new();
-        app.current_path = "/".to_string();
+        app.current_path = PathBuf::from("/");
         app.entry_selected_index = 5;
         app.navigate_up();
         // "/" has no parent, so navigate_up is a no-op (path and index unchanged).
-        assert_eq!(app.current_path, "/");
+        assert_eq!(app.current_path, PathBuf::from("/"));
         assert_eq!(app.entry_selected_index, 5);
     }
 }

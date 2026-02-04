@@ -30,8 +30,8 @@ pub(super) fn find_search_matches(
         .iter()
         .enumerate()
         .filter(|(_, (entry, _))| {
-            let filename = std::path::Path::new(&entry.path).file_name().map_or_else(
-                || entry.path.to_lowercase(),
+            let filename = entry.path.file_name().map_or_else(
+                || entry.path.to_string_lossy().to_lowercase(),
                 |f| f.to_string_lossy().to_lowercase(),
             );
             filename.contains(&query_lower)
@@ -50,7 +50,7 @@ pub(super) fn sorted_entry_rows(
     config: &Config,
     db: &Database,
 ) -> Option<Vec<(crate::db::Entry, i64)>> {
-    if app.current_path.is_empty() {
+    if app.current_path.as_os_str().is_empty() {
         return None;
     }
     let entries = db.list_entries_by_parent(app.current_path()).ok()?;
@@ -453,7 +453,7 @@ impl InputHandler {
     /// Otherwise, delete the currently focused entry.
     fn initiate_entry_delete(app: &mut App, config: &Config, db: &Database) {
         // Get entries for current path
-        if app.current_path.is_empty() {
+        if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot delete entry: no path selected");
             return;
         }
@@ -485,7 +485,7 @@ impl InputHandler {
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
                 vec![super::PendingEntry {
                     id: entry.id,
-                    path: PathBuf::from(&entry.path),
+                    path: entry.path.clone(),
                     is_dir: entry.is_dir,
                 }]
             } else {
@@ -499,7 +499,7 @@ impl InputHandler {
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
                 .map(|(e, _)| super::PendingEntry {
                     id: e.id,
-                    path: PathBuf::from(&e.path),
+                    path: e.path.clone(),
                     is_dir: e.is_dir,
                 })
                 .collect()
@@ -534,9 +534,12 @@ impl InputHandler {
                     let total = entries.len();
 
                     for entry in entries {
-                        let path_str = entry.path.to_string_lossy();
-                        if let Err(e) = db.delete_entry(entry.id, &path_str, entry.is_dir) {
-                            tracing::warn!("Failed to delete entry {}: {}", path_str, e);
+                        if let Err(e) = db.delete_entry(entry.id, &entry.path, entry.is_dir) {
+                            tracing::warn!(
+                                "Failed to delete entry {}: {}",
+                                entry.path.display(),
+                                e
+                            );
                             app.status_message = Some(format!("Delete failed: {e}"));
                             app.status_message_time = Some(std::time::Instant::now());
                             fail_count += 1;
@@ -551,7 +554,7 @@ impl InputHandler {
                             if let Err(e) = audit.record(
                                 &user,
                                 AuditAction::Remove,
-                                Some(&*path_str),
+                                Some(entry.path.as_path()),
                                 Some(detail),
                                 root_id,
                             ) {
@@ -597,7 +600,7 @@ impl InputHandler {
     /// Otherwise, defer the currently focused entry.
     fn initiate_entry_defer(app: &mut App, config: &Config, db: &Database) {
         // Get entries for current path
-        if app.current_path.is_empty() {
+        if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot defer entry: no path selected");
             return;
         }
@@ -629,7 +632,7 @@ impl InputHandler {
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
                 vec![super::PendingEntry {
                     id: entry.id,
-                    path: PathBuf::from(&entry.path),
+                    path: entry.path.clone(),
                     is_dir: entry.is_dir,
                 }]
             } else {
@@ -643,7 +646,7 @@ impl InputHandler {
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
                 .map(|(e, _)| super::PendingEntry {
                     id: e.id,
-                    path: PathBuf::from(&e.path),
+                    path: e.path.clone(),
                     is_dir: e.is_dir,
                 })
                 .collect()
@@ -707,25 +710,24 @@ impl InputHandler {
                     let root_id = app.current_root_id.get();
 
                     for entry in &deferral.entries {
-                        let path_str = entry.path.to_string_lossy();
                         if let Err(e) = db.defer_entry(entry.id, deferred_until) {
-                            tracing::warn!("Failed to defer entry {}: {}", path_str, e);
+                            tracing::warn!("Failed to defer entry {}: {}", entry.path.display(), e);
                         } else {
                             // Propagate to children if this is a directory
                             if entry.is_dir
                                 && let Err(e) =
-                                    db.defer_entries_by_path_prefix(&path_str, deferred_until)
+                                    db.defer_entries_by_path_prefix(&entry.path, deferred_until)
                             {
                                 tracing::warn!(
                                     "Failed to propagate deferral to children of {}: {}",
-                                    path_str,
+                                    entry.path.display(),
                                     e
                                 );
                             }
                             if let Err(e) = audit.record(
                                 &user,
                                 AuditAction::Defer,
-                                Some(&*path_str),
+                                Some(entry.path.as_path()),
                                 details.as_deref(),
                                 root_id,
                             ) {
@@ -756,7 +758,7 @@ impl InputHandler {
     /// Otherwise, ignore the currently focused file.
     fn initiate_entry_ignore(app: &mut App, config: &Config, db: &Database) {
         // Get entries for current path
-        if app.current_path.is_empty() {
+        if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot ignore entry: no path selected");
             return;
         }
@@ -788,7 +790,7 @@ impl InputHandler {
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
                 vec![super::PendingEntry {
                     id: entry.id,
-                    path: PathBuf::from(&entry.path),
+                    path: entry.path.clone(),
                     is_dir: entry.is_dir,
                 }]
             } else {
@@ -802,7 +804,7 @@ impl InputHandler {
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
                 .map(|(e, _)| super::PendingEntry {
                     id: e.id,
-                    path: PathBuf::from(&e.path),
+                    path: e.path.clone(),
                     is_dir: e.is_dir,
                 })
                 .collect()
@@ -833,25 +835,28 @@ impl InputHandler {
                     let root_id = app.current_root_id.get();
 
                     for entry in entries {
-                        let path_str = entry.path.to_string_lossy();
                         if let Err(e) = db.update_entry_status(entry.id, "ignored") {
-                            tracing::warn!("Failed to ignore entry {}: {}", path_str, e);
+                            tracing::warn!(
+                                "Failed to ignore entry {}: {}",
+                                entry.path.display(),
+                                e
+                            );
                         } else {
                             // Propagate to children if this is a directory
                             if entry.is_dir
                                 && let Err(e) =
-                                    db.update_entries_by_path_prefix(&path_str, "ignored")
+                                    db.update_entries_by_path_prefix(&entry.path, "ignored")
                             {
                                 tracing::warn!(
                                     "Failed to propagate ignore to children of {}: {}",
-                                    path_str,
+                                    entry.path.display(),
                                     e
                                 );
                             }
                             if let Err(e) = audit.record(
                                 &user,
                                 AuditAction::Ignore,
-                                Some(&*path_str),
+                                Some(entry.path.as_path()),
                                 None,
                                 root_id,
                             ) {
@@ -882,7 +887,7 @@ impl InputHandler {
     /// Otherwise, approve the currently focused entry.
     fn initiate_entry_approve(app: &mut App, config: &Config, db: &Database) {
         // Get entries for current path
-        if app.current_path.is_empty() {
+        if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot approve entry: no path selected");
             return;
         }
@@ -914,7 +919,7 @@ impl InputHandler {
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
                 vec![super::PendingEntry {
                     id: entry.id,
-                    path: PathBuf::from(&entry.path),
+                    path: entry.path.clone(),
                     is_dir: entry.is_dir,
                 }]
             } else {
@@ -928,7 +933,7 @@ impl InputHandler {
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
                 .map(|(e, _)| super::PendingEntry {
                     id: e.id,
-                    path: PathBuf::from(&e.path),
+                    path: e.path.clone(),
                     is_dir: e.is_dir,
                 })
                 .collect()
@@ -959,25 +964,28 @@ impl InputHandler {
                     let root_id = app.current_root_id.get();
 
                     for entry in entries {
-                        let path_str = entry.path.to_string_lossy();
                         if let Err(e) = db.update_entry_status(entry.id, "approved") {
-                            tracing::warn!("Failed to approve entry {}: {}", path_str, e);
+                            tracing::warn!(
+                                "Failed to approve entry {}: {}",
+                                entry.path.display(),
+                                e
+                            );
                         } else {
                             // Propagate to children if this is a directory
                             if entry.is_dir
                                 && let Err(e) =
-                                    db.update_entries_by_path_prefix(&path_str, "approved")
+                                    db.update_entries_by_path_prefix(&entry.path, "approved")
                             {
                                 tracing::warn!(
                                     "Failed to propagate approval to children of {}: {}",
-                                    path_str,
+                                    entry.path.display(),
                                     e
                                 );
                             }
                             if let Err(e) = audit.record(
                                 &user,
                                 AuditAction::Approve,
-                                Some(&*path_str),
+                                Some(entry.path.as_path()),
                                 None,
                                 root_id,
                             ) {
@@ -1008,7 +1016,7 @@ impl InputHandler {
     /// Works on selected entries if any, otherwise the currently focused entry.
     fn unignore_entry(app: &mut App, config: &Config, db: &Database) {
         // Get entries for current path
-        if app.current_path.is_empty() {
+        if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot unignore entry: no path selected");
             return;
         }
@@ -1042,7 +1050,7 @@ impl InputHandler {
                 if entry.status == "ignored" {
                     vec![super::PendingEntry {
                         id: entry.id,
-                        path: PathBuf::from(&entry.path),
+                        path: entry.path.clone(),
                         is_dir: entry.is_dir,
                     }]
                 } else {
@@ -1061,7 +1069,7 @@ impl InputHandler {
                 .filter(|(e, _)| app.selected_entries.contains(&e.id) && e.status == "ignored")
                 .map(|(e, _)| super::PendingEntry {
                     id: e.id,
-                    path: PathBuf::from(&e.path),
+                    path: e.path.clone(),
                     is_dir: e.is_dir,
                 })
                 .collect()
@@ -1080,27 +1088,26 @@ impl InputHandler {
 
         let mut success_count = 0;
         for entry in &entries_to_unignore {
-            let path_str = entry.path.to_string_lossy();
             if let Err(e) = db.update_entry_status(entry.id, "tracked") {
-                tracing::warn!("Failed to unignore entry {}: {}", path_str, e);
+                tracing::warn!("Failed to unignore entry {}: {}", entry.path.display(), e);
                 app.status_message = Some(format!("Unignore failed: {e}"));
                 app.status_message_time = Some(std::time::Instant::now());
             } else {
                 success_count += 1;
                 // Propagate to children if this is a directory
                 if entry.is_dir
-                    && let Err(e) = db.update_entries_by_path_prefix(&path_str, "tracked")
+                    && let Err(e) = db.update_entries_by_path_prefix(&entry.path, "tracked")
                 {
                     tracing::warn!(
                         "Failed to propagate unignore to children of {}: {}",
-                        path_str,
+                        entry.path.display(),
                         e
                     );
                 }
                 if let Err(e) = audit.record(
                     &user,
                     AuditAction::Unignore,
-                    Some(&*path_str),
+                    Some(entry.path.as_path()),
                     None,
                     root_id,
                 ) {
@@ -1197,7 +1204,7 @@ impl InputHandler {
             _ => return Vec::new(),
         };
 
-        if app.current_path.is_empty() {
+        if app.current_path.as_os_str().is_empty() {
             return Vec::new();
         }
 
@@ -1280,9 +1287,8 @@ impl InputHandler {
                         return;
                     }
 
-                    let path_str = canonical_path.to_string_lossy();
                     if let Ok(roots) = db.list_roots()
-                        && roots.iter().any(|r| r.path == path_str.as_ref())
+                        && roots.iter().any(|r| r.path == canonical_path)
                     {
                         tracing::warn!("Path already tracked: {}", canonical_path.display());
                         app.pending_add_path = None;
@@ -1290,7 +1296,7 @@ impl InputHandler {
                     }
 
                     // Insert as a root in the database
-                    if let Err(e) = db.insert_root(&path_str) {
+                    if let Err(e) = db.insert_root(&canonical_path) {
                         tracing::warn!("Failed to add root to database: {}", e);
                         app.pending_add_path = None;
                         return;
@@ -1330,10 +1336,7 @@ impl InputHandler {
         };
 
         if let Some(root) = roots.get(app.sidebar_selected_index) {
-            let is_config_root = config
-                .tracked_paths
-                .iter()
-                .any(|p| p.to_string_lossy() == root.path);
+            let is_config_root = config.tracked_paths.contains(&root.path);
 
             if is_config_root {
                 app.status_message =
@@ -1358,17 +1361,23 @@ impl InputHandler {
                             if let Err(e) = db.delete_root(root.id) {
                                 tracing::warn!("Failed to remove root from database: {}", e);
                             } else {
-                                tracing::info!("Removed tracked path: {}", path_to_remove);
+                                tracing::info!(
+                                    "Removed tracked path: {}",
+                                    path_to_remove.display()
+                                );
                                 // If we were browsing this root, clear the view
-                                if app.current_path.starts_with(path_to_remove.as_str()) {
-                                    app.current_path.clear();
+                                if app.current_path.starts_with(path_to_remove) {
+                                    app.current_path = PathBuf::new();
                                     app.current_root_id.set(None);
                                     app.focus_panel = FocusPanel::Sidebar;
                                 }
                             }
                         }
                         Ok(None) => {
-                            tracing::warn!("Root not found in database: {}", path_to_remove);
+                            tracing::warn!(
+                                "Root not found in database: {}",
+                                path_to_remove.display()
+                            );
                         }
                         Err(e) => {
                             tracing::warn!("Failed to look up root: {}", e);
@@ -1392,6 +1401,8 @@ impl InputHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::config::Config;
     use crate::db::Database;
@@ -1443,11 +1454,11 @@ mod tests {
         let mut app = App::new();
         let config = test_config();
 
-        db.insert_root("/test/downloads")
+        db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
 
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/downloads".to_string();
+        app.current_path = PathBuf::from("/test/downloads");
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
         assert!(app.sidebar_visible);
@@ -1459,16 +1470,16 @@ mod tests {
         let mut app = App::new();
         let config = test_config();
 
-        db.insert_root("/test/downloads")
+        db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
 
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/downloads/subdir".to_string();
+        app.current_path = PathBuf::from("/test/downloads/subdir");
         app.entry_selected_index = 3;
 
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
 
-        assert_eq!(app.current_path, "/test/downloads");
+        assert_eq!(app.current_path, PathBuf::from("/test/downloads"));
         assert_eq!(app.entry_selected_index, 0);
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
     }
@@ -1494,7 +1505,7 @@ mod tests {
         let mut app = App::new();
         let config = test_config();
 
-        db.insert_root("/test/downloads")
+        db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
 
         app.focus_panel = FocusPanel::Sidebar;
@@ -1502,7 +1513,7 @@ mod tests {
 
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('l')));
 
-        assert_eq!(app.current_path, "/test/downloads");
+        assert_eq!(app.current_path, PathBuf::from("/test/downloads"));
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
         assert_eq!(app.entry_selected_index, 0);
     }
@@ -1514,12 +1525,12 @@ mod tests {
         let config = test_config();
 
         let root_id = db
-            .insert_root("/test/downloads")
+            .insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
         db.upsert_entry(
             root_id,
-            "/test/downloads/subdir",
-            "/test/downloads",
+            Path::new("/test/downloads/subdir"),
+            Path::new("/test/downloads"),
             true,
             0,
             None,
@@ -1527,8 +1538,8 @@ mod tests {
         .expect("Failed to create dir entry");
         db.upsert_entry(
             root_id,
-            "/test/downloads/file.txt",
-            "/test/downloads",
+            Path::new("/test/downloads/file.txt"),
+            Path::new("/test/downloads"),
             false,
             100,
             Some(1000),
@@ -1536,14 +1547,14 @@ mod tests {
         .expect("Failed to create file entry");
 
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/downloads".to_string();
+        app.current_path = PathBuf::from("/test/downloads");
         // Sort by name puts directories first, so index 0 should be the subdir
         app.sort_mode = SortMode::Name;
         app.entry_selected_index = 0;
 
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('l')));
 
-        assert_eq!(app.current_path, "/test/downloads/subdir");
+        assert_eq!(app.current_path, PathBuf::from("/test/downloads/subdir"));
         assert_eq!(app.entry_selected_index, 0);
     }
 
@@ -1554,12 +1565,12 @@ mod tests {
         let config = test_config();
 
         let root_id = db
-            .insert_root("/test/downloads")
+            .insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
         db.upsert_entry(
             root_id,
-            "/test/downloads/file.txt",
-            "/test/downloads",
+            Path::new("/test/downloads/file.txt"),
+            Path::new("/test/downloads"),
             false,
             100,
             Some(1000),
@@ -1567,13 +1578,13 @@ mod tests {
         .expect("Failed to create file entry");
 
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/downloads".to_string();
+        app.current_path = PathBuf::from("/test/downloads");
         app.entry_selected_index = 0;
 
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('l')));
 
         // Should remain in the same directory
-        assert_eq!(app.current_path, "/test/downloads");
+        assert_eq!(app.current_path, PathBuf::from("/test/downloads"));
     }
 
     #[test]
@@ -1768,7 +1779,7 @@ mod tests {
         let config = test_config();
 
         // Create a root in the database
-        db.insert_root("/test/downloads")
+        db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
 
         // Focus sidebar and select the root
@@ -1778,7 +1789,7 @@ mod tests {
         // Press Enter
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
 
-        assert_eq!(app.current_path, "/test/downloads");
+        assert_eq!(app.current_path, PathBuf::from("/test/downloads"));
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
         assert_eq!(app.entry_selected_index, 0);
     }
@@ -1793,7 +1804,7 @@ mod tests {
 
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
 
-        assert!(app.current_path.is_empty());
+        assert!(app.current_path.as_os_str().is_empty());
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
     }
 
@@ -1803,11 +1814,11 @@ mod tests {
         let mut app = App::new();
         let config = test_config();
 
-        db.insert_root("/test/downloads")
+        db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
 
         // Simulate being inside a root
-        app.current_path = "/test/downloads".to_string();
+        app.current_path = PathBuf::from("/test/downloads");
         app.focus_panel = FocusPanel::MainPanel;
 
         // Press Backspace
@@ -1822,11 +1833,11 @@ mod tests {
         let mut app = App::new();
         let config = test_config();
 
-        db.insert_root("/test/downloads")
+        db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
 
         // Simulate being inside a subdirectory within a root
-        app.current_path = "/test/downloads/subdir".to_string();
+        app.current_path = PathBuf::from("/test/downloads/subdir");
         app.focus_panel = FocusPanel::MainPanel;
 
         // Press Backspace — should not switch to sidebar since we're not at root level
@@ -1841,15 +1852,15 @@ mod tests {
     fn setup_with_files(db: &Database) -> (i64, Vec<i64>) {
         // Create a test root
         let root_id = db
-            .insert_root("/test/dir")
+            .insert_root(Path::new("/test/dir"))
             .expect("Failed to create test root");
 
         // Insert two test entries (files)
         let entry1_id = db
             .upsert_entry(
                 root_id,
-                "/test/dir/file1.txt",
-                "/test/dir",
+                Path::new("/test/dir/file1.txt"),
+                Path::new("/test/dir"),
                 false,
                 500,
                 Some(100),
@@ -1858,8 +1869,8 @@ mod tests {
         let entry2_id = db
             .upsert_entry(
                 root_id,
-                "/test/dir/file2.txt",
-                "/test/dir",
+                Path::new("/test/dir/file2.txt"),
+                Path::new("/test/dir"),
                 false,
                 500,
                 Some(150),
@@ -1880,7 +1891,7 @@ mod tests {
 
         // Set up app state to simulate viewing directory with first entry selected
         app.current_root_id.set(Some(dir_id));
-        app.current_path = "/test/dir".to_string();
+        app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
 
@@ -1941,12 +1952,10 @@ mod tests {
 
         // Set up database with the real file path
         let root_id = db
-            .insert_root(temp_dir.path().to_str().expect("Invalid path"))
+            .insert_root(temp_dir.path())
             .expect("Failed to create test root");
-        let file_path_str = file_path.to_str().expect("Invalid path");
-        let parent_path = temp_dir.path().to_str().expect("Invalid path");
         let entry_id = db
-            .upsert_entry(root_id, file_path_str, parent_path, false, 13, Some(100))
+            .upsert_entry(root_id, &file_path, temp_dir.path(), false, 13, Some(100))
             .expect("Failed to create entry");
 
         app.current_root_id.set(Some(root_id));
@@ -1954,7 +1963,7 @@ mod tests {
         // Manually set pending delete (simulating 'd' key press)
         app.pending_entry_delete = Some(vec![PendingEntry {
             id: entry_id,
-            path: PathBuf::from(file_path_str),
+            path: file_path.clone(),
             is_dir: false,
         }]);
 
@@ -1981,7 +1990,7 @@ mod tests {
 
         // Entry should no longer appear in the active entries list
         let entries = db
-            .list_entries_by_parent(parent_path)
+            .list_entries_by_parent(temp_dir.path())
             .expect("Failed to list entries");
         assert!(
             !entries.iter().any(|e| e.id == entry_id),
@@ -2023,7 +2032,7 @@ mod tests {
 
         // Entry should still be in tracked status
         let entries = db
-            .list_entries_by_parent("/test/dir")
+            .list_entries_by_parent(Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2046,7 +2055,7 @@ mod tests {
 
         // Set up app state
         app.current_root_id.set(Some(dir_id));
-        app.current_path = "/test/dir".to_string();
+        app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
 
@@ -2102,7 +2111,7 @@ mod tests {
 
         // Entry should be marked as deferred
         let entries = db
-            .list_entries_by_parent("/test/dir")
+            .list_entries_by_parent(Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2150,7 +2159,7 @@ mod tests {
 
         // Entry should be deferred with calculated timestamp
         let entries = db
-            .list_entries_by_parent("/test/dir")
+            .list_entries_by_parent(Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2181,7 +2190,7 @@ mod tests {
 
         // Set up app state
         app.current_root_id.set(Some(dir_id));
-        app.current_path = "/test/dir".to_string();
+        app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
 
@@ -2230,7 +2239,7 @@ mod tests {
 
         // Entry should be marked as ignored
         let entries = db
-            .list_entries_by_parent("/test/dir")
+            .list_entries_by_parent(Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2250,7 +2259,7 @@ mod tests {
 
         // Set up app state
         app.current_root_id.set(Some(dir_id));
-        app.current_path = "/test/dir".to_string();
+        app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
 
@@ -2299,7 +2308,7 @@ mod tests {
 
         // Entry should be marked as approved
         let entries = db
-            .list_entries_by_parent("/test/dir")
+            .list_entries_by_parent(Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2316,7 +2325,7 @@ mod tests {
     /// Helper to set up a root with several distinctly-named files for search tests.
     fn setup_search_files(db: &Database) -> i64 {
         let root_id = db
-            .insert_root("/test/search")
+            .insert_root(Path::new("/test/search"))
             .expect("Failed to create test root");
 
         // Create files with distinct names so we can test matching.
@@ -2333,8 +2342,15 @@ mod tests {
             ("notes.txt", 400),
         ] {
             let path = format!("/test/search/{name}");
-            db.upsert_entry(root_id, &path, "/test/search", false, 1000, Some(mtime))
-                .unwrap_or_else(|_| panic!("Failed to create entry {name}"));
+            db.upsert_entry(
+                root_id,
+                Path::new(&path),
+                Path::new("/test/search"),
+                false,
+                1000,
+                Some(mtime),
+            )
+            .unwrap_or_else(|_| panic!("Failed to create entry {name}"));
         }
 
         root_id
@@ -2347,7 +2363,7 @@ mod tests {
         let root_id = setup_search_files(&db);
 
         let entries = db
-            .list_entries_by_parent("/test/search")
+            .list_entries_by_parent(Path::new("/test/search"))
             .expect("Failed to list entries");
         let mut entry_rows: Vec<_> = entries
             .into_iter()
@@ -2368,7 +2384,10 @@ mod tests {
         let matched_names: Vec<String> = matches
             .iter()
             .map(|&i| {
-                std::path::Path::new(&entry_rows[i].0.path)
+                entry_rows[i]
+                    .0
+                    .path
+                    .as_path()
                     .file_name()
                     .expect("entry should have filename")
                     .to_string_lossy()
@@ -2389,7 +2408,7 @@ mod tests {
         setup_search_files(&db);
 
         let entries = db
-            .list_entries_by_parent("/test/search")
+            .list_entries_by_parent(Path::new("/test/search"))
             .expect("Failed to list entries");
         let mut entry_rows: Vec<_> = entries
             .into_iter()
@@ -2421,7 +2440,7 @@ mod tests {
         setup_search_files(&db);
 
         let entries = db
-            .list_entries_by_parent("/test/search")
+            .list_entries_by_parent(Path::new("/test/search"))
             .expect("Failed to list entries");
         let mut entry_rows: Vec<_> = entries
             .into_iter()
@@ -2533,7 +2552,7 @@ mod tests {
         setup_search_files(&db);
 
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/search".to_string();
+        app.current_path = PathBuf::from("/test/search");
         app.entry_selected_index = 0;
 
         // Enter search mode and type "notes"
@@ -2571,7 +2590,7 @@ mod tests {
         setup_search_files(&db);
 
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/search".to_string();
+        app.current_path = PathBuf::from("/test/search");
 
         // Set up confirmed search for "re" (matches readme.md and report.pdf)
         app.search_query = Some("re".to_string());
@@ -2619,7 +2638,7 @@ mod tests {
         setup_search_files(&db);
 
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/search".to_string();
+        app.current_path = PathBuf::from("/test/search");
 
         // Set up confirmed search for "re" (matches readme.md and report.pdf)
         app.search_query = Some("re".to_string());
@@ -2663,7 +2682,7 @@ mod tests {
         app.search_query = Some("test".to_string());
         app.search_input_active = false;
 
-        app.navigate_into("/some/path".to_string());
+        app.navigate_into(PathBuf::from("/some/path"));
 
         assert_eq!(app.search_query, None, "Navigation should clear search");
     }
@@ -2671,7 +2690,7 @@ mod tests {
     #[test]
     fn navigate_up_clears_search() {
         let mut app = App::new();
-        app.current_path = "/some/path/child".to_string();
+        app.current_path = PathBuf::from("/some/path/child");
         app.search_query = Some("test".to_string());
         app.search_input_active = false;
 
@@ -2706,7 +2725,7 @@ mod tests {
     /// Sorted order: alpha (100), bravo (200), charlie (300), delta (400), echo (500).
     fn setup_visual_files(db: &Database) -> i64 {
         let root_id = db
-            .insert_root("/test/visual")
+            .insert_root(Path::new("/test/visual"))
             .expect("Failed to create test root");
 
         for (name, mtime) in [
@@ -2717,8 +2736,15 @@ mod tests {
             ("echo", 500),
         ] {
             let path = format!("/test/visual/{name}");
-            db.upsert_entry(root_id, &path, "/test/visual", false, 1000, Some(mtime))
-                .unwrap_or_else(|_| panic!("Failed to create entry {name}"));
+            db.upsert_entry(
+                root_id,
+                Path::new(&path),
+                Path::new("/test/visual"),
+                false,
+                1000,
+                Some(mtime),
+            )
+            .unwrap_or_else(|_| panic!("Failed to create entry {name}"));
         }
 
         root_id
@@ -2728,7 +2754,7 @@ mod tests {
     fn visual_entry_ids(db: &Database, config: &Config) -> Vec<i64> {
         let app = {
             let mut a = App::new();
-            a.current_path = "/test/visual".to_string();
+            a.current_path = PathBuf::from("/test/visual");
             a
         };
         sorted_entry_rows(&app, config, db)
@@ -2746,7 +2772,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual".to_string();
+        app.current_path = PathBuf::from("/test/visual");
         app.entry_selected_index = 2; // charlie
 
         assert!(!app.is_visual_mode());
@@ -2769,7 +2795,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual".to_string();
+        app.current_path = PathBuf::from("/test/visual");
         app.entry_selected_index = 1;
 
         // Enter visual mode
@@ -2794,7 +2820,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual".to_string();
+        app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len.set(5);
         app.entry_selected_index = 1; // bravo
 
@@ -2822,7 +2848,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual".to_string();
+        app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len.set(5);
         app.entry_selected_index = 3; // delta
 
@@ -2850,7 +2876,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual".to_string();
+        app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len.set(5);
         app.entry_selected_index = 0;
 
@@ -2887,7 +2913,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual".to_string();
+        app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len.set(5);
         app.entry_selected_index = 1; // bravo
 
@@ -2921,7 +2947,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual".to_string();
+        app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len.set(5);
         app.entry_selected_index = 1;
 
@@ -2948,7 +2974,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual".to_string();
+        app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len.set(5);
         app.entry_selected_index = 2;
 
@@ -2969,7 +2995,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual/subdir".to_string();
+        app.current_path = PathBuf::from("/test/visual/subdir");
         app.entry_selected_index = 0;
 
         // Manually enter visual mode state
@@ -2988,7 +3014,7 @@ mod tests {
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/visual".to_string();
+        app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len.set(5);
         app.entry_selected_index = 3; // delta
 
@@ -3011,12 +3037,12 @@ mod tests {
     fn v_on_empty_directory_is_noop() {
         let (db, _dir) = temp_database();
         let config = test_config();
-        db.insert_root("/test/empty")
+        db.insert_root(Path::new("/test/empty"))
             .expect("Failed to create test root");
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
-        app.current_path = "/test/empty".to_string();
+        app.current_path = PathBuf::from("/test/empty");
 
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
         assert!(!app.is_visual_mode());

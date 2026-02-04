@@ -103,7 +103,7 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
     let mut total_bytes_freed = 0i64;
 
     for entry in approved_entries {
-        let path = std::path::PathBuf::from(&entry.path);
+        let path = entry.path.clone();
 
         tracing::info!(path = ?entry.path, is_dir = entry.is_dir, "Processing approved entry for removal");
 
@@ -120,7 +120,7 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
                 audit.record(
                     &user,
                     AuditAction::Remove,
-                    Some(&entry.path),
+                    Some(entry.path.as_path()),
                     Some(&format!("Removed {} bytes", entry.size_bytes)),
                     Some(entry.id),
                 )?;
@@ -140,7 +140,7 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
                 audit.record(
                     &user,
                     AuditAction::Remove,
-                    Some(&entry.path),
+                    Some(entry.path.as_path()),
                     Some("Blocked: permission denied"),
                     Some(entry.id),
                 )?;
@@ -156,7 +156,7 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
                 audit.record(
                     &user,
                     AuditAction::Remove,
-                    Some(&entry.path),
+                    Some(entry.path.as_path()),
                     Some(&format!("Blocked: {e}")),
                     Some(entry.id),
                 )?;
@@ -226,6 +226,7 @@ mod tests {
     use crate::db::Database;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Helper to create a temporary database for testing.
@@ -240,7 +241,7 @@ mod tests {
     }
 
     /// Helper to create a directory with test files.
-    fn create_test_directory(root: &Path, name: &str, file_count: usize) -> (String, i64) {
+    fn create_test_directory(root: &Path, name: &str, file_count: usize) -> (PathBuf, i64) {
         let dir_path = root.join(name);
         fs::create_dir(&dir_path)
             .expect("failed to create test directory structure - check disk space and permissions");
@@ -259,7 +260,7 @@ mod tests {
             }
         }
 
-        (dir_path.to_string_lossy().to_string(), total_size)
+        (dir_path, total_size)
     }
 
     #[test]
@@ -274,19 +275,15 @@ mod tests {
         let (dir2_path, dir2_size) = create_test_directory(test_root.path(), "dir2", 2);
 
         // Insert root and entries into database
-        let test_root_str = test_root
-            .path()
-            .to_str()
-            .expect("temp directory path should be valid UTF-8");
         let root_id = db
-            .insert_root(test_root_str)
+            .insert_root(test_root.path())
             .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
         let entry1_id = db
             .upsert_entry(
                 root_id,
                 &dir1_path,
-                test_root_str,
+                test_root.path(),
                 true,
                 dir1_size,
                 Some(now),
@@ -296,7 +293,7 @@ mod tests {
             .upsert_entry(
                 root_id,
                 &dir2_path,
-                test_root_str,
+                test_root.path(),
                 true,
                 dir2_size,
                 Some(now),
@@ -310,8 +307,8 @@ mod tests {
             .expect("failed to update entry status - database connection may be lost");
 
         // Verify directories exist
-        assert!(std::path::Path::new(&dir1_path).exists());
-        assert!(std::path::Path::new(&dir2_path).exists());
+        assert!(dir1_path.exists());
+        assert!(dir2_path.exists());
 
         // Remove approved entries
         let summary = remove_approved(&db)
@@ -327,14 +324,8 @@ mod tests {
         );
 
         // Verify directories are gone
-        assert!(
-            !std::path::Path::new(&dir1_path).exists(),
-            "Directory should be removed"
-        );
-        assert!(
-            !std::path::Path::new(&dir2_path).exists(),
-            "Directory should be removed"
-        );
+        assert!(!dir1_path.exists(), "Directory should be removed");
+        assert!(!dir2_path.exists(), "Directory should be removed");
 
         // Verify database status updated
         let entry1 = db
@@ -380,25 +371,27 @@ mod tests {
         let (dir_path, dir_size) = create_test_directory(test_root.path(), "protected", 2);
 
         // Make directory read-only to trigger permission error
-        let path = std::path::Path::new(&dir_path);
-        let mut perms = fs::metadata(path)
+        let mut perms = fs::metadata(&dir_path)
             .expect("failed to read file permissions - check file exists and is accessible")
             .permissions();
         perms.set_mode(0o444); // Read-only
-        fs::set_permissions(path, perms)
+        fs::set_permissions(&dir_path, perms)
             .expect("failed to set file permissions for test - check filesystem support");
 
         // Insert root and entry into database and approve
-        let test_root_str = test_root
-            .path()
-            .to_str()
-            .expect("temp directory path should be valid UTF-8");
         let root_id = db
-            .insert_root(test_root_str)
+            .insert_root(test_root.path())
             .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
         let entry_id = db
-            .upsert_entry(root_id, &dir_path, test_root_str, true, dir_size, Some(now))
+            .upsert_entry(
+                root_id,
+                &dir_path,
+                test_root.path(),
+                true,
+                dir_size,
+                Some(now),
+            )
             .expect("failed to insert test entry - database connection may be lost");
         db.update_entry_status(entry_id, "approved")
             .expect("failed to update entry status - database connection may be lost");
@@ -413,7 +406,7 @@ mod tests {
         assert_eq!(summary.total_bytes_freed(), 0, "Expected no bytes freed");
 
         // Verify directory still exists
-        assert!(path.exists(), "Directory should still exist");
+        assert!(dir_path.exists(), "Directory should still exist");
 
         // Verify database status updated to blocked
         let entry = db
@@ -438,11 +431,11 @@ mod tests {
         );
 
         // Cleanup: restore permissions so tempdir can be removed
-        let mut perms = fs::metadata(path)
+        let mut perms = fs::metadata(&dir_path)
             .expect("failed to read file permissions - check file exists and is accessible")
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(path, perms)
+        fs::set_permissions(&dir_path, perms)
             .expect("failed to set file permissions for test - check filesystem support");
     }
 
@@ -452,15 +445,15 @@ mod tests {
 
         // Insert root and entry that doesn't exist on filesystem
         let root_id = db
-            .insert_root("/nonexistent")
+            .insert_root(Path::new("/nonexistent"))
             .expect("failed to insert root - database connection may be lost");
-        let entry_path = "/nonexistent/path/to/directory";
+        let entry_path = Path::new("/nonexistent/path/to/directory");
         let now = jiff::Timestamp::now().as_second();
         let entry_id = db
             .upsert_entry(
                 root_id,
                 entry_path,
-                "/nonexistent/path/to",
+                Path::new("/nonexistent/path/to"),
                 true,
                 1024,
                 Some(now),
@@ -507,28 +500,23 @@ mod tests {
         let (dir2_path, dir2_size) = create_test_directory(test_root.path(), "protected", 2);
 
         // Make second directory read-only
-        let path2 = std::path::Path::new(&dir2_path);
-        let mut perms = fs::metadata(path2)
+        let mut perms = fs::metadata(&dir2_path)
             .expect("failed to read file permissions - check file exists and is accessible")
             .permissions();
         perms.set_mode(0o444);
-        fs::set_permissions(path2, perms)
+        fs::set_permissions(&dir2_path, perms)
             .expect("failed to set file permissions for test - check filesystem support");
 
         // Insert root and approve both entries
-        let test_root_str = test_root
-            .path()
-            .to_str()
-            .expect("temp directory path should be valid UTF-8");
         let root_id = db
-            .insert_root(test_root_str)
+            .insert_root(test_root.path())
             .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
         let entry1_id = db
             .upsert_entry(
                 root_id,
                 &dir1_path,
-                test_root_str,
+                test_root.path(),
                 true,
                 dir1_size,
                 Some(now),
@@ -538,7 +526,7 @@ mod tests {
             .upsert_entry(
                 root_id,
                 &dir2_path,
-                test_root_str,
+                test_root.path(),
                 true,
                 dir2_size,
                 Some(now),
@@ -563,8 +551,8 @@ mod tests {
         );
 
         // Verify first directory removed, second still exists
-        assert!(!std::path::Path::new(&dir1_path).exists());
-        assert!(path2.exists());
+        assert!(!dir1_path.exists());
+        assert!(dir2_path.exists());
 
         // Verify database statuses
         let entry1 = db
@@ -580,11 +568,11 @@ mod tests {
         assert_eq!(entry2.status, "blocked");
 
         // Cleanup
-        let mut perms = fs::metadata(path2)
+        let mut perms = fs::metadata(&dir2_path)
             .expect("failed to read file permissions - check file exists and is accessible")
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(path2, perms)
+        fs::set_permissions(&dir2_path, perms)
             .expect("failed to set file permissions for test - check filesystem support");
     }
 
@@ -594,14 +582,28 @@ mod tests {
 
         // Insert root and entries with non-approved statuses
         let root_id = db
-            .insert_root("/data")
+            .insert_root(Path::new("/data"))
             .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
         let entry1_id = db
-            .upsert_entry(root_id, "/data/path1", "/data", false, 1024, Some(now))
+            .upsert_entry(
+                root_id,
+                Path::new("/data/path1"),
+                Path::new("/data"),
+                false,
+                1024,
+                Some(now),
+            )
             .expect("failed to insert test entry - database connection may be lost");
         let entry2_id = db
-            .upsert_entry(root_id, "/data/path2", "/data", false, 2048, Some(now))
+            .upsert_entry(
+                root_id,
+                Path::new("/data/path2"),
+                Path::new("/data"),
+                false,
+                2048,
+                Some(now),
+            )
             .expect("failed to insert test entry - database connection may be lost");
 
         db.update_entry_status(entry1_id, "tracked")
@@ -634,16 +636,19 @@ mod tests {
         );
 
         let (dir_path, dir_size) = create_test_directory(test_root.path(), "dir", 2);
-        let test_root_str = test_root
-            .path()
-            .to_str()
-            .expect("temp directory path should be valid UTF-8");
         let root_id = db
-            .insert_root(test_root_str)
+            .insert_root(test_root.path())
             .expect("failed to insert root - database connection may be lost");
         let now = jiff::Timestamp::now().as_second();
         let entry_id = db
-            .upsert_entry(root_id, &dir_path, test_root_str, true, dir_size, Some(now))
+            .upsert_entry(
+                root_id,
+                &dir_path,
+                test_root.path(),
+                true,
+                dir_size,
+                Some(now),
+            )
             .expect("failed to insert test entry - database connection may be lost");
         db.update_entry_status(entry_id, "approved")
             .expect("failed to update entry status - database connection may be lost");
@@ -658,6 +663,9 @@ mod tests {
             .expect("failed to query recent audit entries - database connection may be lost");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entry_id, Some(entry_id));
-        assert_eq!(entries[0].target_path, Some(dir_path));
+        assert_eq!(
+            entries[0].target_path,
+            Some(dir_path.to_string_lossy().into_owned())
+        );
     }
 }

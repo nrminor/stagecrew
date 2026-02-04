@@ -1,6 +1,6 @@
 //! Database schema, queries, and migrations.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
@@ -16,7 +16,7 @@ pub struct Root {
     /// Unique database identifier.
     pub id: i64,
     /// Absolute path to the root directory.
-    pub path: String,
+    pub path: PathBuf,
     /// Unix timestamp when the root was added.
     pub added_at: i64,
     /// Unix timestamp of the last completed scan, or None if never scanned.
@@ -35,9 +35,9 @@ pub struct Entry {
     /// Foreign key to the parent root.
     pub root_id: i64,
     /// Absolute path to the entry.
-    pub path: String,
+    pub path: PathBuf,
     /// Path of the parent directory (for efficient listing).
-    pub parent_path: String,
+    pub parent_path: PathBuf,
     /// True if this entry is a directory, false if it's a file.
     pub is_dir: bool,
     /// Size in bytes (0 for directories).
@@ -161,15 +161,18 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub fn insert_root(&self, path: &str) -> Result<i64> {
-        self.conn
-            .execute("INSERT OR IGNORE INTO roots (path) VALUES (?1)", [path])?;
+    pub fn insert_root(&self, path: &Path) -> Result<i64> {
+        let path_str = path.to_string_lossy();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
+            [&*path_str],
+        )?;
 
-        let id: i64 =
-            self.conn
-                .query_row("SELECT id FROM roots WHERE path = ?1", [path], |row| {
-                    row.get(0)
-                })?;
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM roots WHERE path = ?1",
+            [&*path_str],
+            |row| row.get(0),
+        )?;
         Ok(id)
     }
 
@@ -184,16 +187,17 @@ impl Database {
     /// Returns an error if the database query fails.
     // TODO(cleanup): Will be used by CLI `status` command to show root details.
     #[allow(dead_code)]
-    pub fn get_root_by_path(&self, path: &str) -> Result<Option<Root>> {
+    pub fn get_root_by_path(&self, path: &Path) -> Result<Option<Root>> {
+        let path_str = path.to_string_lossy();
         let mut stmt = self
             .conn
             .prepare("SELECT id, path, added_at, last_scanned FROM roots WHERE path = ?1")?;
 
-        let mut rows = stmt.query([path])?;
+        let mut rows = stmt.query([&*path_str])?;
         if let Some(row) = rows.next()? {
             Ok(Some(Root {
                 id: row.get(0)?,
-                path: row.get(1)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
                 added_at: row.get(2)?,
                 last_scanned: row.get(3)?,
             }))
@@ -219,7 +223,7 @@ impl Database {
         let rows = stmt.query_map([], |row| {
             Ok(Root {
                 id: row.get(0)?,
-                path: row.get(1)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
                 added_at: row.get(2)?,
                 last_scanned: row.get(3)?,
             })
@@ -297,12 +301,14 @@ impl Database {
     pub fn upsert_entry(
         &self,
         root_id: i64,
-        path: &str,
-        parent_path: &str,
+        path: &Path,
+        parent_path: &Path,
         is_dir: bool,
         size_bytes: i64,
         mtime: Option<i64>,
     ) -> Result<i64> {
+        let path_str = path.to_string_lossy();
+        let parent_path_str = parent_path.to_string_lossy();
         self.conn.execute(
             "INSERT INTO entries (root_id, path, parent_path, is_dir, size_bytes, mtime, tracked_since)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'))
@@ -313,14 +319,14 @@ impl Database {
                  size_bytes = excluded.size_bytes,
                  mtime = excluded.mtime,
                  updated_at = strftime('%s', 'now')",
-            (root_id, path, parent_path, is_dir, size_bytes, mtime),
+            (root_id, &*path_str, &*parent_path_str, is_dir, size_bytes, mtime),
         )?;
 
-        let id: i64 =
-            self.conn
-                .query_row("SELECT id FROM entries WHERE path = ?1", [path], |row| {
-                    row.get(0)
-                })?;
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM entries WHERE path = ?1",
+            [&*path_str],
+            |row| row.get(0),
+        )?;
         Ok(id)
     }
 
@@ -335,7 +341,8 @@ impl Database {
     /// Returns an error if the database query fails.
     // TODO(cleanup): Will be used for entry lookup in CLI commands and TUI navigation.
     #[allow(dead_code)]
-    pub fn get_entry_by_path(&self, path: &str) -> Result<Option<Entry>> {
+    pub fn get_entry_by_path(&self, path: &Path) -> Result<Option<Entry>> {
+        let path_str = path.to_string_lossy();
         let mut stmt = self.conn.prepare(
             "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
                     tracked_since, status, deferred_until, created_at, updated_at
@@ -343,13 +350,13 @@ impl Database {
              WHERE path = ?1",
         )?;
 
-        let mut rows = stmt.query([path])?;
+        let mut rows = stmt.query([&*path_str])?;
         if let Some(row) = rows.next()? {
             Ok(Some(Entry {
                 id: row.get(0)?,
                 root_id: row.get(1)?,
-                path: row.get(2)?,
-                parent_path: row.get(3)?,
+                path: PathBuf::from(row.get::<_, String>(2)?),
+                parent_path: PathBuf::from(row.get::<_, String>(3)?),
                 is_dir: row.get(4)?,
                 size_bytes: row.get(5)?,
                 mtime: row.get(6)?,
@@ -380,7 +387,8 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    pub fn list_entries_by_parent(&self, parent_path: &str) -> Result<Vec<Entry>> {
+    pub fn list_entries_by_parent(&self, parent_path: &Path) -> Result<Vec<Entry>> {
+        let parent_path_str = parent_path.to_string_lossy();
         let mut stmt = self.conn.prepare(
             "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
                     tracked_since, status, deferred_until, created_at, updated_at
@@ -389,12 +397,12 @@ impl Database {
              ORDER BY path",
         )?;
 
-        let rows = stmt.query_map([parent_path], |row| {
+        let rows = stmt.query_map([&*parent_path_str], |row| {
             Ok(Entry {
                 id: row.get(0)?,
                 root_id: row.get(1)?,
-                path: row.get(2)?,
-                parent_path: row.get(3)?,
+                path: PathBuf::from(row.get::<_, String>(2)?),
+                parent_path: PathBuf::from(row.get::<_, String>(3)?),
                 is_dir: row.get(4)?,
                 size_bytes: row.get(5)?,
                 mtime: row.get(6)?,
@@ -428,8 +436,8 @@ impl Database {
             Ok(Entry {
                 id: row.get(0)?,
                 root_id: row.get(1)?,
-                path: row.get(2)?,
-                parent_path: row.get(3)?,
+                path: PathBuf::from(row.get::<_, String>(2)?),
+                parent_path: PathBuf::from(row.get::<_, String>(3)?),
                 is_dir: row.get(4)?,
                 size_bytes: row.get(5)?,
                 mtime: row.get(6)?,
@@ -504,15 +512,16 @@ impl Database {
     /// Returns an error if the database operation fails.
     pub fn update_entries_by_path_prefix(
         &self,
-        path_prefix: &str,
+        path_prefix: &Path,
         new_status: &str,
     ) -> Result<usize> {
+        let prefix_str = path_prefix.to_string_lossy();
         // Use path || '/' to match the directory itself and all children
         let rows_affected = self.conn.execute(
             "UPDATE entries
              SET status = ?1, updated_at = strftime('%s', 'now')
              WHERE path = ?2 OR path LIKE ?3",
-            (new_status, path_prefix, format!("{path_prefix}/%")),
+            (new_status, &*prefix_str, format!("{prefix_str}/%")),
         )?;
 
         Ok(rows_affected)
@@ -550,14 +559,15 @@ impl Database {
     /// Returns an error if the database operation fails.
     pub fn defer_entries_by_path_prefix(
         &self,
-        path_prefix: &str,
+        path_prefix: &Path,
         deferred_until: i64,
     ) -> Result<usize> {
+        let prefix_str = path_prefix.to_string_lossy();
         let rows_affected = self.conn.execute(
             "UPDATE entries
              SET status = 'deferred', deferred_until = ?1, updated_at = strftime('%s', 'now')
              WHERE path = ?2 OR path LIKE ?3",
-            (deferred_until, path_prefix, format!("{path_prefix}/%")),
+            (deferred_until, &*prefix_str, format!("{prefix_str}/%")),
         )?;
 
         Ok(rows_affected)
@@ -573,7 +583,7 @@ impl Database {
     /// Returns an error if:
     /// - The entry doesn't exist
     /// - The filesystem deletion fails (permission denied, etc.)
-    pub fn delete_entry(&self, entry_id: i64, path: &str, is_dir: bool) -> Result<()> {
+    pub fn delete_entry(&self, entry_id: i64, path: &Path, is_dir: bool) -> Result<()> {
         // Attempt filesystem deletion
         let fs_result = if is_dir {
             std::fs::remove_dir_all(path)
@@ -583,10 +593,8 @@ impl Database {
 
         if let Err(e) = fs_result {
             return Err(match e.kind() {
-                std::io::ErrorKind::PermissionDenied => {
-                    Error::PermissionDenied(std::path::PathBuf::from(path))
-                }
-                std::io::ErrorKind::NotFound => Error::PathNotFound(std::path::PathBuf::from(path)),
+                std::io::ErrorKind::PermissionDenied => Error::PermissionDenied(path.to_path_buf()),
+                std::io::ErrorKind::NotFound => Error::PathNotFound(path.to_path_buf()),
                 _ => Error::Io(e),
             });
         }
@@ -805,18 +813,27 @@ mod tests {
 
         {
             let db = Database::open(temp_file.path()).expect("first open");
-            let root_id = db.insert_root("/test").expect("insert root");
-            db.upsert_entry(root_id, "/test/file.txt", "/test", false, 100, Some(1000))
-                .expect("insert entry");
+            let root_id = db.insert_root(Path::new("/test")).expect("insert root");
+            db.upsert_entry(
+                root_id,
+                Path::new("/test/file.txt"),
+                Path::new("/test"),
+                false,
+                100,
+                Some(1000),
+            )
+            .expect("insert entry");
         }
 
         let db = Database::open(temp_file.path()).expect("second open");
 
         let roots = db.list_roots().expect("list roots");
         assert_eq!(roots.len(), 1, "root should persist across opens");
-        assert_eq!(roots[0].path, "/test");
+        assert_eq!(roots[0].path, PathBuf::from("/test"));
 
-        let entries = db.list_entries_by_parent("/test").expect("list entries");
+        let entries = db
+            .list_entries_by_parent(Path::new("/test"))
+            .expect("list entries");
         assert_eq!(entries.len(), 1, "entry should persist across opens");
 
         let stats_count: i32 = db
@@ -854,7 +871,7 @@ mod tests {
     fn entries_rejects_invalid_status() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/test").expect("insert root");
+        let root_id = db.insert_root(Path::new("/test")).expect("insert root");
         let result = db.conn.execute(
             "INSERT INTO entries (root_id, path, parent_path, status) VALUES (?1, '/test/file', '/test', 'invalid_status')",
             [root_id],
@@ -885,16 +902,16 @@ mod tests {
         let (_temp, db) = temp_database();
 
         let id = db
-            .insert_root("/data/project1")
+            .insert_root(Path::new("/data/project1"))
             .expect("insert should succeed");
 
         let root = db
-            .get_root_by_path("/data/project1")
+            .get_root_by_path(Path::new("/data/project1"))
             .expect("query should succeed")
             .expect("root should exist");
 
         assert_eq!(root.id, id);
-        assert_eq!(root.path, "/data/project1");
+        assert_eq!(root.path, PathBuf::from("/data/project1"));
         assert!(root.added_at > 0);
         assert_eq!(root.last_scanned, None);
     }
@@ -903,8 +920,12 @@ mod tests {
     fn insert_root_is_idempotent() {
         let (_temp, db) = temp_database();
 
-        let id1 = db.insert_root("/data/project1").expect("first insert");
-        let id2 = db.insert_root("/data/project1").expect("second insert");
+        let id1 = db
+            .insert_root(Path::new("/data/project1"))
+            .expect("first insert");
+        let id2 = db
+            .insert_root(Path::new("/data/project1"))
+            .expect("second insert");
 
         assert_eq!(id1, id2, "inserting same path should return same ID");
 
@@ -917,7 +938,7 @@ mod tests {
         let (_temp, db) = temp_database();
 
         let result = db
-            .get_root_by_path("/nonexistent")
+            .get_root_by_path(Path::new("/nonexistent"))
             .expect("query should succeed");
 
         assert_eq!(result, None);
@@ -927,26 +948,28 @@ mod tests {
     fn list_roots_returns_all_ordered_by_path() {
         let (_temp, db) = temp_database();
 
-        db.insert_root("/data/zebra").expect("insert");
-        db.insert_root("/data/alpha").expect("insert");
-        db.insert_root("/data/middle").expect("insert");
+        db.insert_root(Path::new("/data/zebra")).expect("insert");
+        db.insert_root(Path::new("/data/alpha")).expect("insert");
+        db.insert_root(Path::new("/data/middle")).expect("insert");
 
         let roots = db.list_roots().expect("list roots");
 
         assert_eq!(roots.len(), 3);
-        assert_eq!(roots[0].path, "/data/alpha");
-        assert_eq!(roots[1].path, "/data/middle");
-        assert_eq!(roots[2].path, "/data/zebra");
+        assert_eq!(roots[0].path, PathBuf::from("/data/alpha"));
+        assert_eq!(roots[1].path, PathBuf::from("/data/middle"));
+        assert_eq!(roots[2].path, PathBuf::from("/data/zebra"));
     }
 
     #[test]
     fn delete_root_removes_root() {
         let (_temp, db) = temp_database();
 
-        let id = db.insert_root("/data/project1").expect("insert");
+        let id = db.insert_root(Path::new("/data/project1")).expect("insert");
         db.delete_root(id).expect("delete should succeed");
 
-        let root = db.get_root_by_path("/data/project1").expect("query");
+        let root = db
+            .get_root_by_path(Path::new("/data/project1"))
+            .expect("query");
         assert_eq!(root, None, "root should be deleted");
     }
 
@@ -954,23 +977,29 @@ mod tests {
     fn delete_root_cascades_to_entries() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data/project1").expect("insert root");
+        let root_id = db
+            .insert_root(Path::new("/data/project1"))
+            .expect("insert root");
         db.upsert_entry(
             root_id,
-            "/data/project1/file.txt",
-            "/data/project1",
+            Path::new("/data/project1/file.txt"),
+            Path::new("/data/project1"),
             false,
             100,
             Some(1000),
         )
         .expect("insert entry");
 
-        let entries_before = db.list_entries_by_parent("/data/project1").expect("list");
+        let entries_before = db
+            .list_entries_by_parent(Path::new("/data/project1"))
+            .expect("list");
         assert_eq!(entries_before.len(), 1);
 
         db.delete_root(root_id).expect("delete root");
 
-        let entries_after = db.list_entries_by_parent("/data/project1").expect("list");
+        let entries_after = db
+            .list_entries_by_parent(Path::new("/data/project1"))
+            .expect("list");
         assert_eq!(entries_after.len(), 0, "entries should be cascaded");
     }
 
@@ -986,10 +1015,10 @@ mod tests {
     fn update_root_last_scanned_works() {
         let (_temp, db) = temp_database();
 
-        let id = db.insert_root("/data/project1").expect("insert");
+        let id = db.insert_root(Path::new("/data/project1")).expect("insert");
 
         let root_before = db
-            .get_root_by_path("/data/project1")
+            .get_root_by_path(Path::new("/data/project1"))
             .expect("query")
             .expect("root should exist");
         assert_eq!(root_before.last_scanned, None);
@@ -998,7 +1027,7 @@ mod tests {
             .expect("update");
 
         let root_after = db
-            .get_root_by_path("/data/project1")
+            .get_root_by_path(Path::new("/data/project1"))
             .expect("query")
             .expect("root should exist");
         assert_eq!(root_after.last_scanned, Some(1_700_000_000));
@@ -1010,12 +1039,12 @@ mod tests {
     fn upsert_entry_creates_new_file() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
             .upsert_entry(
                 root_id,
-                "/data/file.txt",
-                "/data",
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
                 false,
                 512,
                 Some(1_700_000_000),
@@ -1023,14 +1052,14 @@ mod tests {
             .expect("insert entry");
 
         let entry = db
-            .get_entry_by_path("/data/file.txt")
+            .get_entry_by_path(Path::new("/data/file.txt"))
             .expect("query")
             .expect("entry should exist");
 
         assert_eq!(entry.id, entry_id);
         assert_eq!(entry.root_id, root_id);
-        assert_eq!(entry.path, "/data/file.txt");
-        assert_eq!(entry.parent_path, "/data");
+        assert_eq!(entry.path, PathBuf::from("/data/file.txt"));
+        assert_eq!(entry.parent_path, PathBuf::from("/data"));
         assert!(!entry.is_dir);
         assert_eq!(entry.size_bytes, 512);
         assert_eq!(entry.mtime, Some(1_700_000_000));
@@ -1042,13 +1071,20 @@ mod tests {
     fn upsert_entry_creates_new_directory() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
-            .upsert_entry(root_id, "/data/subdir", "/data", true, 0, None)
+            .upsert_entry(
+                root_id,
+                Path::new("/data/subdir"),
+                Path::new("/data"),
+                true,
+                0,
+                None,
+            )
             .expect("insert entry");
 
         let entry = db
-            .get_entry_by_path("/data/subdir")
+            .get_entry_by_path(Path::new("/data/subdir"))
             .expect("query")
             .expect("entry should exist");
 
@@ -1062,13 +1098,13 @@ mod tests {
     fn upsert_entry_updates_existing() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
         let id1 = db
             .upsert_entry(
                 root_id,
-                "/data/file.txt",
-                "/data",
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
                 false,
                 512,
                 Some(1_700_000_000),
@@ -1078,8 +1114,8 @@ mod tests {
         let id2 = db
             .upsert_entry(
                 root_id,
-                "/data/file.txt",
-                "/data",
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
                 false,
                 1024,
                 Some(1_700_050_000),
@@ -1089,7 +1125,7 @@ mod tests {
         assert_eq!(id1, id2, "upsert should return same ID");
 
         let entry = db
-            .get_entry_by_path("/data/file.txt")
+            .get_entry_by_path(Path::new("/data/file.txt"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(entry.size_bytes, 1024);
@@ -1100,12 +1136,12 @@ mod tests {
     fn upsert_entry_preserves_tracked_since() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
         db.upsert_entry(
             root_id,
-            "/data/file.txt",
-            "/data",
+            Path::new("/data/file.txt"),
+            Path::new("/data"),
             false,
             512,
             Some(1_700_000_000),
@@ -1113,7 +1149,7 @@ mod tests {
         .expect("first insert");
 
         let entry_before = db
-            .get_entry_by_path("/data/file.txt")
+            .get_entry_by_path(Path::new("/data/file.txt"))
             .expect("query")
             .expect("entry should exist");
         let tracked_since = entry_before.tracked_since;
@@ -1122,8 +1158,8 @@ mod tests {
 
         db.upsert_entry(
             root_id,
-            "/data/file.txt",
-            "/data",
+            Path::new("/data/file.txt"),
+            Path::new("/data"),
             false,
             1024,
             Some(1_700_050_000),
@@ -1131,7 +1167,7 @@ mod tests {
         .expect("update");
 
         let entry_after = db
-            .get_entry_by_path("/data/file.txt")
+            .get_entry_by_path(Path::new("/data/file.txt"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(
@@ -1146,8 +1182,8 @@ mod tests {
 
         let result = db.upsert_entry(
             999,
-            "/data/file.txt",
-            "/data",
+            Path::new("/data/file.txt"),
+            Path::new("/data"),
             false,
             512,
             Some(1_700_000_000),
@@ -1159,7 +1195,9 @@ mod tests {
     fn get_entry_by_path_returns_none_when_not_found() {
         let (_temp, db) = temp_database();
 
-        let result = db.get_entry_by_path("/nonexistent").expect("query");
+        let result = db
+            .get_entry_by_path(Path::new("/nonexistent"))
+            .expect("query");
         assert_eq!(result, None);
     }
 
@@ -1167,46 +1205,74 @@ mod tests {
     fn list_entries_by_parent_returns_children() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
-        db.upsert_entry(root_id, "/data/a.txt", "/data", false, 100, Some(1000))
-            .expect("insert");
-        db.upsert_entry(root_id, "/data/b.txt", "/data", false, 200, Some(1000))
-            .expect("insert");
-        db.upsert_entry(root_id, "/data/subdir", "/data", true, 0, None)
-            .expect("insert");
         db.upsert_entry(
             root_id,
-            "/data/subdir/nested.txt",
-            "/data/subdir",
+            Path::new("/data/a.txt"),
+            Path::new("/data"),
+            false,
+            100,
+            Some(1000),
+        )
+        .expect("insert");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/b.txt"),
+            Path::new("/data"),
+            false,
+            200,
+            Some(1000),
+        )
+        .expect("insert");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/subdir"),
+            Path::new("/data"),
+            true,
+            0,
+            None,
+        )
+        .expect("insert");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/subdir/nested.txt"),
+            Path::new("/data/subdir"),
             false,
             50,
             Some(1000),
         )
         .expect("insert");
 
-        let entries = db.list_entries_by_parent("/data").expect("list");
+        let entries = db.list_entries_by_parent(Path::new("/data")).expect("list");
 
         assert_eq!(entries.len(), 3, "should return only immediate children");
-        assert_eq!(entries[0].path, "/data/a.txt");
-        assert_eq!(entries[1].path, "/data/b.txt");
-        assert_eq!(entries[2].path, "/data/subdir");
+        assert_eq!(entries[0].path, PathBuf::from("/data/a.txt"));
+        assert_eq!(entries[1].path, PathBuf::from("/data/b.txt"));
+        assert_eq!(entries[2].path, PathBuf::from("/data/subdir"));
     }
 
     #[test]
     fn list_entries_by_parent_excludes_removed() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
         let entry_id = db
-            .upsert_entry(root_id, "/data/file.txt", "/data", false, 100, Some(1000))
+            .upsert_entry(
+                root_id,
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
+                false,
+                100,
+                Some(1000),
+            )
             .expect("insert");
 
         db.update_entry_status(entry_id, "removed")
             .expect("update status");
 
-        let entries = db.list_entries_by_parent("/data").expect("list");
+        let entries = db.list_entries_by_parent(Path::new("/data")).expect("list");
         assert_eq!(entries.len(), 0, "removed entries should be excluded");
     }
 
@@ -1214,16 +1280,37 @@ mod tests {
     fn list_entries_filters_by_status() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
         let id1 = db
-            .upsert_entry(root_id, "/data/a.txt", "/data", false, 100, Some(1000))
+            .upsert_entry(
+                root_id,
+                Path::new("/data/a.txt"),
+                Path::new("/data"),
+                false,
+                100,
+                Some(1000),
+            )
             .expect("insert");
         let id2 = db
-            .upsert_entry(root_id, "/data/b.txt", "/data", false, 200, Some(1000))
+            .upsert_entry(
+                root_id,
+                Path::new("/data/b.txt"),
+                Path::new("/data"),
+                false,
+                200,
+                Some(1000),
+            )
             .expect("insert");
-        db.upsert_entry(root_id, "/data/c.txt", "/data", false, 300, Some(1000))
-            .expect("insert");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/c.txt"),
+            Path::new("/data"),
+            false,
+            300,
+            Some(1000),
+        )
+        .expect("insert");
 
         db.update_entry_status(id1, "pending").expect("update");
         db.update_entry_status(id2, "pending").expect("update");
@@ -1233,23 +1320,30 @@ mod tests {
 
         let tracked = db.list_entries(Some("tracked")).expect("list");
         assert_eq!(tracked.len(), 1);
-        assert_eq!(tracked[0].path, "/data/c.txt");
+        assert_eq!(tracked[0].path, PathBuf::from("/data/c.txt"));
     }
 
     #[test]
     fn update_entry_status_works() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
-            .upsert_entry(root_id, "/data/file.txt", "/data", false, 100, Some(1000))
+            .upsert_entry(
+                root_id,
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
+                false,
+                100,
+                Some(1000),
+            )
             .expect("insert");
 
         db.update_entry_status(entry_id, "approved")
             .expect("update");
 
         let entry = db
-            .get_entry_by_path("/data/file.txt")
+            .get_entry_by_path(Path::new("/data/file.txt"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(entry.status, "approved");
@@ -1267,9 +1361,16 @@ mod tests {
     fn update_entry_status_rejects_invalid_status() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
-            .upsert_entry(root_id, "/data/file.txt", "/data", false, 100, Some(1000))
+            .upsert_entry(
+                root_id,
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
+                false,
+                100,
+                Some(1000),
+            )
             .expect("insert");
 
         let result = db.update_entry_status(entry_id, "invalid_status");
@@ -1283,14 +1384,21 @@ mod tests {
     fn update_entries_by_path_prefix_updates_all_matching() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
-        db.upsert_entry(root_id, "/data/archive", "/data", true, 0, None)
-            .expect("insert");
         db.upsert_entry(
             root_id,
-            "/data/archive/old.txt",
-            "/data/archive",
+            Path::new("/data/archive"),
+            Path::new("/data"),
+            true,
+            0,
+            None,
+        )
+        .expect("insert");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/archive/old.txt"),
+            Path::new("/data/archive"),
             false,
             100,
             Some(1000),
@@ -1298,36 +1406,43 @@ mod tests {
         .expect("insert");
         db.upsert_entry(
             root_id,
-            "/data/archive/older.txt",
-            "/data/archive",
+            Path::new("/data/archive/older.txt"),
+            Path::new("/data/archive"),
             false,
             200,
             Some(1000),
         )
         .expect("insert");
-        db.upsert_entry(root_id, "/data/keep.txt", "/data", false, 300, Some(1000))
-            .expect("insert");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/keep.txt"),
+            Path::new("/data"),
+            false,
+            300,
+            Some(1000),
+        )
+        .expect("insert");
 
         let count = db
-            .update_entries_by_path_prefix("/data/archive", "ignored")
+            .update_entries_by_path_prefix(Path::new("/data/archive"), "ignored")
             .expect("update");
 
         assert_eq!(count, 3, "should update directory and its children");
 
         let archive = db
-            .get_entry_by_path("/data/archive")
+            .get_entry_by_path(Path::new("/data/archive"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(archive.status, "ignored");
 
         let old = db
-            .get_entry_by_path("/data/archive/old.txt")
+            .get_entry_by_path(Path::new("/data/archive/old.txt"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(old.status, "ignored");
 
         let keep = db
-            .get_entry_by_path("/data/keep.txt")
+            .get_entry_by_path(Path::new("/data/keep.txt"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(
@@ -1340,15 +1455,22 @@ mod tests {
     fn defer_entry_sets_status_and_timestamp() {
         let (_temp, db) = temp_database();
 
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
         let entry_id = db
-            .upsert_entry(root_id, "/data/file.txt", "/data", false, 100, Some(1000))
+            .upsert_entry(
+                root_id,
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
+                false,
+                100,
+                Some(1000),
+            )
             .expect("insert");
 
         db.defer_entry(entry_id, 1_700_500_000).expect("defer");
 
         let entry = db
-            .get_entry_by_path("/data/file.txt")
+            .get_entry_by_path(Path::new("/data/file.txt"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(entry.status, "deferred");
@@ -1380,13 +1502,13 @@ mod tests {
     #[test]
     fn compute_live_stats_counts_entries() {
         let (_temp, db) = temp_database();
-        let root_id = db.insert_root("/data").expect("insert root");
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
         // Insert a file entry
         db.upsert_entry(
             root_id,
-            "/data/file1.txt",
-            "/data",
+            Path::new("/data/file1.txt"),
+            Path::new("/data"),
             false,
             1024,
             Some(1_700_000_000),
@@ -1415,12 +1537,12 @@ mod tests {
         // Connection 2: the "scan" connection — opens, writes, closes
         {
             let writer = Database::open(path).expect("open writer");
-            let root_id = writer.insert_root("/data").expect("insert root");
+            let root_id = writer.insert_root(Path::new("/data")).expect("insert root");
             writer
                 .upsert_entry(
                     root_id,
-                    "/data/file1.txt",
-                    "/data",
+                    Path::new("/data/file1.txt"),
+                    Path::new("/data"),
                     false,
                     1024,
                     Some(1_700_000_000),

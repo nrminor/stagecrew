@@ -162,15 +162,14 @@ async fn handle_add(config: &Config, db: &Database, path: PathBuf, run_scan: boo
     }
 
     // Check if already tracked in the database
-    let path_str = path.to_string_lossy();
     let existing_roots = db.list_roots().context("Failed to list roots")?;
-    if existing_roots.iter().any(|r| r.path == path_str.as_ref()) {
+    if existing_roots.iter().any(|r| r.path == path) {
         println!("Path is already tracked: {}", path.display());
         return Ok(());
     }
 
     // Insert as a root in the database
-    db.insert_root(&path_str)
+    db.insert_root(&path)
         .context("Failed to add root to database")?;
 
     println!("Added tracked path: {}", path.display());
@@ -224,8 +223,7 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
 
     // If a specific path was provided, ensure it exists as a root in the DB
     if let Some(ref specific_path) = path {
-        let path_str = specific_path.to_string_lossy();
-        db.insert_root(&path_str)
+        db.insert_root(specific_path)
             .context("Failed to add path as root")?;
         println!("Scanning {}...", specific_path.display());
     }
@@ -241,19 +239,19 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
     if path.is_none() {
         let total_roots = {
             // Count unique roots: config paths that aren't already in DB + DB roots
-            let db_paths: std::collections::HashSet<_> =
-                db_roots.iter().map(|r| r.path.as_str()).collect();
+            let db_paths: std::collections::HashSet<&std::path::Path> =
+                db_roots.iter().map(|r| r.path.as_path()).collect();
             let new_from_config = config
                 .tracked_paths
                 .iter()
-                .filter(|p| !db_paths.contains(p.to_string_lossy().as_ref()))
+                .filter(|p| !db_paths.contains(p.as_path()))
                 .count();
             db_roots.len() + new_from_config
         };
         if total_roots == 1 {
             let display_path = db_roots.first().map_or_else(
                 || config.tracked_paths[0].display().to_string(),
-                |r| r.path.clone(),
+                |r| r.path.display().to_string(),
             );
             println!("Scanning {display_path}...");
         } else {

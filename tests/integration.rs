@@ -88,15 +88,11 @@ async fn test_full_workflow() {
     // 4. Verify root is in database
     let roots = db.list_roots().expect("should list roots");
     assert_eq!(roots.len(), 1, "should have 1 root in database");
-    assert_eq!(
-        roots[0].path,
-        tracked_dir.to_string_lossy(),
-        "root path should match"
-    );
+    assert_eq!(roots[0].path, tracked_dir, "root path should match");
 
     // 5. Verify entries are in database
     let all_entries = db
-        .list_entries_by_parent(&tracked_dir.to_string_lossy())
+        .list_entries_by_parent(&tracked_dir)
         .expect("should list entries");
     assert_eq!(
         all_entries.len(),
@@ -113,10 +109,9 @@ async fn test_full_workflow() {
     }
 
     // Find the old file entry in database
-    let old_file_path = old_file.to_string_lossy().to_string();
     let old_file_entry = all_entries
         .iter()
-        .find(|e| e.path == old_file_path)
+        .find(|e| e.path == old_file)
         .expect("old_file should be in database");
 
     // Verify old file entry has correct metadata
@@ -135,10 +130,11 @@ async fn test_full_workflow() {
         .expect("timestamp arithmetic");
 
     // Update tracked_since for old_file
+    let old_file_str = old_file.to_string_lossy();
     db.conn()
         .execute(
             "UPDATE entries SET tracked_since = ?1 WHERE path = ?2",
-            (ninetyfive_days_ago.as_second(), &old_file_path),
+            (ninetyfive_days_ago.as_second(), &*old_file_str),
         )
         .expect("failed to backdate tracked_since for old_file");
 
@@ -165,7 +161,7 @@ async fn test_full_workflow() {
         "should have 1 pending entry after transition"
     );
     assert_eq!(
-        pending_entries[0].path, old_file_path,
+        pending_entries[0].path, old_file,
         "old_file should be pending"
     );
 
@@ -180,7 +176,7 @@ async fn test_full_workflow() {
         .record(
             &user,
             AuditAction::Approve,
-            Some(&old_file_path),
+            Some(old_file.as_path()),
             Some("Manual approval for removal"),
             Some(old_file_entry.id),
         )
@@ -192,7 +188,7 @@ async fn test_full_workflow() {
         .expect("should list approved entries");
     assert_eq!(approved_entries.len(), 1, "should have 1 approved entry");
     assert_eq!(
-        approved_entries[0].path, old_file_path,
+        approved_entries[0].path, old_file,
         "old_file should be approved"
     );
 
@@ -227,7 +223,7 @@ async fn test_full_workflow() {
         "should have 1 removed entry in database"
     );
     assert_eq!(
-        removed_entries[0].path, old_file_path,
+        removed_entries[0].path, old_file,
         "old_file should have removed status"
     );
 
@@ -265,7 +261,7 @@ async fn test_full_workflow() {
         .expect("should find approve entry");
     assert_eq!(
         approve_entry.target_path,
-        Some(old_file_path.clone()),
+        Some(old_file.to_string_lossy().into_owned()),
         "approve entry should reference old_file"
     );
     assert_eq!(

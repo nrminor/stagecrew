@@ -87,7 +87,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
 
     // Render remove path confirmation modal if pending remove path
     if let Some(path) = app.pending_remove_path() {
-        render_remove_path_modal(frame, path);
+        render_remove_path_modal(frame, &path.display().to_string());
     }
 }
 
@@ -214,12 +214,14 @@ fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::la
         .enumerate()
         .map(|(idx, root)| {
             // Extract just the directory name from full path
-            let dir_name = std::path::Path::new(&root.path)
+            let path_str = root.path.to_string_lossy();
+            let dir_name = root
+                .path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or(&root.path);
+                .unwrap_or(&path_str);
 
-            let cell = Cell::from(dir_name);
+            let cell = Cell::from(dir_name.to_owned());
 
             // Highlight selected row and show focus
             let style = if idx == selected_idx {
@@ -276,7 +278,7 @@ fn render_main_entry_panel(
     let current_path = app.current_path();
 
     // If current_path is empty, show a message to select a root
-    if current_path.is_empty() {
+    if current_path.as_os_str().is_empty() {
         let message = Paragraph::new(
             "Select a root from the sidebar\n\n(Use j/k to navigate, Tab to switch panels)",
         )
@@ -356,10 +358,12 @@ fn render_main_entry_panel(
             let indicator_cell = Cell::from(indicator_symbol).fg(indicator_color);
 
             // Extract filename from path with directory indicator
-            let filename = std::path::Path::new(&entry.path)
+            let path_str = entry.path.to_string_lossy();
+            let filename = entry
+                .path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or(&entry.path);
+                .unwrap_or(&path_str);
             let display_name = if entry.is_dir {
                 format!("{filename}/")
             } else {
@@ -549,14 +553,18 @@ pub(super) fn sort_entry_rows(rows: &mut [(crate::db::Entry, i64)], sort_mode: S
                     (true, false) => std::cmp::Ordering::Less,
                     (false, true) => std::cmp::Ordering::Greater,
                     _ => {
-                        let name_a = std::path::Path::new(&a.0.path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(&a.0.path);
-                        let name_b = std::path::Path::new(&b.0.path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(&b.0.path);
+                        let str_a = a.0.path.to_string_lossy();
+                        let name_a =
+                            a.0.path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(&str_a);
+                        let str_b = b.0.path.to_string_lossy();
+                        let name_b =
+                            b.0.path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(&str_b);
                         name_a.cmp(name_b)
                     }
                 }
@@ -1486,6 +1494,8 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     // Helper to create a minimal Entry for testing (file)
@@ -1494,8 +1504,8 @@ mod tests {
         crate::db::Entry {
             id: 0,
             root_id: 1,
-            path: path.to_string(),
-            parent_path: "/".to_string(),
+            path: PathBuf::from(path),
+            parent_path: PathBuf::from("/"),
             is_dir: false,
             size_bytes,
             mtime,
@@ -1513,8 +1523,8 @@ mod tests {
         crate::db::Entry {
             id: 0,
             root_id: 1,
-            path: path.to_string(),
-            parent_path: "/".to_string(),
+            path: PathBuf::from(path),
+            parent_path: PathBuf::from("/"),
             is_dir: true,
             size_bytes: 0,
             mtime: None,
@@ -1539,15 +1549,18 @@ mod tests {
         sort_entry_rows(&mut rows, SortMode::Expiration);
 
         assert_eq!(
-            rows[0].0.path, "/a.txt",
+            rows[0].0.path,
+            PathBuf::from("/a.txt"),
             "Most urgent (5 days) should be first"
         );
         assert_eq!(
-            rows[1].0.path, "/b.txt",
+            rows[1].0.path,
+            PathBuf::from("/b.txt"),
             "Middle urgency (15 days) should be second"
         );
         assert_eq!(
-            rows[2].0.path, "/c.txt",
+            rows[2].0.path,
+            PathBuf::from("/c.txt"),
             "Least urgent (30 days) should be last"
         );
     }
@@ -1563,11 +1576,20 @@ mod tests {
         sort_entry_rows(&mut rows, SortMode::Expiration);
 
         assert_eq!(
-            rows[0].0.path, "/subdir",
+            rows[0].0.path,
+            PathBuf::from("/subdir"),
             "Most urgent (dir with 3 days) first"
         );
-        assert_eq!(rows[1].0.path, "/a.txt", "File with 10 days second");
-        assert_eq!(rows[2].0.path, "/b.txt", "Least urgent (20 days) last");
+        assert_eq!(
+            rows[1].0.path,
+            PathBuf::from("/a.txt"),
+            "File with 10 days second"
+        );
+        assert_eq!(
+            rows[2].0.path,
+            PathBuf::from("/b.txt"),
+            "Least urgent (20 days) last"
+        );
     }
 
     #[test]
@@ -1580,9 +1602,21 @@ mod tests {
 
         sort_entry_rows(&mut rows, SortMode::Size);
 
-        assert_eq!(rows[0].0.path, "/b.txt", "Largest (500) should be first");
-        assert_eq!(rows[1].0.path, "/c.txt", "Middle (250) should be second");
-        assert_eq!(rows[2].0.path, "/a.txt", "Smallest (100) should be last");
+        assert_eq!(
+            rows[0].0.path,
+            PathBuf::from("/b.txt"),
+            "Largest (500) should be first"
+        );
+        assert_eq!(
+            rows[1].0.path,
+            PathBuf::from("/c.txt"),
+            "Middle (250) should be second"
+        );
+        assert_eq!(
+            rows[2].0.path,
+            PathBuf::from("/a.txt"),
+            "Smallest (100) should be last"
+        );
     }
 
     #[test]
@@ -1595,9 +1629,21 @@ mod tests {
 
         sort_entry_rows(&mut rows, SortMode::Name);
 
-        assert_eq!(rows[0].0.path, "/alpha_dir", "Directory should come first");
-        assert_eq!(rows[1].0.path, "/mango.txt", "Mango should be second");
-        assert_eq!(rows[2].0.path, "/zebra.txt", "Zebra should be last");
+        assert_eq!(
+            rows[0].0.path,
+            PathBuf::from("/alpha_dir"),
+            "Directory should come first"
+        );
+        assert_eq!(
+            rows[1].0.path,
+            PathBuf::from("/mango.txt"),
+            "Mango should be second"
+        );
+        assert_eq!(
+            rows[2].0.path,
+            PathBuf::from("/zebra.txt"),
+            "Zebra should be last"
+        );
     }
 
     #[test]
@@ -1624,11 +1670,20 @@ mod tests {
         sort_entry_rows(&mut rows, SortMode::Modified);
 
         assert_eq!(
-            rows[0].0.path, "/b.txt",
+            rows[0].0.path,
+            PathBuf::from("/b.txt"),
             "Most recent (5000) should be first"
         );
-        assert_eq!(rows[1].0.path, "/c.txt", "Middle (3000) should be second");
-        assert_eq!(rows[2].0.path, "/a.txt", "Oldest (1000) should be last");
+        assert_eq!(
+            rows[1].0.path,
+            PathBuf::from("/c.txt"),
+            "Middle (3000) should be second"
+        );
+        assert_eq!(
+            rows[2].0.path,
+            PathBuf::from("/a.txt"),
+            "Oldest (1000) should be last"
+        );
     }
 
     // Tests for determine_row_style
@@ -1771,8 +1826,8 @@ mod tests {
         crate::db::Entry {
             id: 1,
             root_id: 1,
-            path: "/test/file.txt".to_string(),
-            parent_path: "/test".to_string(),
+            path: PathBuf::from("/test/file.txt"),
+            parent_path: PathBuf::from("/test"),
             is_dir: false,
             size_bytes: 100,
             mtime: Some(0),
