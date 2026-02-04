@@ -901,6 +901,139 @@ Press any key to close this help screen";
     frame.render_widget(text, area);
 }
 
+/// Build a `Line` of hint spans that fits within `max_width`.
+///
+/// Left-side hints are rendered in priority order until space runs out.
+/// Right-side (pinned) hints are always shown if they fit, separated from
+/// the left group by flexible padding. Each hint is rendered as `[key] Label`
+/// with a single space between hints.
+fn build_hint_line(left: &[(&str, &str)], right: &[(&str, &str)], max_width: u16) -> Line<'static> {
+    let style = Style::default().fg(Color::Black).bg(Color::Gray);
+    let width = usize::from(max_width);
+
+    // Format a single hint as "[key] Label"
+    let fmt = |key: &str, label: &str| -> String { format!("[{key}] {label}") };
+
+    // Measure the pinned right-side hints (with separating spaces)
+    let right_parts: Vec<String> = right.iter().map(|(k, l)| fmt(k, l)).collect();
+    let right_total: usize =
+        right_parts.iter().map(String::len).sum::<usize>() + right_parts.len().saturating_sub(1); // spaces between
+
+    // If even the pinned hints don't fit, just render what we can
+    if right_total >= width {
+        let joined = right_parts.join(" ");
+        return Line::from(Span::styled(
+            joined[..width.min(joined.len())].to_string(),
+            style,
+        ));
+    }
+
+    // Budget for left-side hints: total width minus right hints minus a gap
+    let min_gap: usize = 2;
+    let left_budget = width.saturating_sub(right_total).saturating_sub(min_gap);
+
+    // Greedily add left-side hints in priority order
+    let mut left_rendered: Vec<String> = Vec::new();
+    let mut left_used: usize = 0;
+    for (key, label) in left {
+        let part = fmt(key, label);
+        let needed = if left_rendered.is_empty() {
+            part.len()
+        } else {
+            part.len() + 1 // space separator
+        };
+        if left_used + needed > left_budget {
+            break;
+        }
+        left_used += needed;
+        left_rendered.push(part);
+    }
+
+    let left_str = left_rendered.join(" ");
+    let gap = width
+        .saturating_sub(left_str.len())
+        .saturating_sub(right_total);
+    let right_str = right_parts.join(" ");
+
+    Line::from(Span::styled(
+        format!("{left_str}{:>gap$}{right_str}", "", gap = gap),
+        style,
+    ))
+}
+
+/// A keybind hint: `(key_label, description)`, rendered as `[key] description`.
+type Hint = (&'static str, &'static str);
+
+/// Return priority-ordered hint pairs for the current non-modal context.
+///
+/// Hints are ordered by importance: the most essential bindings come first
+/// so they survive truncation on narrow terminals. The returned tuple is
+/// `(left_hints, right_pinned_hints)`.
+fn context_hints(app: &App) -> (Vec<Hint>, Vec<Hint>) {
+    let right = vec![("?", "Help"), ("q", "Quit")];
+
+    let left = match app.view() {
+        View::FileList => {
+            let selection_count = app.selected_entries().len();
+
+            if app.search_query.is_some() {
+                vec![
+                    ("n", "Next match"),
+                    ("N", "Prev match"),
+                    ("/", "New search"),
+                    ("Esc", "Clear search"),
+                ]
+            } else if app.is_visual_mode() {
+                vec![
+                    ("j/k", "Extend"),
+                    ("d/r/i/x", "Act on selection"),
+                    ("Esc", "Keep & exit"),
+                    ("g/G", "Top/Bottom"),
+                ]
+            } else if selection_count > 0 {
+                vec![
+                    ("d", "Delete"),
+                    ("r", "Defer"),
+                    ("i", "Ignore"),
+                    ("x", "Approve"),
+                    ("Esc", "Clear"),
+                ]
+            } else {
+                match app.focus_panel() {
+                    FocusPanel::Sidebar => vec![
+                        ("j/k", "Navigate"),
+                        ("h/l", "Switch panel"),
+                        ("d/r/i/x", "Actions"),
+                        ("Space", "Select"),
+                        ("g/G", "Top/Bottom"),
+                        ("s", "Sort"),
+                        ("a", "Audit"),
+                    ],
+                    FocusPanel::MainPanel => vec![
+                        ("j/k", "Navigate"),
+                        ("h/l", "Switch panel"),
+                        ("d", "Delete"),
+                        ("r", "Defer"),
+                        ("i", "Ignore"),
+                        ("x", "Approve"),
+                        ("Space", "Select"),
+                        ("v", "Visual"),
+                        ("s", "Sort"),
+                        ("a", "Audit"),
+                    ],
+                }
+            }
+        }
+        View::AuditLog => vec![("j/k", "Navigate"), ("Esc", "Back"), ("g/G", "Top/Bottom")],
+        View::Help => {
+            // Help view is simple enough to not need pinned right hints
+            return (vec![("Any key", "Close")], vec![]);
+        }
+    };
+
+    (left, right)
+}
+
 /// Render the footer with mode badge and context-sensitive keybinding hints.
 fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Determine current mode for the badge
@@ -952,7 +1085,8 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         return;
     }
 
-    // Check if any modal is open (takes precedence over normal view hints)
+    // Check if any modal is open (takes precedence over normal view hints).
+    // Modal hints are short enough to never overflow, so they bypass truncation.
     let modal_open = app.pending_entry_delete().is_some()
         || app.pending_entry_deferral().is_some()
         || app.pending_entry_ignore().is_some()
@@ -960,48 +1094,22 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         || app.pending_add_path().is_some()
         || app.pending_remove_path().is_some();
 
-    let hints = if modal_open {
-        if app.pending_entry_deferral().is_some() {
-            "[0-9] Enter days [Backspace] Delete [Enter] Confirm [Esc] Cancel".to_string()
+    if modal_open {
+        let hints = if app.pending_entry_deferral().is_some() {
+            "[0-9] Enter days [Backspace] Delete [Enter] Confirm [Esc] Cancel"
         } else if app.pending_add_path().is_some() {
-            "[Type path] (supports ~) [Backspace] Delete [Enter] Add [Esc] Cancel".to_string()
+            "[Type path] (supports ~) [Backspace] Delete [Enter] Add [Esc] Cancel"
         } else {
-            "[y] Yes [n] No [Esc] Cancel".to_string()
-        }
-    } else {
-        match app.view() {
-            View::FileList => {
-                let selection_count = app.selected_entries().len();
+            "[y] Yes [n] No [Esc] Cancel"
+        };
+        let footer = Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(Color::Gray));
+        frame.render_widget(footer, chunks[1]);
+        return;
+    }
 
-                if app.search_query.is_some() {
-                    "[n] Next match [N] Prev match [/] New search [Esc] Clear search [q] Quit"
-                        .to_string()
-                } else if app.is_visual_mode() {
-                    format!(
-                        "[j/k] Extend [g/G] Extend to top/bottom [Esc] Keep & exit [v] Keep & exit [d/r/i/x] Act on {selection_count} [q] Quit"
-                    )
-                } else if selection_count > 0 {
-                    format!(
-                        "[d] Delete {selection_count} [r] Defer {selection_count} [i] Ignore {selection_count} [x] Approve {selection_count} [Esc] Clear [q] Quit"
-                    )
-                } else {
-                    match app.focus_panel() {
-                        FocusPanel::Sidebar => {
-                            "[j/k] Navigate [g/G] Top/Bottom [X] Remove [A] Add [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
-                        }
-                        FocusPanel::MainPanel => {
-                            "[j/k] Navigate [g/G] Top/Bottom [d] Delete [r] Defer [i] Ignore [x] Approve [Space] Select [v] Visual [A] Add path [Tab/h/l] Switch panel [s] Sort [a] Audit [?] Help [q] Quit"
-                        }
-                    }
-                    .to_string()
-                }
-            }
-            View::AuditLog => "[j/k] Navigate [g/G] Top/Bottom [Esc] Back [q] Quit".to_string(),
-            View::Help => "[Any key] Close".to_string(),
-        }
-    };
-
-    let footer = Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(Color::Gray));
+    let (left, right) = context_hints(app);
+    let line = build_hint_line(&left, &right, chunks[1].width);
+    let footer = Paragraph::new(line);
     frame.render_widget(footer, chunks[1]);
 }
 
