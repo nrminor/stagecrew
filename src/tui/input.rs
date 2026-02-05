@@ -314,8 +314,10 @@ impl InputHandler {
                 Self::initiate_remove_path(app, config, db);
             }
 
-            // Quota target (t = set target for selected root)
-            KeyCode::Char('t') if app.focus_panel == FocusPanel::Sidebar => {
+            // Quota target (t = set target for selected root, works from sidebar or entries panel)
+            KeyCode::Char('t')
+                if matches!(app.focus_panel, FocusPanel::Sidebar | FocusPanel::MainPanel) =>
+            {
                 Self::initiate_quota_target(app, db);
             }
 
@@ -1455,6 +1457,9 @@ impl InputHandler {
     }
 
     /// Initiate quota target edit for the selected root.
+    ///
+    /// When called from the sidebar, uses the selected root. When called from
+    /// the entries panel, finds the root containing the current path.
     fn initiate_quota_target(app: &mut App, db: &Database) {
         let roots = match db.list_roots() {
             Ok(roots) => roots,
@@ -1464,7 +1469,16 @@ impl InputHandler {
             }
         };
 
-        if let Some(root) = roots.get(app.sidebar_selected_index) {
+        // Determine which root to use based on context
+        let root = if app.focus_panel == FocusPanel::Sidebar {
+            roots.get(app.sidebar_selected_index)
+        } else if !app.current_path.as_os_str().is_empty() {
+            roots.iter().find(|r| app.current_path.starts_with(&r.path))
+        } else {
+            None
+        };
+
+        if let Some(root) = root {
             app.pending_quota_target = Some(super::PendingQuotaTarget {
                 root_id: root.id,
                 root_path: root.path.clone(),
