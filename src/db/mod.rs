@@ -462,6 +462,45 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// List all entries belonging to a specific root.
+    ///
+    /// Returns all entries (files and directories) under the given root, excluding
+    /// removed entries. This is useful for computing aggregate statistics or
+    /// visualizations that need the full picture of a root's contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_entries_by_root(&self, root_id: i64) -> Result<Vec<Entry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
+                    tracked_since, status, deferred_until, created_at, updated_at
+             FROM entries
+             WHERE root_id = ?1 AND status != 'removed'
+             ORDER BY path",
+        )?;
+
+        let rows = stmt.query_map([root_id], |row| {
+            Ok(Entry {
+                id: row.get(0)?,
+                root_id: row.get(1)?,
+                path: PathBuf::from(row.get::<_, String>(2)?),
+                parent_path: PathBuf::from(row.get::<_, String>(3)?),
+                is_dir: row.get(4)?,
+                size_bytes: row.get(5)?,
+                mtime: row.get(6)?,
+                tracked_since: row.get(7)?,
+                status: row.get(8)?,
+                deferred_until: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+            })
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// List all entries, optionally filtered by status.
     ///
     /// # Arguments
@@ -1368,6 +1407,87 @@ mod tests {
             .expect("update status");
 
         let entries = db.list_entries_by_parent(Path::new("/data")).expect("list");
+        assert_eq!(entries.len(), 0, "removed entries should be excluded");
+    }
+
+    #[test]
+    fn list_entries_by_root_returns_all_descendants() {
+        let (_temp, db) = temp_database();
+
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
+
+        // Create a nested structure: /data/a.txt, /data/subdir/, /data/subdir/b.txt
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/a.txt"),
+            Path::new("/data"),
+            false,
+            100,
+            Some(1000),
+        )
+        .expect("insert");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/subdir"),
+            Path::new("/data"),
+            true,
+            0,
+            None,
+        )
+        .expect("insert");
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/subdir/b.txt"),
+            Path::new("/data/subdir"),
+            false,
+            200,
+            Some(1000),
+        )
+        .expect("insert");
+
+        // Create another root with its own entry (should not be returned)
+        let other_root_id = db
+            .insert_root(Path::new("/other"))
+            .expect("insert other root");
+        db.upsert_entry(
+            other_root_id,
+            Path::new("/other/c.txt"),
+            Path::new("/other"),
+            false,
+            300,
+            Some(1000),
+        )
+        .expect("insert");
+
+        let entries = db.list_entries_by_root(root_id).expect("list");
+
+        assert_eq!(entries.len(), 3, "should return all entries for the root");
+        assert_eq!(entries[0].path, PathBuf::from("/data/a.txt"));
+        assert_eq!(entries[1].path, PathBuf::from("/data/subdir"));
+        assert_eq!(entries[2].path, PathBuf::from("/data/subdir/b.txt"));
+    }
+
+    #[test]
+    fn list_entries_by_root_excludes_removed() {
+        let (_temp, db) = temp_database();
+
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
+
+        let entry_id = db
+            .upsert_entry(
+                root_id,
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
+                false,
+                100,
+                Some(1000),
+            )
+            .expect("insert");
+
+        db.update_entry_status(entry_id, "removed")
+            .expect("update status");
+
+        let entries = db.list_entries_by_root(root_id).expect("list");
         assert_eq!(entries.len(), 0, "removed entries should be excluded");
     }
 

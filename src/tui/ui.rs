@@ -111,17 +111,24 @@ fn render_file_list_view(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
-    // Split vertically: overview widget | content area
+    // Split vertically: top widgets row | content area
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // Overview: summary + divider + bars + divider inside bordered block
+            Constraint::Length(7), // Top row: lifecycle + timeline widgets
             Constraint::Min(0),    // Content area (sidebar + main panel)
         ])
         .split(area);
 
-    // Render combined overview widget (header stats + lifecycle bars)
-    render_overview_widget(app, frame, v_chunks[0]);
+    // Split top row horizontally: lifecycle widget | expiration timeline
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(v_chunks[0]);
+
+    // Render both top widgets
+    render_lifecycle_widget(app, config, db, frame, top_chunks[0]);
+    render_expiration_timeline(app, config, db, frame, top_chunks[1]);
 
     let content_area = v_chunks[1];
 
@@ -150,12 +157,6 @@ fn render_file_list_view(
 struct LifecycleTally {
     files: u64,
     bytes: u64,
-}
-
-impl LifecycleTally {
-    fn label(&self) -> String {
-        format!("{} ({})", self.files, format_bytes(self.bytes))
-    }
 }
 
 /// Pre-computed unsigned view of `Stats` for the overview widget, with pending
@@ -195,25 +196,113 @@ impl From<&crate::db::Stats> for LifecycleView {
     }
 }
 
-/// Render the combined overview widget inside a single bordered block.
+impl LifecycleView {
+    /// Compute lifecycle view from a list of entries.
+    ///
+    /// Categorizes entries by lifecycle status based on their expiration state:
+    /// - Healthy: tracked entries with more than `warning_days` until expiration
+    /// - Warning: tracked entries within the warning period
+    /// - Overdue: tracked entries past expiration, or pending/approved entries
+    ///
+    /// Directories and ignored/removed entries are excluded from the tally.
+    fn from_entries(entries: &[crate::db::Entry], config: &Config) -> Self {
+        let mut healthy = LifecycleTally { files: 0, bytes: 0 };
+        let mut warning = LifecycleTally { files: 0, bytes: 0 };
+        let mut overdue = LifecycleTally { files: 0, bytes: 0 };
+
+        for entry in entries
+            .iter()
+            .filter(|e| !e.is_dir && e.status != "removed" && e.status != "ignored")
+        {
+            // Clamp size to non-negative for safe casting
+            #[allow(clippy::cast_sign_loss)]
+            let size = entry.size_bytes.max(0) as u64;
+
+            // pending/approved entries are always "overdue" (require attention)
+            if entry.status == "pending" || entry.status == "approved" {
+                overdue.files += 1;
+                overdue.bytes += size;
+                continue;
+            }
+
+            // For tracked/deferred, calculate days remaining
+            let days_remaining = if entry.status == "deferred" {
+                entry.deferred_until.map(|until| {
+                    let now = jiff::Timestamp::now().as_second();
+                    (until - now) / 86400
+                })
+            } else {
+                entry
+                    .mtime
+                    .map(|m| calculate_expiration(m, config.expiration_days))
+            };
+
+            match days_remaining {
+                Some(d) if d <= 0 => {
+                    overdue.files += 1;
+                    overdue.bytes += size;
+                }
+                Some(d) if d <= i64::from(config.warning_days) => {
+                    warning.files += 1;
+                    warning.bytes += size;
+                }
+                // None (no mtime) or Some with days > warning_days: assume healthy
+                _ => {
+                    healthy.files += 1;
+                    healthy.bytes += size;
+                }
+            }
+        }
+
+        Self {
+            total_files: healthy.files + warning.files + overdue.files,
+            total_bytes: healthy.bytes + warning.bytes + overdue.bytes,
+            healthy,
+            warning,
+            overdue,
+        }
+    }
+}
+
+/// Render the lifecycle widget showing stats for the selected root.
 ///
 /// Layout (7 rows total = border + 5 content + border):
-///   Row 0: Top border with "Overview" title
-///   Row 1: Summary — total in white, then colored lifecycle tallies (full width)
-///   Row 2: Thin divider line (full width)
-///   Row 3: Files lifecycle bar (left half only)
-///   Row 4: Thin divider line (left half only)
-///   Row 5: Bytes lifecycle bar (left half only)
+///   Row 0: Top border with "LIFECYCLE" title
+///   Row 1: Summary — total in white, then colored lifecycle tallies
+///   Row 2: Thin divider line
+///   Row 3: Files lifecycle bar
+///   Row 4: Thin divider line
+///   Row 5: Bytes lifecycle bar
 ///   Row 6: Bottom border
 ///
-/// Ignored files are excluded from lifecycle bar computations.
-fn render_overview_widget(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let view = LifecycleView::from(&app.cached_stats);
-
-    // Render the outer block and get the inner rect
-    let block = Block::default().borders(Borders::ALL).title("OVERVIEW");
+/// If no root is selected, shows a placeholder message.
+fn render_lifecycle_widget(
+    app: &App,
+    config: &Config,
+    db: &Database,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+) {
+    let block = Block::default().borders(Borders::ALL).title("LIFECYCLE");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // Get the selected root
+    let Some(root_id) = app.current_root_id.get() else {
+        let msg = Paragraph::new("Select a root from the sidebar")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, inner);
+        return;
+    };
+
+    // Get entries for this root
+    let Ok(entries) = db.list_entries_by_root(root_id) else {
+        let msg = Paragraph::new("Error loading entries").style(Style::default().fg(Color::Red));
+        frame.render_widget(msg, inner);
+        return;
+    };
+
+    let view = LifecycleView::from_entries(&entries, config);
 
     // Split inner area: summary + divider on top (2 rows), bars below (3 rows)
     let v_chunks = Layout::default()
@@ -234,17 +323,9 @@ fn render_overview_widget(app: &App, frame: &mut Frame, area: ratatui::layout::R
     let summary_widget = Paragraph::new(vec![summary_line, full_divider]);
     frame.render_widget(summary_widget, summary_area);
 
-    // Split bars area horizontally: left half for bars, right half reserved for future use
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(bars_area);
-
-    let bars_left = h_chunks[0];
-
-    // Build lifecycle bars sized to the left half. The "Files " / "Bytes " prefix is 6 chars.
+    // Build lifecycle bars sized to full width. The "Files " / "Bytes " prefix is 6 chars.
     let prefix_width: u16 = 6;
-    let bar_width = bars_left.width.saturating_sub(prefix_width);
+    let bar_width = bars_area.width.saturating_sub(prefix_width);
 
     let files_segments = [
         BarSegment {
@@ -292,7 +373,7 @@ fn render_overview_widget(app: &App, frame: &mut Frame, area: ratatui::layout::R
     let files_line = Line::from(files_spans);
 
     let bar_divider = Line::from(Span::styled(
-        "─".repeat(usize::from(bars_left.width)),
+        "─".repeat(usize::from(bars_area.width)),
         Style::default().fg(Color::DarkGray),
     ));
 
@@ -304,7 +385,290 @@ fn render_overview_widget(app: &App, frame: &mut Frame, area: ratatui::layout::R
     let bytes_line = Line::from(bytes_spans);
 
     let bars_widget = Paragraph::new(vec![files_line, bar_divider, bytes_line]);
-    frame.render_widget(bars_widget, bars_left);
+    frame.render_widget(bars_widget, bars_area);
+}
+
+/// Render the expiration timeline showing when files expire over the next 30 days.
+///
+/// The timeline is a horizontal strip with markers indicating when files will expire.
+/// Files are bucketed by day, with the count shown below each marker.
+// Allow: This function handles timeline rendering with multiple layout stages (axis labels,
+// timeline, markers, summary) that form a cohesive visualization pipeline.
+#[allow(clippy::too_many_lines)]
+fn render_expiration_timeline(
+    app: &App,
+    config: &Config,
+    db: &Database,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+) {
+    const TIMELINE_DAYS: usize = 30;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("EXPIRATION TIMELINE");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Get the selected root
+    let Some(root_id) = app.current_root_id.get() else {
+        let msg = Paragraph::new("Select a root from the sidebar")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, inner);
+        return;
+    };
+
+    // Get entries for this root
+    let Ok(entries) = db.list_entries_by_root(root_id) else {
+        let msg = Paragraph::new("Error loading entries").style(Style::default().fg(Color::Red));
+        frame.render_widget(msg, inner);
+        return;
+    };
+
+    // Bucket entries by days until expiration (0-30 days)
+    // Index 0 = expires today, index 30 = expires in 30 days
+    let mut buckets: [u64; TIMELINE_DAYS + 1] = [0; TIMELINE_DAYS + 1];
+    let mut total_expiring: u64 = 0;
+    let mut total_bytes: i64 = 0;
+
+    for entry in entries
+        .iter()
+        .filter(|e| !e.is_dir && e.status != "removed" && e.status != "ignored")
+    {
+        // Calculate days until expiration
+        let days_remaining = if entry.status == "deferred" {
+            entry.deferred_until.map(|until| {
+                let now = jiff::Timestamp::now().as_second();
+                (until - now) / 86400
+            })
+        } else if entry.status == "pending" || entry.status == "approved" {
+            // Already overdue
+            Some(0)
+        } else {
+            entry
+                .mtime
+                .map(|m| calculate_expiration(m, config.expiration_days))
+        };
+
+        if let Some(days) = days_remaining {
+            // Only count files expiring within our timeline window
+            if days <= i64::try_from(TIMELINE_DAYS).unwrap_or(i64::MAX) {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let bucket_idx = days.max(0) as usize;
+                buckets[bucket_idx] += 1;
+                total_expiring += 1;
+                total_bytes += entry.size_bytes;
+            }
+        }
+    }
+
+    // If nothing is expiring, show a calm message
+    if total_expiring == 0 {
+        let msg = Paragraph::new("No files expiring in the next 30 days")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    // Layout: split vertically into timeline rows + summary, then split top horizontally for legend
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Timeline area (axis labels + axis + markers)
+            Constraint::Min(1),    // Summary text
+        ])
+        .split(inner);
+
+    let timeline_block = v_chunks[0];
+    let summary_area = v_chunks[1];
+
+    // Split timeline block horizontally: timeline on left, legend on right
+    let legend_width: u16 = 7; // " · <3" etc
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(legend_width)])
+        .split(timeline_block);
+
+    let timeline_area_full = h_chunks[0];
+    let legend_area = h_chunks[1];
+
+    // Split timeline area into rows
+    let timeline_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Axis labels
+            Constraint::Length(1), // Timeline axis
+            Constraint::Length(1), // Markers
+        ])
+        .split(timeline_area_full);
+
+    let axis_label_area = timeline_rows[0];
+    let timeline_area = timeline_rows[1];
+    let marker_area = timeline_rows[2];
+
+    // Split legend area into rows (aligned with timeline rows)
+    let legend_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(legend_area);
+
+    // Render legend (right-aligned in each row)
+    // Pad with spaces so dots align vertically
+    frame.render_widget(
+        Paragraph::new("·  <3").alignment(ratatui::layout::Alignment::Right),
+        legend_rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new("• <10").alignment(ratatui::layout::Alignment::Right),
+        legend_rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new("● 10+").alignment(ratatui::layout::Alignment::Right),
+        legend_rows[2],
+    );
+
+    // Build axis labels: "Today", "+15d", "+30d"
+    let axis_width = usize::from(axis_label_area.width);
+    let mut axis_label = String::with_capacity(axis_width);
+    axis_label.push_str("Today");
+    let mid_label = "+15d";
+    let end_label = "+30d";
+
+    // Calculate positions for labels
+    let mid_pos = axis_width / 2;
+    let end_pos = axis_width.saturating_sub(end_label.len());
+
+    // Pad to mid position
+    let padding_to_mid = mid_pos
+        .saturating_sub(axis_label.len())
+        .saturating_sub(mid_label.len() / 2);
+    for _ in 0..padding_to_mid {
+        axis_label.push(' ');
+    }
+    axis_label.push_str(mid_label);
+
+    // Pad to end position
+    let padding_to_end = end_pos.saturating_sub(axis_label.len());
+    for _ in 0..padding_to_end {
+        axis_label.push(' ');
+    }
+    axis_label.push_str(end_label);
+
+    let axis_label_line = Line::from(Span::styled(
+        axis_label,
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(axis_label_line), axis_label_area);
+
+    // Build timeline axis (simple line without ticks)
+    let timeline_width = usize::from(timeline_area.width);
+    let mut timeline = String::with_capacity(timeline_width);
+    timeline.push('├');
+    for _ in 1..timeline_width.saturating_sub(1) {
+        timeline.push('─');
+    }
+    if timeline_width > 1 {
+        timeline.push('┤');
+    }
+
+    let timeline_line = Line::from(Span::styled(timeline, Style::default().fg(Color::DarkGray)));
+    frame.render_widget(Paragraph::new(timeline_line), timeline_area);
+
+    // Build markers showing where files expire, with dot size indicating count
+    let marker_width = usize::from(marker_area.width);
+
+    if marker_width == 0 {
+        return;
+    }
+
+    // Scale factor: marker_width positions for TIMELINE_DAYS+1 buckets
+    #[allow(clippy::cast_precision_loss)]
+    let scale = marker_width as f64 / (TIMELINE_DAYS + 1) as f64;
+
+    // Build marker line: each position holds (char, color) or space
+    let mut marker_chars: Vec<(char, Color)> = vec![(' ', Color::Reset); marker_width];
+
+    for (day, &count) in buckets.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let x = ((day as f64 * scale) as usize).min(marker_width.saturating_sub(1));
+        let is_overdue = day == 0;
+        let color = if is_overdue {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+
+        // Use dot size to indicate magnitude
+        // ·  (U+00B7 middle dot) for 1-2 files
+        // •  (U+2022 bullet) for 3-9 files
+        // ●  (U+25CF black circle) for 10+ files
+        let symbol = if count >= 10 {
+            '●'
+        } else if count >= 3 {
+            '•'
+        } else {
+            '·'
+        };
+
+        marker_chars[x] = (symbol, color);
+    }
+
+    // Convert to spans, grouping consecutive same-color characters
+    let mut spans: Vec<Span> = Vec::new();
+    let mut current_color = Color::Reset;
+    let mut current_text = String::new();
+
+    for (ch, color) in marker_chars {
+        if color != current_color {
+            if !current_text.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current_text),
+                    Style::default().fg(current_color),
+                ));
+            }
+            current_color = color;
+        }
+        current_text.push(ch);
+    }
+    if !current_text.is_empty() {
+        spans.push(Span::styled(
+            current_text,
+            Style::default().fg(current_color),
+        ));
+    }
+
+    let marker_line = Line::from(spans);
+    frame.render_widget(Paragraph::new(marker_line), marker_area);
+
+    // Build summary line (centered, with blank line above for spacing)
+    #[allow(clippy::cast_sign_loss)]
+    let total_bytes_u64 = total_bytes.max(0) as u64;
+    let summary_text = format!(
+        "{} files ({}) expire in next 30 days",
+        total_expiring,
+        format_bytes(total_bytes_u64)
+    );
+    let summary_paragraph = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            summary_text,
+            Style::default().fg(Color::White),
+        )),
+    ])
+    .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(summary_paragraph, summary_area);
 }
 
 /// Render the quota target widget (pie chart with text above, or placeholder message).
@@ -358,8 +722,7 @@ fn render_quota_widget(
     };
 
     // Categorize entries by lifecycle status: healthy, warning, overdue
-    let (healthy_bytes, warning_bytes, overdue_bytes) = match db.list_entries_by_parent(&root.path)
-    {
+    let (healthy_bytes, warning_bytes, overdue_bytes) = match db.list_entries_by_root(root_id) {
         Ok(entries) => {
             let mut healthy: i64 = 0;
             let mut warning: i64 = 0;
@@ -527,40 +890,16 @@ fn render_quota_widget(
     frame.render_widget(chart, square_chart_area);
 }
 
-/// Build the summary line showing total in white, then colored lifecycle tallies.
+/// Build the summary line showing total files and bytes, plus optional status message.
 fn build_summary_line<'a>(view: &LifecycleView, status_message: Option<&str>) -> Line<'a> {
-    let mut spans = vec![
-        Span::styled(
-            format!(
-                "Total: {} files, {}",
-                view.total_files,
-                format_bytes(view.total_bytes)
-            ),
-            Style::default().add_modifier(Modifier::BOLD),
+    let mut spans = vec![Span::styled(
+        format!(
+            "Total: {} files, {}",
+            view.total_files,
+            format_bytes(view.total_bytes)
         ),
-        Span::raw("  "),
-        Span::styled(
-            "Healthy: ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(view.healthy.label(), Style::default().fg(Color::Green)),
-        Span::raw("  "),
-        Span::styled(
-            "Expiring soon: ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(view.warning.label(), Style::default().fg(Color::Yellow)),
-        Span::raw("  "),
-        Span::styled(
-            "Overdue: ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(view.overdue.label(), Style::default().fg(Color::Red)),
-    ];
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
 
     if let Some(status) = status_message {
         spans.push(Span::raw("  "));
