@@ -1245,8 +1245,6 @@ fn render_main_entry_panel(
             } else {
                 filename.to_string()
             };
-            let filename_cell = Cell::from(display_name);
-
             // Format size (directories show as "-")
             let size_str = if entry.is_dir {
                 "-".to_string()
@@ -1255,34 +1253,9 @@ fn render_main_entry_panel(
                 #[allow(clippy::cast_sign_loss)]
                 format_bytes(entry.size_bytes as u64)
             };
-            let size_cell = Cell::from(size_str);
 
-            // Format expiration
-            let expires_str = if *days_remaining >= 0 {
-                format!("{days_remaining} days")
-            } else {
-                format!("{} days ago", -days_remaining)
-            };
-            let expires_cell = Cell::from(expires_str);
-
-            // Display status from database, with expiration-based fallback for "tracked" entries.
-            // Directories show the same status as files based on their oldest child's mtime.
-            let status_str = match entry.status.as_str() {
-                "tracked" => {
-                    if *days_remaining <= 0 {
-                        "overdue"
-                    } else if *days_remaining <= i64::from(config.warning_days) {
-                        "warning"
-                    } else {
-                        "tracked"
-                    }
-                }
-                other => other,
-            };
-            let status_cell = Cell::from(status_str);
-
-            // Determine row color based on actual entry status
-            // For deferred entries, use the deferral end date instead of mtime-based expiration
+            // Calculate effective days for expiration display
+            // For deferred entries, use the deferral end date
             let effective_days = if entry.status == "deferred" {
                 if let Some(deferred_until) = entry.deferred_until {
                     let now = jiff::Timestamp::now().as_second();
@@ -1293,38 +1266,110 @@ fn render_main_entry_panel(
             } else {
                 *days_remaining
             };
-            let row_style =
-                determine_row_style(&entry.status, Some(effective_days), config.warning_days);
+            let expires_str = if effective_days >= 0 {
+                format!("{effective_days} days")
+            } else {
+                format!("{} days ago", -effective_days)
+            };
+
+            // Determine display status from database, with expiration-based fallback for "tracked"
+            let status_str = match entry.status.as_str() {
+                "tracked" => {
+                    if effective_days <= 0 {
+                        "overdue"
+                    } else if effective_days <= i64::from(config.warning_days) {
+                        "warning"
+                    } else {
+                        "tracked"
+                    }
+                }
+                other => other,
+            };
 
             // Check if this entry is selected (multi-select)
             let is_selected = app.selected_entries().contains(&entry.id);
             let is_search_match = search_match_set.contains(&idx);
 
-            // Highlight selected row and show focus
+            // Determine if this is the cursor row - affects styling strategy
+            // When REVERSED modifier is used, cell foreground colors become backgrounds,
+            // creating visual artifacts. So cursor rows use plain text (no cell colors).
             let is_cursor = idx == selected_idx && app.focus_panel() == FocusPanel::MainPanel;
-            let mut style = if is_selected && is_cursor {
+            let uses_reversed = is_cursor; // REVERSED swaps fg/bg, breaking cell colors
+
+            // Build cells with conditional styling
+            // When row uses REVERSED, skip cell colors to avoid artifacts
+            let filename_cell = if uses_reversed {
+                Cell::from(display_name)
+            } else if entry.status == "ignored" {
+                Cell::from(display_name).style(Style::default().fg(Color::DarkGray))
+            } else {
+                Cell::from(display_name)
+            };
+
+            let size_cell = if uses_reversed {
+                Cell::from(size_str)
+            } else {
+                Cell::from(size_str).style(Style::default().fg(Color::DarkGray))
+            };
+
+            let expires_cell = if uses_reversed {
+                Cell::from(expires_str)
+            } else {
+                let expires_style = if entry.status == "ignored" {
+                    Style::default().fg(Color::DarkGray)
+                } else if effective_days <= 0 {
+                    Style::default().fg(Color::Red) // Overdue
+                } else if effective_days <= i64::from(config.warning_days) {
+                    Style::default().fg(Color::Yellow) // Warning
+                } else {
+                    Style::default().fg(Color::DarkGray) // Safe - dimmed
+                };
+                Cell::from(expires_str).style(expires_style)
+            };
+
+            // Status column is always color-coded to match the visual language
+            // used in the sidebar stats (green/yellow/red categories)
+            let status_style = match entry.status.as_str() {
+                "tracked" => {
+                    if effective_days <= 0 {
+                        Style::default().fg(Color::Red)
+                    } else if effective_days <= i64::from(config.warning_days) {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Green) // Safe - matches sidebar "green" category
+                    }
+                }
+                "pending" | "approved" => Style::default().fg(Color::Red),
+                "deferred" => Style::default().fg(Color::Cyan),
+                _ => Style::default().fg(Color::DarkGray), // ignored and others
+            };
+            let status_cell = if uses_reversed {
+                Cell::from(status_str)
+            } else {
+                Cell::from(status_str).style(status_style)
+            };
+
+            // Row-level styling for selection and cursor
+            let mut row_style = if is_selected && is_cursor {
                 // Cursor on a selected row: combine both indicators
-                row_style
+                Style::default()
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                    .fg(Color::Cyan)
             } else if is_selected {
-                // Selected entries get dark gray background for contrast with all text colors
-                row_style.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-            } else if idx == selected_idx {
+                // Selected entries get dark gray background
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_cursor {
                 // Currently focused entry
-                if app.focus_panel() == FocusPanel::MainPanel {
-                    row_style.add_modifier(Modifier::REVERSED).fg(Color::Cyan)
-                } else {
-                    row_style.add_modifier(Modifier::REVERSED)
-                }
+                Style::default().add_modifier(Modifier::REVERSED)
             } else {
-                row_style
+                Style::default()
             };
 
             // Underline search matches so they stand out
             if is_search_match {
-                style = style.add_modifier(Modifier::UNDERLINED);
+                row_style = row_style.add_modifier(Modifier::UNDERLINED);
             }
 
             Row::new(vec![
@@ -1334,7 +1379,7 @@ fn render_main_entry_panel(
                 expires_cell,
                 status_cell,
             ])
-            .style(style)
+            .style(row_style)
         })
         .collect();
 
@@ -1532,30 +1577,6 @@ fn expiration_sort_key_entry(entry: &crate::db::Entry, days_remaining: i64) -> i
             }
         }
         _ => days_remaining,
-    }
-}
-
-/// Determine row style based on status and expiration.
-///
-/// For deferred files, the caller should pass the effective days remaining
-/// based on `deferred_until`, not the mtime-based expiration.
-fn determine_row_style(status: &str, days_remaining: Option<i64>, warning_days: u32) -> Style {
-    // Ignored paths are gray
-    if status == "ignored" {
-        return Style::default().fg(Color::DarkGray);
-    }
-
-    // Pending or approved paths are red (require attention)
-    if status == "pending" || status == "approved" {
-        return Style::default().fg(Color::Red);
-    }
-
-    // Check expiration status (applies to tracked and deferred)
-    match days_remaining {
-        None => Style::default(), // No mtime, use default
-        Some(days) if days <= 0 => Style::default().fg(Color::Red), // Overdue
-        Some(days) if days <= i64::from(warning_days) => Style::default().fg(Color::Yellow), // Warning
-        _ => Style::default().fg(Color::Green),                                              // Safe
     }
 }
 
@@ -2807,73 +2828,6 @@ mod tests {
             PathBuf::from("/a.txt"),
             "Oldest (1000) should be last"
         );
-    }
-
-    // Tests for determine_row_style
-
-    #[test]
-    fn determine_row_style_ignored_is_gray() {
-        let style = determine_row_style("ignored", Some(30), 14);
-        assert_eq!(style.fg, Some(Color::DarkGray));
-    }
-
-    #[test]
-    fn determine_row_style_pending_is_red() {
-        let style = determine_row_style("pending", Some(30), 14);
-        assert_eq!(style.fg, Some(Color::Red));
-    }
-
-    #[test]
-    fn determine_row_style_approved_is_red() {
-        let style = determine_row_style("approved", Some(30), 14);
-        assert_eq!(style.fg, Some(Color::Red));
-    }
-
-    #[test]
-    fn determine_row_style_overdue_is_red() {
-        let style = determine_row_style("tracked", Some(0), 14);
-        assert_eq!(style.fg, Some(Color::Red));
-
-        let style = determine_row_style("tracked", Some(-5), 14);
-        assert_eq!(style.fg, Some(Color::Red));
-    }
-
-    #[test]
-    fn determine_row_style_within_warning_is_yellow() {
-        let style = determine_row_style("tracked", Some(14), 14);
-        assert_eq!(style.fg, Some(Color::Yellow));
-
-        let style = determine_row_style("tracked", Some(7), 14);
-        assert_eq!(style.fg, Some(Color::Yellow));
-
-        let style = determine_row_style("tracked", Some(1), 14);
-        assert_eq!(style.fg, Some(Color::Yellow));
-    }
-
-    #[test]
-    fn determine_row_style_safe_is_green() {
-        let style = determine_row_style("tracked", Some(15), 14);
-        assert_eq!(style.fg, Some(Color::Green));
-
-        let style = determine_row_style("tracked", Some(90), 14);
-        assert_eq!(style.fg, Some(Color::Green));
-    }
-
-    #[test]
-    fn determine_row_style_no_mtime_is_default() {
-        let style = determine_row_style("tracked", None, 14);
-        assert_eq!(style.fg, None);
-    }
-
-    #[test]
-    fn determine_row_style_status_takes_precedence_over_expiration() {
-        // Even if days remaining is safe, pending status should show red
-        let style = determine_row_style("pending", Some(90), 14);
-        assert_eq!(style.fg, Some(Color::Red));
-
-        // Ignored should be gray regardless of expiration
-        let style = determine_row_style("ignored", Some(-10), 14);
-        assert_eq!(style.fg, Some(Color::DarkGray));
     }
 
     // Tests for format_timestamp

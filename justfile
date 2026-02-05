@@ -60,9 +60,13 @@ test-verbose:
 build:
     cargo build
 
+alias b := build
+
 # Build release binary
 build-release:
     cargo build --release
+
+alias r := build-release
 
 # Install a release binary on the system $PATH
 install:
