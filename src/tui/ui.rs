@@ -207,7 +207,7 @@ fn render_overview_widget(app: &App, frame: &mut Frame, area: ratatui::layout::R
     let view = LifecycleView::from(&app.cached_stats);
 
     // Render the outer block and get the inner rect
-    let block = Block::default().borders(Borders::ALL).title("Overview");
+    let block = Block::default().borders(Borders::ALL).title("OVERVIEW");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -466,7 +466,7 @@ fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::la
     // Fetch roots from database
     let Ok(roots) = db.list_roots() else {
         let error_text = Paragraph::new("Error loading roots")
-            .block(Block::default().borders(Borders::ALL).title("Roots"))
+            .block(Block::default().borders(Borders::ALL).title("ROOTS"))
             .style(Style::default().fg(Color::Red));
         frame.render_widget(error_text, area);
         return;
@@ -522,7 +522,7 @@ fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::la
     // Empty state
     if rows.is_empty() {
         let empty_text = Paragraph::new("No tracked paths.\n\nRun 'stagecrew add PATH'")
-            .block(Block::default().borders(Borders::ALL).title("Roots"))
+            .block(Block::default().borders(Borders::ALL).title("ROOTS"))
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty_text, area);
         return;
@@ -530,7 +530,7 @@ fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::la
 
     let table = Table::new(rows, [Constraint::Percentage(100)]).block(
         Block::default()
-            .title("Roots")
+            .title("ROOTS")
             .borders(Borders::ALL)
             .border_style(if app.focus_panel() == FocusPanel::Sidebar {
                 Style::default().fg(Color::Cyan)
@@ -561,7 +561,7 @@ fn render_main_entry_panel(
         let message = Paragraph::new(
             "Select a root from the sidebar\n\n(Use j/k to navigate, Tab to switch panels)",
         )
-        .block(Block::default().borders(Borders::ALL).title("Entries"))
+        .block(Block::default().borders(Borders::ALL).title("ENTRIES"))
         .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(message, area);
         return;
@@ -570,7 +570,7 @@ fn render_main_entry_panel(
     // Fetch entries for this path
     let Ok(entries) = db.list_entries_by_parent(current_path) else {
         let error_text = Paragraph::new("Error loading entries from database")
-            .block(Block::default().borders(Borders::ALL).title("Entries"))
+            .block(Block::default().borders(Borders::ALL).title("ENTRIES"))
             .style(Style::default().fg(Color::Red));
         frame.render_widget(error_text, area);
         return;
@@ -579,7 +579,7 @@ fn render_main_entry_panel(
     // Empty state
     if entries.is_empty() {
         let empty_text = Paragraph::new("No entries in this directory")
-            .block(Block::default().borders(Borders::ALL).title("Entries"))
+            .block(Block::default().borders(Borders::ALL).title("ENTRIES"))
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty_text, area);
         return;
@@ -781,7 +781,7 @@ fn render_main_entry_panel(
         .block(
             Block::default()
                 .title(format!(
-                    "Entries{sort_indicator}{selection_info}{search_info}"
+                    "ENTRIES{sort_indicator}{selection_info}{search_info}"
                 ))
                 .borders(Borders::ALL)
                 .border_style(if app.focus_panel() == FocusPanel::MainPanel {
