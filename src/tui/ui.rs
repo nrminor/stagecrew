@@ -1254,8 +1254,8 @@ fn render_main_entry_panel(
                 format_bytes(entry.size_bytes as u64)
             };
 
-            // Calculate effective days for expiration display
-            // For deferred entries, use the deferral end date
+            // Calculate effective days for the Due column
+            // For deferred entries, use the deferral end date instead of mtime-based expiration
             let effective_days = if entry.status == "deferred" {
                 if let Some(deferred_until) = entry.deferred_until {
                     let now = jiff::Timestamp::now().as_second();
@@ -1266,24 +1266,15 @@ fn render_main_entry_panel(
             } else {
                 *days_remaining
             };
-            let expires_str = if effective_days >= 0 {
+
+            // Format the Due column value
+            // Ignored entries show "—" since they're exempt from removal
+            let due_str = if entry.status == "ignored" {
+                "—".to_string()
+            } else if effective_days >= 0 {
                 format!("{effective_days} days")
             } else {
                 format!("{} days ago", -effective_days)
-            };
-
-            // Determine display status from database, with expiration-based fallback for "tracked"
-            let status_str = match entry.status.as_str() {
-                "tracked" => {
-                    if effective_days <= 0 {
-                        "overdue"
-                    } else if effective_days <= i64::from(config.warning_days) {
-                        "warning"
-                    } else {
-                        "tracked"
-                    }
-                }
-                other => other,
             };
 
             // Check if this entry is selected (multi-select)
@@ -1312,41 +1303,27 @@ fn render_main_entry_panel(
                 Cell::from(size_str).style(Style::default().fg(Color::DarkGray))
             };
 
-            let expires_cell = if uses_reversed {
-                Cell::from(expires_str)
-            } else {
-                let expires_style = if entry.status == "ignored" {
-                    Style::default().fg(Color::DarkGray)
-                } else if effective_days <= 0 {
-                    Style::default().fg(Color::Red) // Overdue
-                } else if effective_days <= i64::from(config.warning_days) {
-                    Style::default().fg(Color::Yellow) // Warning
-                } else {
-                    Style::default().fg(Color::DarkGray) // Safe - dimmed
-                };
-                Cell::from(expires_str).style(expires_style)
-            };
-
-            // Status column is always color-coded to match the visual language
-            // used in the sidebar stats (green/yellow/red categories)
-            let status_style = match entry.status.as_str() {
-                "tracked" => {
-                    if effective_days <= 0 {
-                        Style::default().fg(Color::Red)
-                    } else if effective_days <= i64::from(config.warning_days) {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::Green) // Safe - matches sidebar "green" category
-                    }
-                }
+            // Due column is color-coded to match the sidebar stats visual language
+            // Colors encode both urgency (days remaining) and special states
+            let due_style = match entry.status.as_str() {
+                "ignored" => Style::default().fg(Color::DarkGray),
                 "pending" | "approved" => Style::default().fg(Color::Red),
                 "deferred" => Style::default().fg(Color::Cyan),
-                _ => Style::default().fg(Color::DarkGray), // ignored and others
+                _ => {
+                    // For tracked entries, color by urgency
+                    if effective_days <= 0 {
+                        Style::default().fg(Color::Red) // Overdue
+                    } else if effective_days <= i64::from(config.warning_days) {
+                        Style::default().fg(Color::Yellow) // Warning period
+                    } else {
+                        Style::default().fg(Color::Green) // Safe
+                    }
+                }
             };
-            let status_cell = if uses_reversed {
-                Cell::from(status_str)
+            let due_cell = if uses_reversed {
+                Cell::from(due_str)
             } else {
-                Cell::from(status_str).style(status_style)
+                Cell::from(due_str).style(due_style)
             };
 
             // Row-level styling for selection and cursor
@@ -1372,28 +1349,20 @@ fn render_main_entry_panel(
                 row_style = row_style.add_modifier(Modifier::UNDERLINED);
             }
 
-            Row::new(vec![
-                indicator_cell,
-                filename_cell,
-                size_cell,
-                expires_cell,
-                status_cell,
-            ])
-            .style(row_style)
+            Row::new(vec![indicator_cell, filename_cell, size_cell, due_cell]).style(row_style)
         })
         .collect();
 
     // Build table
     let widths = [
         Constraint::Length(2),      // Visual indicator (●/⚠/✓)
-        Constraint::Percentage(42), // Filename
+        Constraint::Percentage(55), // Filename
         Constraint::Percentage(15), // Size
-        Constraint::Percentage(20), // Expires
-        Constraint::Percentage(20), // Status
+        Constraint::Percentage(27), // Due
     ];
 
     let sort_indicator = match app.sort_mode() {
-        SortMode::Expiration => " (by expiration)",
+        SortMode::Expiration => " (by due)",
         SortMode::Size => " (by size)",
         SortMode::Name => " (by name)",
         SortMode::Modified => " (by modified)",
@@ -1625,7 +1594,7 @@ fn expiration_indicator_entry(
 /// Generate header cells for the entry table with sort indicators.
 ///
 /// The currently sorted column gets a triangle indicator:
-/// - `▲` for ascending sort (Name, Expiration)
+/// - `▲` for ascending sort (Name, Due)
 /// - `▼` for descending sort (Size, Modified)
 fn entry_table_header_cells(sort_mode: SortMode) -> Vec<Cell<'static>> {
     let indicator_asc = " ▲";
@@ -1641,23 +1610,19 @@ fn entry_table_header_cells(sort_mode: SortMode) -> Vec<Cell<'static>> {
         _ => "Size".to_string(),
     };
 
-    let expires_header = match sort_mode {
-        SortMode::Expiration => format!("Expires{indicator_asc}"),
-        _ => "Expires".to_string(),
-    };
-
-    // Modified isn't a visible column, but if we're sorting by it, show in Status column
-    let status_header = match sort_mode {
-        SortMode::Modified => format!("Status (by mtime{indicator_desc})"),
-        _ => "Status".to_string(),
+    // Due column shows sort indicator for both Expiration and Modified sorts
+    // (Modified sorts by mtime, which determines the due date)
+    let due_header = match sort_mode {
+        SortMode::Expiration => format!("Due{indicator_asc}"),
+        SortMode::Modified => format!("Due (mtime){indicator_desc}"),
+        _ => "Due".to_string(),
     };
 
     vec![
         Cell::from(""), // No header for indicator column
         Cell::from(filename_header),
         Cell::from(size_header),
-        Cell::from(expires_header),
-        Cell::from(status_header),
+        Cell::from(due_header),
     ]
 }
 
@@ -1903,7 +1868,7 @@ Views:
   ?           Show this help screen
 
 Sorting:
-  s           Cycle sort mode (Expiration → Size → Name → Modified)
+  s           Cycle sort mode (Due → Size → Name → Modified)
 
 Other:
   R           Refresh tracked paths (rescan filesystem)
