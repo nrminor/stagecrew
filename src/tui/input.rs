@@ -260,6 +260,14 @@ impl InputHandler {
                 Self::unignore_entry(app, config, db);
             }
 
+            // Open in external application
+            KeyCode::Char('e') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::request_open_in_editor(app, config, db);
+            }
+            KeyCode::Char('o') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::request_open_in_system_viewer(app, config, db);
+            }
+
             // Search
             KeyCode::Char('/') if app.focus_panel == FocusPanel::MainPanel => {
                 app.search_query = Some(String::new());
@@ -1200,6 +1208,59 @@ impl InputHandler {
         }
         app.exit_visual_mode();
         app.clear_selection();
+    }
+
+    /// Request to open files in $VISUAL or $EDITOR.
+    ///
+    /// Collects paths from selected entries (or the focused entry if none selected)
+    /// and sets `external_open_request` for the main loop to handle.
+    fn request_open_in_editor(app: &mut App, config: &Config, db: &Database) {
+        let paths = Self::collect_paths_for_external_open(app, config, db);
+        if paths.is_empty() {
+            app.status_message = Some("No files to open".to_string());
+            app.status_message_time = Some(std::time::Instant::now());
+            return;
+        }
+        app.external_open_request = Some(super::ExternalOpenRequest::Editor(paths));
+    }
+
+    /// Request to open files with the system default viewer.
+    ///
+    /// Collects paths from selected entries (or the focused entry if none selected)
+    /// and sets `external_open_request` for the main loop to handle.
+    fn request_open_in_system_viewer(app: &mut App, config: &Config, db: &Database) {
+        let paths = Self::collect_paths_for_external_open(app, config, db);
+        if paths.is_empty() {
+            app.status_message = Some("No files to open".to_string());
+            app.status_message_time = Some(std::time::Instant::now());
+            return;
+        }
+        app.external_open_request = Some(super::ExternalOpenRequest::SystemViewer(paths));
+    }
+
+    /// Collect filesystem paths for opening in an external application.
+    ///
+    /// Returns paths from selected entries if any are selected, otherwise
+    /// returns the path of the currently focused entry.
+    fn collect_paths_for_external_open(app: &App, config: &Config, db: &Database) -> Vec<PathBuf> {
+        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+            return Vec::new();
+        };
+
+        if app.selected_entries.is_empty() {
+            // No selection - use currently focused entry
+            entry_rows
+                .get(app.entry_selected_index)
+                .map(|(entry, _)| vec![entry.path.clone()])
+                .unwrap_or_default()
+        } else {
+            // Use selected entries
+            entry_rows
+                .into_iter()
+                .filter(|(e, _)| app.selected_entries.contains(&e.id))
+                .map(|(e, _)| e.path)
+                .collect()
+        }
     }
 
     /// Handle search input mode (typing a search query).

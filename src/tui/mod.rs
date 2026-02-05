@@ -133,6 +133,15 @@ pub(crate) enum QuotaTargetFocus {
     Unit,
 }
 
+/// Request to open files in an external application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExternalOpenRequest {
+    /// Open in $VISUAL or $EDITOR (suspends TUI, waits for exit, then rescans).
+    Editor(Vec<PathBuf>),
+    /// Open with system viewer (fire-and-forget, no TUI interruption).
+    SystemViewer(Vec<PathBuf>),
+}
+
 /// State for an in-progress quota target edit.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingQuotaTarget {
@@ -284,6 +293,10 @@ pub struct App {
     /// This allows mouse scrolling to move the viewport independently of
     /// the cursor position.
     pub(crate) ensure_cursor_visible: bool,
+
+    /// Pending request to open files in an external application.
+    /// Set by input handler, consumed by main loop.
+    pub(crate) external_open_request: Option<ExternalOpenRequest>,
 }
 
 impl App {
@@ -512,6 +525,31 @@ impl TerminalManager {
     fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
         &mut self.terminal
     }
+
+    /// Temporarily suspend the TUI to allow an external program to use the terminal.
+    ///
+    /// Returns the terminal to normal mode (disables raw mode, leaves alternate screen,
+    /// disables mouse capture). Call `restore()` after the external program exits.
+    fn suspend() -> io::Result<()> {
+        disable_raw_mode()?;
+        io::stdout()
+            .execute(LeaveAlternateScreen)?
+            .execute(DisableMouseCapture)?;
+        Ok(())
+    }
+
+    /// Restore the TUI after suspending for an external program.
+    ///
+    /// Re-enables raw mode, enters alternate screen, enables mouse capture,
+    /// and clears the given terminal for a fresh redraw.
+    fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+        enable_raw_mode()?;
+        io::stdout()
+            .execute(EnterAlternateScreen)?
+            .execute(EnableMouseCapture)?;
+        terminal.clear()?;
+        Ok(())
+    }
 }
 
 impl Drop for TerminalManager {
@@ -624,6 +662,7 @@ impl App {
             search_query: None,
             search_input_active: false,
             ensure_cursor_visible: false,
+            external_open_request: None,
         }
     }
 
@@ -750,6 +789,9 @@ impl App {
                 }));
             }
 
+            // Handle external open requests (editor or system viewer)
+            self.handle_external_open_request(&mut terminal_manager);
+
             // Use select! to handle events and scan completion concurrently
             tokio::select! {
                 // Handle keyboard/mouse events
@@ -867,6 +909,86 @@ impl App {
                 // Ignore other mouse events (clicks, drags, etc.)
             }
         }
+    }
+
+    /// Run an editor on the given paths, suspending the TUI while the editor runs.
+    ///
+    /// Checks `$VISUAL` first, then `$EDITOR`, then falls back to `vi`.
+    /// Handle a pending external open request (editor or system viewer).
+    ///
+    /// Consumes the request from `self.external_open_request` and executes it.
+    fn handle_external_open_request(&mut self, terminal_manager: &mut TerminalManager) {
+        let Some(request) = self.external_open_request.take() else {
+            return;
+        };
+
+        match request {
+            ExternalOpenRequest::Editor(paths) => {
+                // Suspend TUI, run editor, restore TUI, trigger rescan
+                if let Err(e) = Self::run_editor(terminal_manager, &paths) {
+                    self.status_message = Some(format!("Editor failed: {e}"));
+                    self.status_message_time = Some(std::time::Instant::now());
+                } else {
+                    // Trigger rescan to pick up any mtime changes
+                    self.scan_requested = true;
+                }
+            }
+            ExternalOpenRequest::SystemViewer(paths) => {
+                // Fire-and-forget, no TUI interruption
+                if let Err(e) = Self::open_with_system_viewer(&paths) {
+                    self.status_message = Some(format!("Open failed: {e}"));
+                    self.status_message_time = Some(std::time::Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Run an editor on the given paths, suspending the TUI while the editor runs.
+    ///
+    /// Checks `$VISUAL` first, then `$EDITOR`, then falls back to `vi`.
+    /// Suspends the terminal, spawns the editor, waits for it to exit, then restores.
+    fn run_editor(terminal_manager: &mut TerminalManager, paths: &[PathBuf]) -> io::Result<()> {
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".to_string());
+
+        TerminalManager::suspend()?;
+
+        let status = std::process::Command::new(&editor).args(paths).status();
+
+        // Always try to restore, even if the editor failed
+        TerminalManager::restore(terminal_manager.terminal_mut())?;
+
+        match status {
+            Ok(exit_status) if exit_status.success() => Ok(()),
+            Ok(exit_status) => Err(io::Error::other(format!(
+                "Editor exited with status: {exit_status}"
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Open paths with the system default viewer (fire-and-forget).
+    ///
+    /// Uses `open` on macOS and `xdg-open` on Linux. Spawns detached processes
+    /// that don't block the TUI.
+    fn open_with_system_viewer(paths: &[PathBuf]) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        let opener = "open";
+        #[cfg(target_os = "linux")]
+        let opener = "xdg-open";
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let opener = "xdg-open"; // Best guess for other Unix-likes
+
+        for path in paths {
+            std::process::Command::new(opener)
+                .arg(path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+        }
+        Ok(())
     }
 }
 

@@ -1868,6 +1868,8 @@ Actions (on focused file or all selected files):
   r           Defer file(s) expiration (reset clock, prompt for days)
   i           Permanently ignore file(s)
   x           Approve file(s) for daemon removal
+  e           Open in $VISUAL/$EDITOR (suspends TUI)
+  o           Open with system viewer (fire-and-forget)
 
 Root Management:
   A           Add a new tracked path
