@@ -225,6 +225,9 @@ impl InputHandler {
             KeyCode::Char('v') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::toggle_visual_mode(app, config, db);
             }
+            KeyCode::Char('a') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::select_all_entries(app, config, db);
+            }
             KeyCode::Esc if app.focus_panel == FocusPanel::MainPanel => {
                 if app.is_visual_mode() {
                     app.exit_visual_mode();
@@ -272,7 +275,8 @@ impl InputHandler {
             }
 
             // Views
-            KeyCode::Char('a') => app.view = View::AuditLog,
+            KeyCode::Char('1') => app.view = View::FileList,
+            KeyCode::Char('2') => app.view = View::AuditLog,
             KeyCode::Char('?') => app.view = View::Help,
 
             // Refresh tracked paths (scan filesystem + transition expired files)
@@ -394,9 +398,25 @@ impl InputHandler {
         }
     }
 
+    /// Select all entries in the current directory.
+    fn select_all_entries(app: &mut App, config: &Config, db: &Database) {
+        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+            tracing::warn!("Cannot select all: no path selected or query failed");
+            return;
+        };
+
+        // Exit visual mode if active
+        app.exit_visual_mode();
+
+        // Add all entry IDs to selection
+        for (entry, _) in &entry_rows {
+            app.selected_entries.insert(entry.id);
+        }
+    }
+
     fn handle_audit_log(app: &mut App, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q' | 'h') | KeyCode::Esc => {
+            KeyCode::Char('q' | 'h' | '1') | KeyCode::Esc => {
                 app.view = View::FileList;
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1870,13 +1890,24 @@ mod tests {
     // ===== View Switching Tests =====
 
     #[test]
-    fn a_switches_to_audit_log_view() {
+    fn number_1_switches_to_file_list_view() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let config = test_config();
+
+        app.view = View::AuditLog;
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('1')));
+        assert_eq!(app.view, View::FileList);
+    }
+
+    #[test]
+    fn number_2_switches_to_audit_log_view() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let config = test_config();
 
         assert_eq!(app.view, View::FileList);
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('a')));
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('2')));
         assert_eq!(app.view, View::AuditLog);
     }
 
@@ -3228,5 +3259,43 @@ mod tests {
 
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
         assert!(!app.is_visual_mode());
+    }
+
+    #[test]
+    fn a_selects_all_entries_in_current_directory() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_path = PathBuf::from("/test/visual");
+
+        assert!(app.selected_entries.is_empty());
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('a')));
+
+        let ids = visual_entry_ids(&db, &config);
+        assert_eq!(app.selected_entries.len(), ids.len());
+        for id in &ids {
+            assert!(app.selected_entries.contains(id));
+        }
+    }
+
+    #[test]
+    fn a_in_sidebar_does_nothing() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
+        setup_visual_files(&db);
+
+        let mut app = App::new();
+        app.focus_panel = FocusPanel::Sidebar;
+
+        assert!(app.selected_entries.is_empty());
+
+        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('a')));
+
+        // Should remain empty since we're in sidebar
+        assert!(app.selected_entries.is_empty());
     }
 }

@@ -1852,30 +1852,39 @@ Navigation:
   G           Jump to bottom of focused panel
   Tab         Switch focus between sidebar and main panel
   h           Switch focus to sidebar (shows sidebar if hidden)
-  l           Switch focus to main panel
+  l           Switch focus to main panel / enter directory
   B           Toggle sidebar visibility
-  
+  /           Search entries (Enter to confirm, Esc to cancel)
+  n / N       Jump to next / previous search match
+
 Selection (main panel only):
   Space       Toggle selection on current file and advance cursor
   v           Enter/exit visual mode (range select from anchor)
+  a           Select all entries in current directory
   Esc         Exit visual mode / clear search / clear selection
 
-Actions (main panel only - on focused file or all selected files):
+Actions (on focused file or all selected files):
   d           Delete file(s) with confirmation
   r           Defer file(s) expiration (reset clock, prompt for days)
   i           Permanently ignore file(s)
   x           Approve file(s) for daemon removal
 
+Root Management:
+  A           Add a new tracked path
+  X           Remove selected root (sidebar only)
+  t           Set quota target for current root
+
 Views:
-  a           Show audit log
+  1           Main dashboard (file list)
+  2           Audit log
   ?           Show this help screen
-  
+
 Sorting:
   s           Cycle sort mode (Expiration → Size → Name → Modified)
-  
+
 Other:
-  R           Refresh tracked paths
-  q           Quit application
+  R           Refresh tracked paths (rescan filesystem)
+  q           Quit application (or return from audit log)
   Ctrl+C      Quit application
 
 Press any key to close this help screen";
