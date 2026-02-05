@@ -481,16 +481,61 @@ impl App {
         }
     }
 
+    /// Sync the main panel to show the currently selected sidebar root.
+    ///
+    /// Looks up the root at `sidebar_selected_index` and updates `current_path`
+    /// and `current_root_id` to match. This ensures the main panel immediately
+    /// reflects sidebar navigation rather than requiring an explicit "enter".
+    pub(crate) fn sync_to_sidebar_selection(&mut self, db: &crate::db::Database) {
+        let Ok(roots) = db.list_roots() else {
+            return;
+        };
+        let Some(root) = roots.get(self.sidebar_selected_index) else {
+            return;
+        };
+        self.navigate_into(root.path.clone());
+        self.current_root_id = Some(root.id);
+    }
+
     /// Navigate up to the parent directory.
     ///
     /// If already at a root level, this is a no-op.
     /// Clears any active search since results are directory-specific.
-    pub(crate) fn navigate_up(&mut self) {
-        if let Some(parent) = self.current_path.parent() {
-            self.current_path = parent.to_path_buf();
+    /// Attempts to restore cursor position to the directory we came from.
+    pub(crate) fn navigate_up(&mut self, config: &crate::config::Config, db: &crate::db::Database) {
+        let Some(parent) = self.current_path.parent() else {
+            return;
+        };
+
+        // Remember the directory we're leaving so we can restore cursor to it
+        let leaving_path = self.current_path.clone();
+
+        self.current_path = parent.to_path_buf();
+        self.ensure_cursor_visible = true;
+        self.clear_search();
+
+        // Try to find the directory we came from in the parent's entry list
+        // and set the cursor to it (instead of defaulting to index 0)
+        if let Ok(entries) = db.list_entries_by_parent(&self.current_path) {
+            let mut rows: Vec<_> = entries
+                .into_iter()
+                .map(|entry| {
+                    let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                        crate::scanner::calculate_expiration(cs, config.expiration_days)
+                    });
+                    (entry, days_remaining)
+                })
+                .collect();
+            crate::tui::ui::sort_entry_rows(&mut rows, self.sort_mode);
+
+            // Find the index of the directory we just left
+            if let Some(idx) = rows.iter().position(|(e, _)| e.path == leaving_path) {
+                self.entry_selected_index = idx;
+            } else {
+                self.entry_selected_index = 0;
+            }
+        } else {
             self.entry_selected_index = 0;
-            self.ensure_cursor_visible = true;
-            self.clear_search();
         }
     }
 }
@@ -1001,6 +1046,18 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn temp_database() -> (crate::db::Database, tempfile::TempDir) {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::Database::open(&db_path).expect("Failed to create test database");
+        (db, dir)
+    }
+
+    fn test_config() -> crate::config::Config {
+        crate::config::Config::default()
+    }
 
     #[test]
     fn sort_mode_default_is_expiration() {
@@ -1162,20 +1219,25 @@ mod tests {
 
     #[test]
     fn app_navigate_up_goes_to_parent() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
         let mut app = App::new();
         app.current_path = PathBuf::from("/test/path/child");
         app.entry_selected_index = 5;
-        app.navigate_up();
+        app.navigate_up(&config, &db);
         assert_eq!(app.current_path, PathBuf::from("/test/path"));
+        // With no entries in the database, cursor defaults to 0
         assert_eq!(app.entry_selected_index, 0);
     }
 
     #[test]
     fn app_navigate_up_at_root_is_noop() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
         let mut app = App::new();
         app.current_path = PathBuf::from("/");
         app.entry_selected_index = 5;
-        app.navigate_up();
+        app.navigate_up(&config, &db);
         // "/" has no parent, so navigate_up is a no-op (path and index unchanged).
         assert_eq!(app.current_path, PathBuf::from("/"));
         assert_eq!(app.entry_selected_index, 5);

@@ -715,11 +715,15 @@ fn render_expiration_timeline(
             clippy::cast_precision_loss
         )]
         let x = ((day as f64 * scale) as usize).min(marker_width.saturating_sub(1));
-        let is_overdue = day == 0;
-        let color = if is_overdue {
+
+        // Color by urgency: red for overdue, yellow for warning period, green for safe
+        let warning_days = config.warning_days as usize;
+        let color = if day == 0 {
             palette::RED
-        } else {
+        } else if day <= warning_days {
             palette::YELLOW
+        } else {
+            palette::GREEN
         };
 
         // Use dot size to indicate magnitude
@@ -1169,7 +1173,11 @@ fn render_roots_list(app: &mut App, db: &Database, frame: &mut Frame, area: rata
     // Fetch roots from database
     let Ok(roots) = db.list_roots() else {
         let error_text = Paragraph::new("Error loading roots")
-            .block(Block::default().borders(Borders::ALL).title("ROOTS"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("TRACKED DIRECTORIES"),
+            )
             .style(Style::default().fg(palette::RED));
         frame.render_widget(error_text, area);
         return;
@@ -1225,7 +1233,11 @@ fn render_roots_list(app: &mut App, db: &Database, frame: &mut Frame, area: rata
     // Empty state
     if rows.is_empty() {
         let empty_text = Paragraph::new("No tracked paths.\n\nRun 'stagecrew add PATH'")
-            .block(Block::default().borders(Borders::ALL).title("ROOTS"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("TRACKED DIRECTORIES"),
+            )
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty_text, area);
         return;
@@ -1233,7 +1245,7 @@ fn render_roots_list(app: &mut App, db: &Database, frame: &mut Frame, area: rata
 
     let table = Table::new(rows, [Constraint::Percentage(100)]).block(
         Block::default()
-            .title("ROOTS")
+            .title("TRACKED DIRECTORIES")
             .borders(Borders::ALL)
             .border_style(if app.focus_panel() == FocusPanel::Sidebar {
                 Style::default().fg(palette::CYAN)
@@ -2126,7 +2138,6 @@ fn context_hints(app: &App) -> (Vec<Hint>, Vec<Hint>) {
                         ("Space", "Select"),
                         ("g/G", "Top/Bottom"),
                         ("s", "Sort"),
-                        ("a", "Audit"),
                     ],
                     FocusPanel::MainPanel => vec![
                         ("j/k", "Navigate"),
@@ -2138,7 +2149,7 @@ fn context_hints(app: &App) -> (Vec<Hint>, Vec<Hint>) {
                         ("Space", "Select"),
                         ("v", "Visual"),
                         ("s", "Sort"),
-                        ("a", "Audit"),
+                        ("a", "All"),
                     ],
                 }
             }

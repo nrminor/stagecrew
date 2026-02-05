@@ -152,7 +152,7 @@ impl InputHandler {
                 }
             }
             KeyCode::Char('h') => {
-                Self::handle_h_navigation(app, db);
+                Self::handle_h_navigation(app, config, db);
             }
             KeyCode::Char('l') => {
                 Self::handle_l_navigation(app, config, db);
@@ -163,9 +163,18 @@ impl InputHandler {
                 match app.focus_panel {
                     FocusPanel::Sidebar => {
                         app.sidebar_selected_index = app.sidebar_selected_index.saturating_add(1);
+                        if app.sidebar_len > 0 {
+                            app.sidebar_selected_index =
+                                app.sidebar_selected_index.min(app.sidebar_len - 1);
+                        }
+                        app.sync_to_sidebar_selection(db);
                     }
                     FocusPanel::MainPanel => {
                         app.entry_selected_index = app.entry_selected_index.saturating_add(1);
+                        if app.entry_list_len > 0 {
+                            app.entry_selected_index =
+                                app.entry_selected_index.min(app.entry_list_len - 1);
+                        }
                         Self::update_visual_selection(app, config, db);
                     }
                 }
@@ -175,6 +184,7 @@ impl InputHandler {
                 match app.focus_panel {
                     FocusPanel::Sidebar => {
                         app.sidebar_selected_index = app.sidebar_selected_index.saturating_sub(1);
+                        app.sync_to_sidebar_selection(db);
                     }
                     FocusPanel::MainPanel => {
                         app.entry_selected_index = app.entry_selected_index.saturating_sub(1);
@@ -458,7 +468,7 @@ impl InputHandler {
     /// - Main panel, inside a subdirectory: navigate up to parent
     /// - Main panel, at root level: return focus to sidebar
     /// - Sidebar: no-op
-    fn handle_h_navigation(app: &mut App, db: &Database) {
+    fn handle_h_navigation(app: &mut App, config: &Config, db: &Database) {
         match app.focus_panel {
             FocusPanel::Sidebar => {}
             FocusPanel::MainPanel => {
@@ -469,7 +479,7 @@ impl InputHandler {
                         app.sidebar_visible = true;
                         app.focus_panel = FocusPanel::Sidebar;
                     } else {
-                        app.navigate_up();
+                        app.navigate_up(config, db);
                     }
                 }
             }
@@ -2963,12 +2973,14 @@ mod tests {
 
     #[test]
     fn navigate_up_clears_search() {
+        let (db, _dir) = temp_database();
+        let config = test_config();
         let mut app = App::new();
         app.current_path = PathBuf::from("/some/path/child");
         app.search_query = Some("test".to_string());
         app.search_input_active = false;
 
-        app.navigate_up();
+        app.navigate_up(&config, &db);
 
         assert_eq!(app.search_query, None, "Navigation up should clear search");
     }
