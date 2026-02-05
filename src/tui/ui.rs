@@ -1,5 +1,7 @@
 //! Widget rendering for the TUI.
 
+use std::sync::OnceLock;
+
 use ratatui::Frame;
 use ratatui::layout::Margin;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -18,6 +20,106 @@ use crate::removal::RemovalMethod;
 use crate::scanner::calculate_expiration;
 
 use super::{App, FocusPanel, PendingQuotaTarget, QuotaTargetFocus, SortMode, View};
+
+/// Semantic color palette for consistent styling across the TUI.
+/// Using RGB values ensures colors look the same regardless of terminal theme,
+/// and enables smooth gradient interpolation for the row fade effect.
+mod palette {
+    use ratatui::style::Color;
+
+    /// Safe/healthy state - files with plenty of time remaining
+    /// Uses Terminal.app's green for a mellower appearance than pure bright green
+    pub const GREEN: Color = Color::Rgb(0, 166, 0);
+    /// Warning state - files approaching expiration
+    pub const YELLOW: Color = Color::Rgb(220, 200, 0);
+    /// Danger/overdue state - files past expiration or pending removal
+    pub const RED: Color = Color::Rgb(220, 80, 80);
+    /// Deferred state - files with extended deadline
+    pub const CYAN: Color = Color::Rgb(0, 200, 200);
+}
+
+/// Pre-computed gradient for row fading effect.
+/// Contains 101 colors (indices 0-100) from full brightness to fully faded.
+/// Index 0 = cursor row (full brightness), index 100 = maximally faded.
+struct FadeGradient {
+    text: [Color; 101],
+    green: [Color; 101],
+    yellow: [Color; 101],
+    red: [Color; 101],
+    cyan: [Color; 101],
+    gray: [Color; 101],
+}
+
+impl FadeGradient {
+    /// Create a new gradient set for row fading.
+    /// All gradients fade toward a muted gray endpoint.
+    fn new() -> Self {
+        // Endpoint for all fades - a medium gray for subtle dimming effect
+        // Higher values = less contrast = subtler fade
+        let fade_end = (100, 100, 100);
+
+        // RGB values must match palette constants
+        let green_rgb = (0, 166, 0);
+        let yellow_rgb = (220, 200, 0);
+        let red_rgb = (220, 80, 80);
+        let cyan_rgb = (0, 200, 200);
+
+        Self {
+            text: Self::generate((220, 220, 220), fade_end),
+            green: Self::generate(green_rgb, fade_end),
+            yellow: Self::generate(yellow_rgb, fade_end),
+            red: Self::generate(red_rgb, fade_end),
+            cyan: Self::generate(cyan_rgb, fade_end),
+            gray: Self::generate((128, 128, 128), fade_end),
+        }
+    }
+
+    /// Generate a 101-color gradient via linear RGB interpolation.
+    fn generate(start: (u8, u8, u8), end: (u8, u8, u8)) -> [Color; 101] {
+        let mut gradient = [Color::Reset; 101];
+        for (i, slot) in gradient.iter_mut().enumerate() {
+            let r = Self::lerp_channel(start.0, end.0, i);
+            let g = Self::lerp_channel(start.1, end.1, i);
+            let b = Self::lerp_channel(start.2, end.2, i);
+            *slot = Color::Rgb(r, g, b);
+        }
+        gradient
+    }
+
+    /// Linear interpolation for a single color channel.
+    /// `t` is the step index (0-100), representing t/100 of the way from start to end.
+    #[allow(clippy::cast_possible_truncation)]
+    // Allow: t is clamped to 0-100 before cast, and result is mathematically
+    // bounded to 0-255 (interpolation between two u8 values).
+    fn lerp_channel(start: u8, end: u8, t: usize) -> u8 {
+        let start_16 = u16::from(start);
+        let end_16 = u16::from(end);
+        let t_16 = t.min(100) as u16;
+
+        let result = if end_16 >= start_16 {
+            start_16 + (end_16 - start_16) * t_16 / 100
+        } else {
+            start_16 - (start_16 - end_16) * t_16 / 100
+        };
+
+        result as u8
+    }
+
+    /// Get the fade percentage for a row based on distance from cursor.
+    /// Returns 0 for cursor row, up to 100 for rows at the edge of visibility.
+    fn fade_percent(row_idx: usize, cursor_idx: usize, visible_rows: usize) -> usize {
+        if visible_rows == 0 {
+            return 0;
+        }
+        let distance = row_idx.abs_diff(cursor_idx);
+        (distance * 100 / visible_rows.max(1)).min(100)
+    }
+}
+
+fn fade_gradient() -> &'static FadeGradient {
+    static GRADIENT: OnceLock<FadeGradient> = OnceLock::new();
+    GRADIENT.get_or_init(FadeGradient::new)
+}
 
 /// Render the current application state to the terminal.
 ///
@@ -307,7 +409,7 @@ fn render_lifecycle_widget(
 
     // Get entries for this root
     let Ok(entries) = db.list_entries_by_root(root_id) else {
-        let msg = Paragraph::new("Error loading entries").style(Style::default().fg(Color::Red));
+        let msg = Paragraph::new("Error loading entries").style(Style::default().fg(palette::RED));
         frame.render_widget(msg, inner);
         return;
     };
@@ -341,34 +443,34 @@ fn render_lifecycle_widget(
         BarSegment {
             value: view.healthy.files,
             label: view.healthy.files.to_string(),
-            color: Color::Green,
+            color: palette::GREEN,
         },
         BarSegment {
             value: view.warning.files,
             label: view.warning.files.to_string(),
-            color: Color::Yellow,
+            color: palette::YELLOW,
         },
         BarSegment {
             value: view.overdue.files,
             label: view.overdue.files.to_string(),
-            color: Color::Red,
+            color: palette::RED,
         },
     ];
     let bytes_segments = [
         BarSegment {
             value: view.healthy.bytes,
             label: format_bytes(view.healthy.bytes),
-            color: Color::Green,
+            color: palette::GREEN,
         },
         BarSegment {
             value: view.warning.bytes,
             label: format_bytes(view.warning.bytes),
-            color: Color::Yellow,
+            color: palette::YELLOW,
         },
         BarSegment {
             value: view.overdue.bytes,
             label: format_bytes(view.overdue.bytes),
-            color: Color::Red,
+            color: palette::RED,
         },
     ];
 
@@ -416,7 +518,7 @@ fn render_expiration_timeline(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("EXPIRATION TIMELINE");
+        .title("REMOVAL TIMELINE");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -430,7 +532,7 @@ fn render_expiration_timeline(
 
     // Get entries for this root
     let Ok(entries) = db.list_entries_by_root(root_id) else {
-        let msg = Paragraph::new("Error loading entries").style(Style::default().fg(Color::Red));
+        let msg = Paragraph::new("Error loading entries").style(Style::default().fg(palette::RED));
         frame.render_widget(msg, inner);
         return;
     };
@@ -615,9 +717,9 @@ fn render_expiration_timeline(
         let x = ((day as f64 * scale) as usize).min(marker_width.saturating_sub(1));
         let is_overdue = day == 0;
         let color = if is_overdue {
-            Color::Red
+            palette::RED
         } else {
-            Color::Yellow
+            palette::YELLOW
         };
 
         // Use dot size to indicate magnitude
@@ -710,7 +812,7 @@ fn render_quota_widget(
     let Ok(roots) = db.list_roots() else {
         let msg = Paragraph::new("Error")
             .alignment(ratatui::layout::Alignment::Center)
-            .style(Style::default().fg(Color::Red));
+            .style(Style::default().fg(palette::RED));
         frame.render_widget(msg, inner);
         return;
     };
@@ -718,7 +820,7 @@ fn render_quota_widget(
     let Some(root) = roots.iter().find(|r| r.id == root_id) else {
         let msg = Paragraph::new("Not found")
             .alignment(ratatui::layout::Alignment::Center)
-            .style(Style::default().fg(Color::Red));
+            .style(Style::default().fg(palette::RED));
         frame.render_widget(msg, inner);
         return;
     };
@@ -802,7 +904,7 @@ fn render_quota_widget(
 
     // Text color: red if over quota, otherwise white
     let text_color = if used_bytes > target_bytes {
-        Color::Red
+        palette::RED
     } else {
         Color::White
     };
@@ -851,8 +953,8 @@ fn render_quota_widget(
         // Over quota: show solid red. We use 99.99% + 0.01% because tui-piechart
         // doesn't render single-slice charts correctly (shows as a thin line).
         vec![
-            tui_piechart::PieSlice::new("", 99.99, Color::Red),
-            tui_piechart::PieSlice::new("", 0.01, Color::Red),
+            tui_piechart::PieSlice::new("", 99.99, palette::RED),
+            tui_piechart::PieSlice::new("", 0.01, palette::RED),
         ]
     } else {
         // Under quota: show healthy (green), warning (yellow), overdue (red), remaining (gray)
@@ -869,13 +971,17 @@ fn render_quota_widget(
 
         let mut slices = Vec::new();
         if healthy_pct > 0.0 {
-            slices.push(tui_piechart::PieSlice::new("", healthy_pct, Color::Green));
+            slices.push(tui_piechart::PieSlice::new("", healthy_pct, palette::GREEN));
         }
         if warning_pct > 0.0 {
-            slices.push(tui_piechart::PieSlice::new("", warning_pct, Color::Yellow));
+            slices.push(tui_piechart::PieSlice::new(
+                "",
+                warning_pct,
+                palette::YELLOW,
+            ));
         }
         if overdue_pct > 0.0 {
-            slices.push(tui_piechart::PieSlice::new("", overdue_pct, Color::Red));
+            slices.push(tui_piechart::PieSlice::new("", overdue_pct, palette::RED));
         }
         if remaining_pct > 0.0 {
             slices.push(tui_piechart::PieSlice::new(
@@ -1064,7 +1170,7 @@ fn render_roots_list(app: &mut App, db: &Database, frame: &mut Frame, area: rata
     let Ok(roots) = db.list_roots() else {
         let error_text = Paragraph::new("Error loading roots")
             .block(Block::default().borders(Borders::ALL).title("ROOTS"))
-            .style(Style::default().fg(Color::Red));
+            .style(Style::default().fg(palette::RED));
         frame.render_widget(error_text, area);
         return;
     };
@@ -1104,7 +1210,7 @@ fn render_roots_list(app: &mut App, db: &Database, frame: &mut Frame, area: rata
                 if app.focus_panel() == FocusPanel::Sidebar {
                     Style::default()
                         .add_modifier(Modifier::REVERSED)
-                        .fg(Color::Cyan)
+                        .fg(palette::CYAN)
                 } else {
                     Style::default().add_modifier(Modifier::REVERSED)
                 }
@@ -1130,7 +1236,7 @@ fn render_roots_list(app: &mut App, db: &Database, frame: &mut Frame, area: rata
             .title("ROOTS")
             .borders(Borders::ALL)
             .border_style(if app.focus_panel() == FocusPanel::Sidebar {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(palette::CYAN)
             } else {
                 Style::default()
             }),
@@ -1168,7 +1274,7 @@ fn render_main_entry_panel(
     let Ok(entries) = db.list_entries_by_parent(current_path) else {
         let error_text = Paragraph::new("Error loading entries from database")
             .block(Block::default().borders(Borders::ALL).title("ENTRIES"))
-            .style(Style::default().fg(Color::Red));
+            .style(Style::default().fg(palette::RED));
         frame.render_widget(error_text, area);
         return;
     };
@@ -1219,11 +1325,20 @@ fn render_main_entry_panel(
         })
         .unwrap_or_default();
 
+    // Calculate viewport height for gradient fade effect
+    // This determines how aggressively rows fade based on distance from cursor
+    let viewport_height = area.height.saturating_sub(4) as usize; // borders + header + margin
+    let gradient = fade_gradient();
+
     // Build entry table rows
     let rows: Vec<Row> = entry_rows
         .iter()
         .enumerate()
         .map(|(idx, (entry, days_remaining))| {
+            // Calculate fade percentage based on distance from cursor
+            // Cursor row = 0% fade (full brightness), edge rows = up to 100% fade
+            let fade_pct = FadeGradient::fade_percent(idx, selected_idx, viewport_height);
+
             // Visual indicator showing attention status
             let (indicator_symbol, indicator_color) = expiration_indicator_entry(
                 &entry.status,
@@ -1287,44 +1402,67 @@ fn render_main_entry_panel(
             let is_cursor = idx == selected_idx && app.focus_panel() == FocusPanel::MainPanel;
             let uses_reversed = is_cursor; // REVERSED swaps fg/bg, breaking cell colors
 
-            // Build cells with conditional styling
-            // When row uses REVERSED, skip cell colors to avoid artifacts
+            // Build cells with gradient-faded colors based on distance from cursor
+            // Cursor row and selected rows don't fade; other rows fade progressively
+            let should_fade = !is_cursor && !is_selected;
+
             let filename_cell = if uses_reversed {
                 Cell::from(display_name)
             } else if entry.status == "ignored" {
-                Cell::from(display_name).style(Style::default().fg(Color::DarkGray))
+                let color = if should_fade {
+                    gradient.gray[fade_pct]
+                } else {
+                    Color::DarkGray
+                };
+                Cell::from(display_name).style(Style::default().fg(color))
             } else {
-                Cell::from(display_name)
+                let color = if should_fade {
+                    gradient.text[fade_pct]
+                } else {
+                    Color::Reset // Default terminal color for cursor/selected
+                };
+                Cell::from(display_name).style(Style::default().fg(color))
             };
 
             let size_cell = if uses_reversed {
                 Cell::from(size_str)
             } else {
-                Cell::from(size_str).style(Style::default().fg(Color::DarkGray))
+                let color = if should_fade {
+                    gradient.gray[fade_pct]
+                } else {
+                    Color::DarkGray
+                };
+                Cell::from(size_str).style(Style::default().fg(color))
             };
 
             // Due column is color-coded to match the sidebar stats visual language
             // Colors encode both urgency (days remaining) and special states
-            let due_style = match entry.status.as_str() {
-                "ignored" => Style::default().fg(Color::DarkGray),
-                "pending" | "approved" => Style::default().fg(Color::Red),
-                "deferred" => Style::default().fg(Color::Cyan),
-                _ => {
-                    // For tracked entries, color by urgency
-                    if effective_days <= 0 {
-                        Style::default().fg(Color::Red) // Overdue
-                    } else if effective_days <= i64::from(config.warning_days) {
-                        Style::default().fg(Color::Yellow) // Warning period
-                    } else {
-                        Style::default().fg(Color::Green) // Safe
+            // The gradient fades each color toward dark gray
+            let due_color = if uses_reversed {
+                Color::Reset
+            } else {
+                let base_gradient = match entry.status.as_str() {
+                    "ignored" => &gradient.gray,
+                    "pending" | "approved" => &gradient.red,
+                    "deferred" => &gradient.cyan,
+                    _ => {
+                        // For tracked entries, color by urgency
+                        if effective_days <= 0 {
+                            &gradient.red // Overdue
+                        } else if effective_days <= i64::from(config.warning_days) {
+                            &gradient.yellow // Warning period
+                        } else {
+                            &gradient.green // Safe
+                        }
                     }
+                };
+                if should_fade {
+                    base_gradient[fade_pct]
+                } else {
+                    base_gradient[0] // Full brightness for cursor/selected
                 }
             };
-            let due_cell = if uses_reversed {
-                Cell::from(due_str)
-            } else {
-                Cell::from(due_str).style(due_style)
-            };
+            let due_cell = Cell::from(due_str).style(Style::default().fg(due_color));
 
             // Row-level styling for selection and cursor
             let mut row_style = if is_selected && is_cursor {
@@ -1396,7 +1534,7 @@ fn render_main_entry_panel(
                 ))
                 .borders(Borders::ALL)
                 .border_style(if app.focus_panel() == FocusPanel::MainPanel {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(palette::CYAN)
                 } else {
                     Style::default()
                 }),
@@ -1583,9 +1721,9 @@ fn expiration_indicator_entry(
     };
 
     if effective_days <= 0 {
-        ("●", Color::Red) // Overdue - filled circle
+        ("●", palette::RED) // Overdue - filled circle
     } else if effective_days <= i64::from(warning_days) {
-        ("⚠", Color::Yellow) // Warning - warning triangle
+        ("⚠", palette::YELLOW) // Warning - warning triangle
     } else {
         (" ", Color::Reset) // Safe - no indicator needed
     }
@@ -1668,7 +1806,7 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
         // Error handling: show error message
         let error_text = Paragraph::new("Error loading audit log from database")
             .block(Block::default().borders(Borders::ALL).title("Error"))
-            .style(Style::default().fg(Color::Red));
+            .style(Style::default().fg(palette::RED));
         frame.render_widget(error_text, area);
         return;
     };
@@ -1823,7 +1961,7 @@ fn render_help(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let block = Block::default()
         .title("Stagecrew - Keybinding Reference")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette::CYAN))
         .style(Style::default());
 
     let help_text = r"File-Centric Workflow:
@@ -2031,7 +2169,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
             " VISUAL ",
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Green)
+                .bg(palette::GREEN)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
@@ -2123,7 +2261,7 @@ fn render_confirmation_modal(frame: &mut Frame, path: &str) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(palette::YELLOW)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2186,7 +2324,7 @@ fn render_deferral_modal(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(palette::CYAN)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2228,7 +2366,7 @@ fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool, method
                 "Move File to Trash"
             },
             "Move to trash",
-            Color::Yellow,
+            palette::YELLOW,
         ),
         RemovalMethod::PermanentDelete => (
             if is_dir {
@@ -2237,7 +2375,7 @@ fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool, method
                 "Permanently Delete File"
             },
             "Permanently delete",
-            Color::Red,
+            palette::RED,
         ),
     };
     let message = format!("{action_verb} {type_name}:\n\n{path}\n\n(y/n)");
@@ -2280,12 +2418,12 @@ fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize, method: Remo
         RemovalMethod::Trash => (
             format!("Move {count} Entries to Trash"),
             format!("Move {count} entries to trash?\n\n(y/n)"),
-            Color::Yellow,
+            palette::YELLOW,
         ),
         RemovalMethod::PermanentDelete => (
             format!("Permanently Delete {count} Entries"),
             format!("Permanently delete {count} entries?\n\n(y/n)"),
-            Color::Red,
+            palette::RED,
         ),
     };
 
@@ -2334,7 +2472,7 @@ fn render_ignore_modal(frame: &mut Frame, path: &str) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(palette::CYAN)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2369,7 +2507,7 @@ fn render_ignore_modal_multi(frame: &mut Frame, count: usize) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(palette::CYAN)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2404,7 +2542,7 @@ fn render_confirmation_modal_multi(frame: &mut Frame, count: usize) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(palette::YELLOW)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2446,7 +2584,7 @@ fn render_add_path_modal(frame: &mut Frame, input: &str) {
             Block::default()
                 .title("Add Tracked Path")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(Style::default().fg(palette::GREEN)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2484,7 +2622,7 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
             Block::default()
                 .title("Remove Tracked Path")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
+                .border_style(Style::default().fg(palette::RED)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2555,14 +2693,14 @@ fn render_quota_target_modal(frame: &mut Frame, target: &PendingQuotaTarget) {
     let (size_style, unit_style) = match target.focus {
         QuotaTargetFocus::Size => (
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette::CYAN)
                 .add_modifier(Modifier::BOLD),
             Style::default().fg(Color::White),
         ),
         QuotaTargetFocus::Unit => (
             Style::default().fg(Color::White),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette::CYAN)
                 .add_modifier(Modifier::BOLD),
         ),
     };
@@ -2589,7 +2727,7 @@ fn render_quota_target_modal(frame: &mut Frame, target: &PendingQuotaTarget) {
             Block::default()
                 .title("Set Quota Target")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(palette::CYAN)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2887,11 +3025,11 @@ mod tests {
         let entry = make_test_entry("tracked", None);
         let (symbol, color) = expiration_indicator_entry("tracked", 0, 14, &entry);
         assert_eq!(symbol, "●", "Overdue (0 days) should show filled circle");
-        assert_eq!(color, Color::Red, "Overdue should be red");
+        assert_eq!(color, palette::RED, "Overdue should be red");
 
         let (symbol, color) = expiration_indicator_entry("tracked", -5, 14, &entry);
         assert_eq!(symbol, "●", "Negative days should show filled circle");
-        assert_eq!(color, Color::Red, "Overdue should be red");
+        assert_eq!(color, palette::RED, "Overdue should be red");
     }
 
     #[test]
@@ -2899,11 +3037,11 @@ mod tests {
         let entry = make_test_entry("tracked", None);
         let (symbol, color) = expiration_indicator_entry("tracked", 1, 14, &entry);
         assert_eq!(symbol, "⚠", "1 day remaining should show warning triangle");
-        assert_eq!(color, Color::Yellow, "Warning should be yellow");
+        assert_eq!(color, palette::YELLOW, "Warning should be yellow");
 
         let (symbol, color) = expiration_indicator_entry("tracked", 14, 14, &entry);
         assert_eq!(symbol, "⚠", "At warning threshold should show warning");
-        assert_eq!(color, Color::Yellow, "Warning should be yellow");
+        assert_eq!(color, palette::YELLOW, "Warning should be yellow");
     }
 
     #[test]
@@ -2948,6 +3086,6 @@ mod tests {
         let entry = make_test_entry("deferred", Some(soon));
         let (symbol, color) = expiration_indicator_entry("deferred", -100, 14, &entry);
         assert_eq!(symbol, "⚠", "Deferred expiring soon should show warning");
-        assert_eq!(color, Color::Yellow);
+        assert_eq!(color, palette::YELLOW);
     }
 }
