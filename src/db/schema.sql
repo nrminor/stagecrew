@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS roots (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,
     added_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    last_scanned INTEGER
+    last_scanned INTEGER,
+    target_bytes INTEGER
 );
 
 -- Unified entries table (files and directories discovered during scan)

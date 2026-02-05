@@ -50,6 +50,100 @@ pub(crate) struct PendingDeferral {
     pub default_days: u32,
 }
 
+/// Byte unit for quota target input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ByteUnit {
+    MB,
+    #[default]
+    GB,
+    TB,
+}
+
+impl ByteUnit {
+    /// Convert a value in this unit to bytes.
+    ///
+    /// Returns the byte count as `i64` for `SQLite` compatibility. Values that
+    /// would overflow `i64::MAX` are clamped.
+    pub fn to_bytes(self, value: u64) -> i64 {
+        let multiplier: u64 = match self {
+            Self::MB => 1_000_000,
+            Self::GB => 1_000_000_000,
+            Self::TB => 1_000_000_000_000,
+        };
+        // Saturating multiply, then clamp to i64 range
+        let bytes = value.saturating_mul(multiplier);
+        // i64::MAX as u64 is safe because i64::MAX is positive
+        #[allow(clippy::cast_sign_loss)]
+        let max_i64 = i64::MAX as u64;
+        if bytes > max_i64 {
+            i64::MAX
+        } else {
+            // Safe: we just checked bytes <= i64::MAX
+            #[allow(clippy::cast_possible_wrap)]
+            let result = bytes as i64;
+            result
+        }
+    }
+
+    /// Cycle to the next unit.
+    pub fn next(self) -> Self {
+        match self {
+            Self::MB => Self::GB,
+            Self::GB => Self::TB,
+            Self::TB => Self::MB,
+        }
+    }
+
+    /// Cycle to the previous unit.
+    pub fn prev(self) -> Self {
+        match self {
+            Self::MB => Self::TB,
+            Self::GB => Self::MB,
+            Self::TB => Self::GB,
+        }
+    }
+}
+
+impl std::fmt::Display for ByteUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MB => write!(f, "MB"),
+            Self::GB => write!(f, "GB"),
+            Self::TB => write!(f, "TB"),
+        }
+    }
+}
+
+/// Which field is focused in the quota target dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum QuotaTargetFocus {
+    #[default]
+    Size,
+    Unit,
+}
+
+/// State for an in-progress quota target edit.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingQuotaTarget {
+    /// The root being edited.
+    pub root_id: i64,
+
+    /// The root's path (for display).
+    pub root_path: PathBuf,
+
+    /// Accumulated input buffer for the size value.
+    pub input: String,
+
+    /// Selected byte unit.
+    pub unit: ByteUnit,
+
+    /// Which field is currently focused.
+    pub focus: QuotaTargetFocus,
+
+    /// Current target value in bytes (if any), for display.
+    pub current_target: Option<i64>,
+}
+
 /// Main TUI application state.
 // Allow: The bools represent independent flags (quit, sidebar visibility, scan state,
 // search input) that don't naturally form a state machine. Each has distinct semantics.
@@ -125,6 +219,10 @@ pub struct App {
     /// Pending remove path confirmation state.
     /// Contains the path awaiting user confirmation for removal from config.
     pub(crate) pending_remove_path: Option<PathBuf>,
+
+    /// Pending quota target edit state.
+    /// Contains the input state for setting a root's byte quota target.
+    pub(crate) pending_quota_target: Option<PendingQuotaTarget>,
 
     /// Whether the sidebar is visible.
     pub(crate) sidebar_visible: bool,
@@ -232,6 +330,11 @@ impl App {
     /// Get the pending remove path confirmation state.
     pub fn pending_remove_path(&self) -> Option<&Path> {
         self.pending_remove_path.as_deref()
+    }
+
+    /// Get the pending quota target edit state.
+    pub fn pending_quota_target(&self) -> Option<&PendingQuotaTarget> {
+        self.pending_quota_target.as_ref()
     }
 
     /// Check if the sidebar is visible.
@@ -455,6 +558,7 @@ impl App {
             pre_visual_selection: HashSet::new(),
             pending_add_path: None,
             pending_remove_path: None,
+            pending_quota_target: None,
             sidebar_visible: true,
             scan_requested: false,
             scan_in_progress: false,

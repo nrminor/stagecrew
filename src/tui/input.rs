@@ -116,6 +116,10 @@ impl InputHandler {
             Self::handle_entry_approval_confirmation(app, config, db, key);
             return;
         }
+        if app.pending_quota_target.is_some() {
+            Self::handle_quota_target_input(app, db, key);
+            return;
+        }
 
         match key.code {
             // Quit
@@ -292,6 +296,11 @@ impl InputHandler {
             }
             KeyCode::Char('X') if app.focus_panel == FocusPanel::Sidebar => {
                 Self::initiate_remove_path(app, config, db);
+            }
+
+            // Quota target (t = set target for selected root)
+            KeyCode::Char('t') if app.focus_panel == FocusPanel::Sidebar => {
+                Self::initiate_quota_target(app, db);
             }
 
             _ => {}
@@ -1395,6 +1404,108 @@ impl InputHandler {
             _ => {
                 // Ignore other keys during confirmation
             }
+        }
+    }
+
+    /// Initiate quota target edit for the selected root.
+    fn initiate_quota_target(app: &mut App, db: &Database) {
+        let roots = match db.list_roots() {
+            Ok(roots) => roots,
+            Err(e) => {
+                tracing::warn!("Failed to query roots: {}", e);
+                return;
+            }
+        };
+
+        if let Some(root) = roots.get(app.sidebar_selected_index) {
+            app.pending_quota_target = Some(super::PendingQuotaTarget {
+                root_id: root.id,
+                root_path: root.path.clone(),
+                input: String::new(),
+                unit: super::ByteUnit::default(),
+                focus: super::QuotaTargetFocus::default(),
+                current_target: root.target_bytes,
+            });
+        } else {
+            tracing::warn!("No root selected for quota target");
+        }
+    }
+
+    /// Handle quota target input (digits, Tab, arrows, Enter, Esc).
+    fn handle_quota_target_input(app: &mut App, db: &Database, key: KeyEvent) {
+        let Some(ref mut target) = app.pending_quota_target else {
+            return;
+        };
+
+        match target.focus {
+            super::QuotaTargetFocus::Size => match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    target.input.push(c);
+                }
+                KeyCode::Backspace => {
+                    target.input.pop();
+                }
+                KeyCode::Tab => {
+                    target.focus = super::QuotaTargetFocus::Unit;
+                }
+                KeyCode::Enter => {
+                    Self::confirm_quota_target(app, db);
+                }
+                KeyCode::Esc => {
+                    app.pending_quota_target = None;
+                }
+                _ => {}
+            },
+            super::QuotaTargetFocus::Unit => match key.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    target.unit = target.unit.prev();
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    target.unit = target.unit.next();
+                }
+                KeyCode::Tab => {
+                    target.focus = super::QuotaTargetFocus::Size;
+                }
+                KeyCode::Enter => {
+                    Self::confirm_quota_target(app, db);
+                }
+                KeyCode::Esc => {
+                    app.pending_quota_target = None;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Confirm and save the quota target.
+    fn confirm_quota_target(app: &mut App, db: &Database) {
+        let Some(target) = app.pending_quota_target.take() else {
+            return;
+        };
+
+        // Empty input or 0 clears the target
+        let target_bytes = if target.input.is_empty() {
+            None
+        } else {
+            match target.input.parse::<u64>() {
+                Ok(0) => None,
+                Ok(value) => Some(target.unit.to_bytes(value)),
+                Err(_) => {
+                    tracing::warn!("Invalid quota target input: {}", target.input);
+                    return;
+                }
+            }
+        };
+
+        if let Err(e) = db.set_root_target_bytes(target.root_id, target_bytes) {
+            tracing::warn!("Failed to set quota target: {}", e);
+        } else {
+            let msg = match target_bytes {
+                Some(_) => format!("Quota target set to {} {}", target.input, target.unit),
+                None => "Quota target cleared".to_string(),
+            };
+            app.status_message = Some(msg);
+            app.status_message_time = Some(std::time::Instant::now());
         }
     }
 }

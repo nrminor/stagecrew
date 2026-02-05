@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::scanner::calculate_expiration;
 
-use super::{App, FocusPanel, SortMode, View};
+use super::{App, FocusPanel, PendingQuotaTarget, QuotaTargetFocus, SortMode, View};
 
 /// Render the current application state to the terminal.
 ///
@@ -89,6 +89,11 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
     if let Some(path) = app.pending_remove_path() {
         render_remove_path_modal(frame, &path.display().to_string());
     }
+
+    // Render quota target input modal if pending
+    if let Some(target) = app.pending_quota_target() {
+        render_quota_target_modal(frame, target);
+    }
 }
 
 /// Render the file list view with sidebar.
@@ -131,7 +136,7 @@ fn render_file_list_view(
             .split(content_area);
 
         // Render sidebar with tracked directories
-        render_sidebar(app, db, frame, h_chunks[0]);
+        render_sidebar(app, config, db, frame, h_chunks[0]);
 
         // Render main panel with entries from current path
         render_main_entry_panel(app, config, db, frame, h_chunks[1]);
@@ -201,7 +206,6 @@ impl From<&crate::db::Stats> for LifecycleView {
 ///   Row 5: Bytes lifecycle bar (left half only)
 ///   Row 6: Bottom border
 ///
-/// The right half of rows 3–5 is currently empty, reserved for future widgets.
 /// Ignored files are excluded from lifecycle bar computations.
 fn render_overview_widget(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let view = LifecycleView::from(&app.cached_stats);
@@ -230,7 +234,7 @@ fn render_overview_widget(app: &App, frame: &mut Frame, area: ratatui::layout::R
     let summary_widget = Paragraph::new(vec![summary_line, full_divider]);
     frame.render_widget(summary_widget, summary_area);
 
-    // Split bars area horizontally: left half for bars, right half reserved
+    // Split bars area horizontally: left half for bars, right half reserved for future use
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -301,6 +305,226 @@ fn render_overview_widget(app: &App, frame: &mut Frame, area: ratatui::layout::R
 
     let bars_widget = Paragraph::new(vec![files_line, bar_divider, bytes_line]);
     frame.render_widget(bars_widget, bars_left);
+}
+
+/// Render the quota target widget (pie chart with text above, or placeholder message).
+// Allow: This function handles multiple early-return cases for different states (no root,
+// error, no target) before the main rendering logic. Breaking it up would obscure the flow.
+#[allow(clippy::too_many_lines)]
+fn render_quota_widget(
+    app: &App,
+    config: &Config,
+    db: &Database,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+) {
+    // Render a bordered block for the quota widget
+    let block = Block::default().borders(Borders::ALL).title("QUOTA");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Get the current root ID
+    let Some(root_id) = app.current_root_id.get() else {
+        let msg = Paragraph::new("Select a root")
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, inner);
+        return;
+    };
+
+    // Get the root from the database to check for target
+    let Ok(roots) = db.list_roots() else {
+        let msg = Paragraph::new("Error")
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(msg, inner);
+        return;
+    };
+
+    let Some(root) = roots.iter().find(|r| r.id == root_id) else {
+        let msg = Paragraph::new("Not found")
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(msg, inner);
+        return;
+    };
+
+    let Some(target_bytes) = root.target_bytes else {
+        let msg = Paragraph::new("Press t to set")
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, inner);
+        return;
+    };
+
+    // Categorize entries by lifecycle status: healthy, warning, overdue
+    let (healthy_bytes, warning_bytes, overdue_bytes) = match db.list_entries_by_parent(&root.path)
+    {
+        Ok(entries) => {
+            let mut healthy: i64 = 0;
+            let mut warning: i64 = 0;
+            let mut overdue: i64 = 0;
+
+            for entry in entries
+                .iter()
+                .filter(|e| !e.is_dir && e.status != "removed" && e.status != "ignored")
+            {
+                // pending/approved entries are always "overdue" (require attention)
+                if entry.status == "pending" || entry.status == "approved" {
+                    overdue += entry.size_bytes;
+                    continue;
+                }
+
+                // For tracked/deferred, calculate days remaining
+                let days_remaining = if entry.status == "deferred" {
+                    entry.deferred_until.map(|until| {
+                        let now = jiff::Timestamp::now().as_second();
+                        (until - now) / 86400
+                    })
+                } else {
+                    entry
+                        .mtime
+                        .map(|m| calculate_expiration(m, config.expiration_days))
+                };
+
+                match days_remaining {
+                    Some(d) if d <= 0 => overdue += entry.size_bytes,
+                    Some(d) if d <= i64::from(config.warning_days) => warning += entry.size_bytes,
+                    // None (no mtime) or Some with days > warning_days: assume healthy
+                    _ => healthy += entry.size_bytes,
+                }
+            }
+
+            (healthy, warning, overdue)
+        }
+        Err(_) => (0, 0, 0),
+    };
+
+    let used_bytes = healthy_bytes + warning_bytes + overdue_bytes;
+
+    // Calculate values for display. Precision loss is acceptable since we only
+    // display integer percentages.
+    #[allow(clippy::cast_precision_loss)]
+    let target_f64 = target_bytes.max(1) as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let used_f64 = used_bytes.max(0) as f64;
+
+    // Split inner area: text on top (2 rows), pie chart below
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+
+    let text_area = chunks[0];
+    let chart_area = chunks[1];
+
+    // Build the text label above the chart
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pct_display = (used_f64 / target_f64 * 100.0).round() as u32;
+
+    #[allow(clippy::cast_sign_loss)]
+    let used_display = crate::format_bytes(used_bytes.max(0) as u64);
+    #[allow(clippy::cast_sign_loss)]
+    let target_display = crate::format_bytes(target_bytes.max(0) as u64);
+
+    // Text color: red if over quota, otherwise white
+    let text_color = if used_bytes > target_bytes {
+        Color::Red
+    } else {
+        Color::White
+    };
+
+    let text_content = if used_bytes > target_bytes {
+        #[allow(clippy::cast_sign_loss)]
+        let overage = crate::format_bytes((used_bytes - target_bytes).max(0) as u64);
+        vec![
+            Line::from(Span::styled(
+                format!("{pct_display}% ({overage} over)"),
+                Style::default().fg(text_color),
+            )),
+            Line::from(format!("{used_display} / {target_display}")),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                format!("{pct_display}%"),
+                Style::default().fg(text_color),
+            )),
+            Line::from(format!("{used_display} / {target_display}")),
+        ]
+    };
+
+    let text_widget = Paragraph::new(text_content)
+        .alignment(ratatui::layout::Alignment::Center)
+        .style(Style::default().fg(Color::White));
+    frame.render_widget(text_widget, text_area);
+
+    // Constrain chart area to be square (use height as the limiting dimension,
+    // accounting for braille's 2:1 aspect ratio where each cell is 2 wide x 4 tall)
+    let chart_height = chart_area.height;
+    // Each braille cell is roughly 2 chars wide for 4 dots tall, so multiply height by 2
+    let ideal_width = chart_height.saturating_mul(2);
+    let actual_width = chart_area.width.min(ideal_width);
+    let x_offset = (chart_area.width.saturating_sub(actual_width)) / 2;
+    let square_chart_area = ratatui::layout::Rect {
+        x: chart_area.x + x_offset,
+        y: chart_area.y,
+        width: actual_width,
+        height: chart_height,
+    };
+
+    // Create pie slices based on lifecycle status
+    let slices = if used_bytes > target_bytes {
+        // Over quota: show solid red. We use 99.99% + 0.01% because tui-piechart
+        // doesn't render single-slice charts correctly (shows as a thin line).
+        vec![
+            tui_piechart::PieSlice::new("", 99.99, Color::Red),
+            tui_piechart::PieSlice::new("", 0.01, Color::Red),
+        ]
+    } else {
+        // Under quota: show healthy (green), warning (yellow), overdue (red), remaining (gray)
+        let remaining_bytes = (target_bytes - used_bytes).max(0);
+
+        #[allow(clippy::cast_precision_loss)]
+        let healthy_pct = healthy_bytes.max(0) as f64 / target_f64 * 100.0;
+        #[allow(clippy::cast_precision_loss)]
+        let warning_pct = warning_bytes.max(0) as f64 / target_f64 * 100.0;
+        #[allow(clippy::cast_precision_loss)]
+        let overdue_pct = overdue_bytes.max(0) as f64 / target_f64 * 100.0;
+        #[allow(clippy::cast_precision_loss)]
+        let remaining_pct = remaining_bytes as f64 / target_f64 * 100.0;
+
+        let mut slices = Vec::new();
+        if healthy_pct > 0.0 {
+            slices.push(tui_piechart::PieSlice::new("", healthy_pct, Color::Green));
+        }
+        if warning_pct > 0.0 {
+            slices.push(tui_piechart::PieSlice::new("", warning_pct, Color::Yellow));
+        }
+        if overdue_pct > 0.0 {
+            slices.push(tui_piechart::PieSlice::new("", overdue_pct, Color::Red));
+        }
+        if remaining_pct > 0.0 {
+            slices.push(tui_piechart::PieSlice::new(
+                "",
+                remaining_pct,
+                Color::DarkGray,
+            ));
+        }
+
+        // If no slices (empty root with target), show all remaining
+        if slices.is_empty() {
+            slices.push(tui_piechart::PieSlice::new("", 100.0, Color::DarkGray));
+        }
+
+        slices
+    };
+
+    let chart = tui_piechart::PieChart::new(slices)
+        .show_legend(false)
+        .high_resolution(true);
+
+    frame.render_widget(chart, square_chart_area);
 }
 
 /// Build the summary line showing total in white, then colored lifecycle tallies.
@@ -461,8 +685,32 @@ fn proportional_widths(values: &[u64], total: u64, width: usize) -> Vec<usize> {
     widths
 }
 
-/// Render the sidebar showing tracked roots.
-fn render_sidebar(app: &App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
+/// Render the sidebar showing tracked roots and quota widget.
+fn render_sidebar(
+    app: &App,
+    config: &Config,
+    db: &Database,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+) {
+    // Split sidebar: roots list on top, quota widget on bottom (fixed 14 rows)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(14)])
+        .split(area);
+
+    let roots_area = chunks[0];
+    let quota_area = chunks[1];
+
+    // Render roots list
+    render_roots_list(app, db, frame, roots_area);
+
+    // Render quota widget
+    render_quota_widget(app, config, db, frame, quota_area);
+}
+
+/// Render the roots list in the sidebar.
+fn render_roots_list(app: &App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Fetch roots from database
     let Ok(roots) = db.list_roots() else {
         let error_text = Paragraph::new("Error loading roots")
@@ -1762,6 +2010,111 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
                 .title("Remove Tracked Path")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    // Clear the area behind the modal
+    frame.render_widget(Clear, modal_area);
+    frame.render_widget(modal, modal_area);
+}
+
+/// Render the quota target input modal.
+///
+/// Displays a centered modal with two fields: a numeric input for the size value
+/// and a unit selector (MB/GB/TB). Tab switches focus between fields.
+fn render_quota_target_modal(frame: &mut Frame, target: &PendingQuotaTarget) {
+    use ratatui::layout::{Alignment, Rect};
+
+    // Calculate centered rectangle for modal (50% width, 9 lines height)
+    let area = frame.area();
+    let modal_width = area.width / 2;
+    let modal_height = 9;
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    // Format the current target for display
+    let current_display = match target.current_target {
+        // Allow: bytes is guaranteed non-negative by the guard
+        #[allow(clippy::cast_sign_loss)]
+        Some(bytes) if bytes >= 0 => crate::format_bytes(bytes as u64),
+        Some(_) => "invalid".to_string(),
+        None => "not set".to_string(),
+    };
+
+    // Format the size input with cursor indicator
+    let size_display = if target.input.is_empty() {
+        "_".to_string()
+    } else {
+        target.input.clone()
+    };
+
+    // Format the unit selector with highlight on selected
+    let unit_display = format!(
+        "{}  {}  {}",
+        if target.unit == super::ByteUnit::MB {
+            "[MB]"
+        } else {
+            " MB "
+        },
+        if target.unit == super::ByteUnit::GB {
+            "[GB]"
+        } else {
+            " GB "
+        },
+        if target.unit == super::ByteUnit::TB {
+            "[TB]"
+        } else {
+            " TB "
+        },
+    );
+
+    // Highlight the focused field
+    let (size_style, unit_style) = match target.focus {
+        QuotaTargetFocus::Size => (
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
+        ),
+        QuotaTargetFocus::Unit => (
+            Style::default().fg(Color::White),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+
+    // Build the content with styled spans
+    let path_display = target.root_path.display().to_string();
+    let content = vec![
+        Line::from(format!("Root: {path_display}")),
+        Line::from(format!("Current: {current_display}")),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("Size: "),
+            Span::styled(size_display, size_style),
+            Span::raw("    Unit: "),
+            Span::styled(unit_display, unit_style),
+        ]),
+        Line::from(""),
+        Line::from("Tab to switch fields, Enter to confirm"),
+        Line::from("Empty or 0 clears the target, Esc to cancel"),
+    ];
+
+    let modal = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title("Set Quota Target")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));

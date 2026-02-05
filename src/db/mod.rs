@@ -21,6 +21,8 @@ pub struct Root {
     pub added_at: i64,
     /// Unix timestamp of the last completed scan, or None if never scanned.
     pub last_scanned: Option<i64>,
+    /// Optional byte quota target for this root.
+    pub target_bytes: Option<i64>,
 }
 
 /// A filesystem entry (file or directory) within a tracked root.
@@ -203,9 +205,9 @@ impl Database {
     #[allow(dead_code)]
     pub fn get_root_by_path(&self, path: &Path) -> Result<Option<Root>> {
         let path_str = path.to_string_lossy();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, path, added_at, last_scanned FROM roots WHERE path = ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, added_at, last_scanned, target_bytes FROM roots WHERE path = ?1",
+        )?;
 
         let mut rows = stmt.query([&*path_str])?;
         if let Some(row) = rows.next()? {
@@ -214,6 +216,7 @@ impl Database {
                 path: PathBuf::from(row.get::<_, String>(1)?),
                 added_at: row.get(2)?,
                 last_scanned: row.get(3)?,
+                target_bytes: row.get(4)?,
             }))
         } else {
             Ok(None)
@@ -230,9 +233,9 @@ impl Database {
     ///
     /// Returns an error if the database query fails.
     pub fn list_roots(&self) -> Result<Vec<Root>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, path, added_at, last_scanned FROM roots ORDER BY path")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, added_at, last_scanned, target_bytes FROM roots ORDER BY path",
+        )?;
 
         let rows = stmt.query_map([], |row| {
             Ok(Root {
@@ -240,6 +243,7 @@ impl Database {
                 path: PathBuf::from(row.get::<_, String>(1)?),
                 added_at: row.get(2)?,
                 last_scanned: row.get(3)?,
+                target_bytes: row.get(4)?,
             })
         })?;
 
@@ -275,6 +279,32 @@ impl Database {
         let rows_affected = self.conn.execute(
             "UPDATE roots SET last_scanned = ?1 WHERE id = ?2",
             (timestamp, root_id),
+        )?;
+
+        if rows_affected == 0 {
+            return Err(Error::Config(format!("Root with id {root_id} not found")));
+        }
+
+        Ok(())
+    }
+
+    /// Set or clear the byte quota target for a root.
+    ///
+    /// Pass `Some(bytes)` to set a target, or `None` to clear it.
+    /// A value of 0 is treated as clearing the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root doesn't exist or the operation fails.
+    // TODO(cleanup): Remove allow once TUI quota target dialog is implemented.
+    #[allow(dead_code)]
+    pub fn set_root_target_bytes(&self, root_id: i64, target: Option<i64>) -> Result<()> {
+        // Treat 0 as "no target" for convenience
+        let target = target.filter(|&t| t > 0);
+
+        let rows_affected = self.conn.execute(
+            "UPDATE roots SET target_bytes = ?1 WHERE id = ?2",
+            (target, root_id),
         )?;
 
         if rows_affected == 0 {
