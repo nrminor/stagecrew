@@ -3,7 +3,6 @@
 mod input;
 mod ui;
 
-use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -18,6 +17,8 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::widgets::{ScrollbarState, TableState};
 
 use crate::config::Config;
 use crate::db::Database;
@@ -174,14 +175,31 @@ pub struct App {
     pub(crate) filter_days: Option<u32>,
 
     /// Length of the sidebar list (updated by render, used for navigation bounds).
-    pub(crate) sidebar_len: Cell<usize>,
+    pub(crate) sidebar_len: usize,
 
     /// Length of the entry list (updated by render, used for navigation bounds).
-    pub(crate) entry_list_len: Cell<usize>,
+    pub(crate) entry_list_len: usize,
 
     /// The root ID currently selected in sidebar for viewing entries.
-    /// Uses Cell for interior mutability since it's updated during rendering.
-    pub(crate) current_root_id: Cell<Option<i64>>,
+    pub(crate) current_root_id: Option<i64>,
+
+    /// Table state for the entries panel (tracks scroll offset and selection).
+    pub(crate) entry_table_state: TableState,
+
+    /// Scrollbar state for the entries panel.
+    pub(crate) entry_scrollbar_state: ScrollbarState,
+
+    /// Table state for the audit log view (tracks scroll offset and selection).
+    pub(crate) audit_table_state: TableState,
+
+    /// Scrollbar state for the audit log view.
+    pub(crate) audit_scrollbar_state: ScrollbarState,
+
+    /// Bounding rectangle of the entries table (for mouse hit-testing).
+    pub(crate) entry_table_area: Rect,
+
+    /// Bounding rectangle of the audit log table (for mouse hit-testing).
+    pub(crate) audit_table_area: Rect,
 
     /// The current path being browsed within the selected root.
     /// This enables hierarchical navigation within a root.
@@ -250,6 +268,12 @@ pub struct App {
     /// When true, keystrokes go to the search buffer. When false (but
     /// `search_query` is `Some`), the user can navigate matches with n/N.
     pub(crate) search_input_active: bool,
+
+    /// Whether to scroll the viewport to ensure the cursor is visible.
+    /// Set by keyboard navigation, cleared after render adjusts the offset.
+    /// This allows mouse scrolling to move the viewport independently of
+    /// the cursor position.
+    pub(crate) ensure_cursor_visible: bool,
 }
 
 impl App {
@@ -289,7 +313,7 @@ impl App {
     // Allow: Will be used by TUI-014 directory navigation to determine root boundaries.
     #[allow(dead_code)]
     pub fn current_root_id(&self) -> Option<i64> {
-        self.current_root_id.get()
+        self.current_root_id
     }
 
     /// Get the current path being browsed.
@@ -413,6 +437,7 @@ impl App {
     pub(crate) fn navigate_into(&mut self, path: PathBuf) {
         self.current_path = path;
         self.entry_selected_index = 0;
+        self.ensure_cursor_visible = true;
         self.clear_search();
     }
 
@@ -429,7 +454,7 @@ impl App {
             && !roots.is_empty()
         {
             self.navigate_into(roots[0].path.clone());
-            self.current_root_id.set(Some(roots[0].id));
+            self.current_root_id = Some(roots[0].id);
         }
     }
 
@@ -441,6 +466,7 @@ impl App {
         if let Some(parent) = self.current_path.parent() {
             self.current_path = parent.to_path_buf();
             self.entry_selected_index = 0;
+            self.ensure_cursor_visible = true;
             self.clear_search();
         }
     }
@@ -545,9 +571,15 @@ impl App {
             entry_selected_index: 0,
             sort_mode: SortMode::default(),
             filter_days: None,
-            sidebar_len: Cell::new(0),
-            entry_list_len: Cell::new(0),
-            current_root_id: Cell::new(None),
+            sidebar_len: 0,
+            entry_list_len: 0,
+            current_root_id: None,
+            entry_table_state: TableState::default(),
+            entry_scrollbar_state: ScrollbarState::default(),
+            audit_table_state: TableState::default(),
+            audit_scrollbar_state: ScrollbarState::default(),
+            entry_table_area: Rect::default(),
+            audit_table_area: Rect::default(),
             current_path: PathBuf::new(),
             pending_entry_delete: None,
             pending_entry_deferral: None,
@@ -581,6 +613,7 @@ impl App {
             },
             search_query: None,
             search_input_active: false,
+            ensure_cursor_visible: false,
         }
     }
 
@@ -758,29 +791,67 @@ impl App {
     }
 
     /// Handle mouse events (scroll wheel navigation).
+    ///
+    /// Mouse scroll adjusts the viewport offset without changing the selection,
+    /// but only when the cursor is over the relevant table area.
     fn handle_mouse_event(&mut self, event: MouseEvent) {
+        const SCROLL_AMOUNT: usize = 3;
+        // Table chrome: 2 for borders + 1 for header row + 1 for header bottom margin
+        const TABLE_CHROME: u16 = 4;
+
+        let mouse_pos = (event.column, event.row);
+
+        // Check if mouse is within a rect
+        let in_rect = |rect: Rect| {
+            mouse_pos.0 >= rect.x
+                && mouse_pos.0 < rect.x + rect.width
+                && mouse_pos.1 >= rect.y
+                && mouse_pos.1 < rect.y + rect.height
+        };
+
         match event.kind {
             MouseEventKind::ScrollDown => {
-                // Scroll down = move selection down (same as 'j')
-                match self.focus_panel {
-                    FocusPanel::Sidebar => {
-                        self.sidebar_selected_index = self.sidebar_selected_index.saturating_add(1);
-                    }
-                    FocusPanel::MainPanel => {
-                        self.entry_selected_index = self.entry_selected_index.saturating_add(1);
-                    }
+                if self.view == View::AuditLog && in_rect(self.audit_table_area) {
+                    // Scroll audit log viewport down (increase offset)
+                    // Clamp so the last items fill the viewport (no empty space at bottom)
+                    let viewport_height =
+                        self.audit_table_area.height.saturating_sub(TABLE_CHROME) as usize;
+                    let max_offset = self.sidebar_len.saturating_sub(viewport_height);
+                    let new_offset = self
+                        .audit_table_state
+                        .offset()
+                        .saturating_add(SCROLL_AMOUNT)
+                        .min(max_offset);
+                    *self.audit_table_state.offset_mut() = new_offset;
+                } else if self.view == View::FileList && in_rect(self.entry_table_area) {
+                    // Scroll entries viewport down (increase offset)
+                    let viewport_height =
+                        self.entry_table_area.height.saturating_sub(TABLE_CHROME) as usize;
+                    let max_offset = self.entry_list_len.saturating_sub(viewport_height);
+                    let new_offset = self
+                        .entry_table_state
+                        .offset()
+                        .saturating_add(SCROLL_AMOUNT)
+                        .min(max_offset);
+                    *self.entry_table_state.offset_mut() = new_offset;
                 }
+                // Ignore scroll events outside table areas
             }
             MouseEventKind::ScrollUp => {
-                // Scroll up = move selection up (same as 'k')
-                match self.focus_panel {
-                    FocusPanel::Sidebar => {
-                        self.sidebar_selected_index = self.sidebar_selected_index.saturating_sub(1);
-                    }
-                    FocusPanel::MainPanel => {
-                        self.entry_selected_index = self.entry_selected_index.saturating_sub(1);
-                    }
+                if self.view == View::AuditLog && in_rect(self.audit_table_area) {
+                    // Scroll audit log viewport up (decrease offset)
+                    *self.audit_table_state.offset_mut() = self
+                        .audit_table_state
+                        .offset()
+                        .saturating_sub(SCROLL_AMOUNT);
+                } else if self.view == View::FileList && in_rect(self.entry_table_area) {
+                    // Scroll entries viewport up (decrease offset)
+                    *self.entry_table_state.offset_mut() = self
+                        .entry_table_state
+                        .offset()
+                        .saturating_sub(SCROLL_AMOUNT);
                 }
+                // Ignore scroll events outside table areas
             }
             _ => {
                 // Ignore other mouse events (clicks, drags, etc.)
@@ -837,19 +908,13 @@ mod tests {
             "App should start with Expiration sort mode"
         );
         assert_eq!(app.filter_days, None, "App should start with no filter");
+        assert_eq!(app.sidebar_len, 0, "App should start with sidebar_len 0");
         assert_eq!(
-            app.sidebar_len.get(),
-            0,
-            "App should start with sidebar_len 0"
-        );
-        assert_eq!(
-            app.entry_list_len.get(),
-            0,
+            app.entry_list_len, 0,
             "App should start with entry_list_len 0"
         );
         assert_eq!(
-            app.current_root_id.get(),
-            None,
+            app.current_root_id, None,
             "App should start with no root selected"
         );
         assert!(
@@ -943,7 +1008,7 @@ mod tests {
         app.entry_selected_index = 5;
         app.sort_mode = SortMode::Size;
         app.filter_days = Some(30);
-        app.current_root_id.set(Some(42));
+        app.current_root_id = Some(42);
 
         assert_eq!(app.view(), View::Help);
         assert_eq!(app.focus_panel(), FocusPanel::MainPanel);

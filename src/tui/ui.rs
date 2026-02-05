@@ -1,11 +1,15 @@
 //! Widget rendering for the TUI.
 
 use ratatui::Frame;
+use ratatui::layout::Margin;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table,
+};
 
 use crate::audit::AuditService;
 use crate::config::Config;
@@ -18,7 +22,7 @@ use super::{App, FocusPanel, PendingQuotaTarget, QuotaTargetFocus, SortMode, Vie
 ///
 /// This is the main rendering function that dispatches to view-specific
 /// rendering based on the current `app.view` state.
-pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Frame) {
+pub(crate) fn render(app: &mut App, config: &Config, db: &Database, frame: &mut Frame) {
     // Create the main layout with a footer for keybinding hints
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -105,7 +109,7 @@ pub(crate) fn render(app: &App, config: &Config, db: &Database, frame: &mut Fram
 // coordination less clear.
 #[allow(clippy::too_many_lines)]
 fn render_file_list_view(
-    app: &App,
+    app: &mut App,
     config: &Config,
     db: &Database,
     frame: &mut Frame,
@@ -288,7 +292,7 @@ fn render_lifecycle_widget(
     frame.render_widget(block, area);
 
     // Get the selected root
-    let Some(root_id) = app.current_root_id.get() else {
+    let Some(root_id) = app.current_root_id else {
         let msg = Paragraph::new("Select a root from the sidebar")
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(msg, inner);
@@ -411,7 +415,7 @@ fn render_expiration_timeline(
     frame.render_widget(block, area);
 
     // Get the selected root
-    let Some(root_id) = app.current_root_id.get() else {
+    let Some(root_id) = app.current_root_id else {
         let msg = Paragraph::new("Select a root from the sidebar")
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(msg, inner);
@@ -688,7 +692,7 @@ fn render_quota_widget(
     frame.render_widget(block, area);
 
     // Get the current root ID
-    let Some(root_id) = app.current_root_id.get() else {
+    let Some(root_id) = app.current_root_id else {
         let msg = Paragraph::new("Select a root")
             .alignment(ratatui::layout::Alignment::Center)
             .style(Style::default().fg(Color::DarkGray));
@@ -1026,7 +1030,7 @@ fn proportional_widths(values: &[u64], total: u64, width: usize) -> Vec<usize> {
 
 /// Render the sidebar showing tracked roots and quota widget.
 fn render_sidebar(
-    app: &App,
+    app: &mut App,
     config: &Config,
     db: &Database,
     frame: &mut Frame,
@@ -1049,7 +1053,7 @@ fn render_sidebar(
 }
 
 /// Render the roots list in the sidebar.
-fn render_roots_list(app: &App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
+fn render_roots_list(app: &mut App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Fetch roots from database
     let Ok(roots) = db.list_roots() else {
         let error_text = Paragraph::new("Error loading roots")
@@ -1060,7 +1064,7 @@ fn render_roots_list(app: &App, db: &Database, frame: &mut Frame, area: ratatui:
     };
 
     // Update sidebar list length for navigation
-    app.sidebar_len.set(roots.len());
+    app.sidebar_len = roots.len();
 
     // Clamp selected index
     let selected_idx = if roots.is_empty() {
@@ -1071,7 +1075,7 @@ fn render_roots_list(app: &App, db: &Database, frame: &mut Frame, area: ratatui:
 
     // Set current root ID based on selection
     if let Some(root) = roots.get(selected_idx) {
-        app.current_root_id.set(Some(root.id));
+        app.current_root_id = Some(root.id);
     }
 
     // Build sidebar rows
@@ -1134,7 +1138,7 @@ fn render_roots_list(app: &App, db: &Database, frame: &mut Frame, area: ratatui:
 // sequential operations that form a cohesive rendering pipeline.
 #[allow(clippy::too_many_lines)]
 fn render_main_entry_panel(
-    app: &App,
+    app: &mut App,
     config: &Config,
     db: &Database,
     frame: &mut Frame,
@@ -1189,7 +1193,7 @@ fn render_main_entry_panel(
     sort_entry_rows(&mut entry_rows, app.sort_mode());
 
     // Update entry list length for navigation
-    app.entry_list_len.set(entry_rows.len());
+    app.entry_list_len = entry_rows.len();
 
     // Clamp selected index
     let selected_idx = if entry_rows.is_empty() {
@@ -1381,9 +1385,58 @@ fn render_main_entry_panel(
             Row::new(entry_table_header_cells(app.sort_mode()))
                 .style(Style::default().add_modifier(Modifier::BOLD))
                 .bottom_margin(1),
-        );
+        )
+        .highlight_spacing(HighlightSpacing::Never);
 
-    frame.render_widget(table, area);
+    // Don't set selection on TableState - we handle row highlighting manually.
+    // This prevents ratatui from auto-scrolling to the selected row,
+    // allowing mouse scroll to control the viewport independently.
+    // We only use TableState for scroll offset management.
+
+    // Only scroll to follow cursor when keyboard navigation requested it.
+    // This allows mouse scrolling to move the viewport independently.
+    if app.ensure_cursor_visible {
+        let viewport_height = area.height.saturating_sub(4) as usize; // borders + header + margin
+        let current_offset = app.entry_table_state.offset();
+        if selected_idx < current_offset {
+            // Selection is above viewport - scroll up to show it
+            *app.entry_table_state.offset_mut() = selected_idx;
+        } else if selected_idx >= current_offset + viewport_height && viewport_height > 0 {
+            // Selection is below viewport - scroll down to show it
+            *app.entry_table_state.offset_mut() = selected_idx.saturating_sub(viewport_height) + 1;
+        }
+        app.ensure_cursor_visible = false;
+    }
+
+    // Store area for mouse hit-testing
+    app.entry_table_area = area;
+
+    // Render the table
+    frame.render_stateful_widget(table, area, &mut app.entry_table_state);
+
+    // Render the scrollbar (inside the border, on the right edge)
+    // Only render if there's content to scroll
+    let viewport_height = area.height.saturating_sub(4) as usize; // borders + header + margin
+    if entry_rows.len() > viewport_height {
+        // content_length is the scrollable range: max_offset + 1 so position 0..=max_offset maps correctly
+        let max_offset = entry_rows.len().saturating_sub(viewport_height);
+        app.entry_scrollbar_state =
+            ScrollbarState::new(max_offset + 1).position(app.entry_table_state.offset());
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"))
+            .track_symbol(Some("│"));
+
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut app.entry_scrollbar_state,
+        );
+    }
 }
 
 /// Sort entry rows according to the specified sort mode.
@@ -1616,7 +1669,7 @@ fn format_bytes(bytes: u64) -> String {
 ///
 /// Displays recent audit entries showing timestamp, user, action, and path.
 /// The view is scrollable and shows the most recent entries first.
-fn render_audit_log(app: &App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
+fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Fetch recent audit entries (limit to 1000 for now)
     let audit = AuditService::new(db);
     let Ok(entries) = audit.list_recent(1000) else {
@@ -1629,7 +1682,7 @@ fn render_audit_log(app: &App, db: &Database, frame: &mut Frame, area: ratatui::
     };
 
     // Update list length for navigation
-    app.sidebar_len.set(entries.len());
+    app.sidebar_len = entries.len();
 
     // Clamp selected index to valid range
     let selected_idx = if entries.is_empty() {
@@ -1696,9 +1749,60 @@ fn render_audit_log(app: &App, db: &Database, frame: &mut Frame, area: ratatui::
             ])
             .style(Style::default().add_modifier(Modifier::BOLD))
             .bottom_margin(1),
-        );
+        )
+        .highlight_spacing(HighlightSpacing::Never);
 
-    frame.render_widget(table, area);
+    // Don't set selection on TableState - we handle row highlighting manually.
+    // This prevents ratatui from auto-scrolling to the selected row,
+    // allowing mouse scroll to control the viewport independently.
+
+    // Only scroll to follow cursor when keyboard navigation requested it.
+    if app.ensure_cursor_visible {
+        let viewport_height = area.height.saturating_sub(4) as usize; // borders + header + margin
+        let current_offset = app.audit_table_state.offset();
+        if selected_idx < current_offset {
+            // Selection is above viewport - scroll up to show it
+            *app.audit_table_state.offset_mut() = selected_idx;
+        } else if selected_idx >= current_offset + viewport_height && viewport_height > 0 {
+            // Selection is below viewport - scroll down to show it
+            *app.audit_table_state.offset_mut() = selected_idx.saturating_sub(viewport_height) + 1;
+        }
+        // Note: flag is cleared by entry panel render, which runs first in FileList view.
+        // For AuditLog view, we clear it here.
+        if app.view() == super::View::AuditLog {
+            app.ensure_cursor_visible = false;
+        }
+    }
+
+    // Store area for mouse hit-testing
+    app.audit_table_area = area;
+
+    // Render the table
+    frame.render_stateful_widget(table, area, &mut app.audit_table_state);
+
+    // Render the scrollbar (inside the border, on the right edge)
+    // Only render if there's content to scroll
+    let viewport_height = area.height.saturating_sub(4) as usize; // borders + header + margin
+    if entries.len() > viewport_height {
+        // content_length is the scrollable range: max_offset + 1 so position 0..=max_offset maps correctly
+        let max_offset = entries.len().saturating_sub(viewport_height);
+        app.audit_scrollbar_state =
+            ScrollbarState::new(max_offset + 1).position(app.audit_table_state.offset());
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"))
+            .track_symbol(Some("│"));
+
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut app.audit_scrollbar_state,
+        );
+    }
 }
 
 /// Format a Unix timestamp as a human-readable string in local timezone.

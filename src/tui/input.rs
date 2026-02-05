@@ -158,24 +158,30 @@ impl InputHandler {
             }
 
             // Navigation (vim-style) - operates on focused panel
-            KeyCode::Char('j') | KeyCode::Down => match app.focus_panel {
-                FocusPanel::Sidebar => {
-                    app.sidebar_selected_index = app.sidebar_selected_index.saturating_add(1);
+            KeyCode::Char('j') | KeyCode::Down => {
+                match app.focus_panel {
+                    FocusPanel::Sidebar => {
+                        app.sidebar_selected_index = app.sidebar_selected_index.saturating_add(1);
+                    }
+                    FocusPanel::MainPanel => {
+                        app.entry_selected_index = app.entry_selected_index.saturating_add(1);
+                        Self::update_visual_selection(app, config, db);
+                    }
                 }
-                FocusPanel::MainPanel => {
-                    app.entry_selected_index = app.entry_selected_index.saturating_add(1);
-                    Self::update_visual_selection(app, config, db);
+                app.ensure_cursor_visible = true;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                match app.focus_panel {
+                    FocusPanel::Sidebar => {
+                        app.sidebar_selected_index = app.sidebar_selected_index.saturating_sub(1);
+                    }
+                    FocusPanel::MainPanel => {
+                        app.entry_selected_index = app.entry_selected_index.saturating_sub(1);
+                        Self::update_visual_selection(app, config, db);
+                    }
                 }
-            },
-            KeyCode::Char('k') | KeyCode::Up => match app.focus_panel {
-                FocusPanel::Sidebar => {
-                    app.sidebar_selected_index = app.sidebar_selected_index.saturating_sub(1);
-                }
-                FocusPanel::MainPanel => {
-                    app.entry_selected_index = app.entry_selected_index.saturating_sub(1);
-                    Self::update_visual_selection(app, config, db);
-                }
-            },
+                app.ensure_cursor_visible = true;
+            }
             KeyCode::Char('g') => {
                 // Go to top of focused panel
                 match app.focus_panel {
@@ -185,18 +191,20 @@ impl InputHandler {
                         Self::update_visual_selection(app, config, db);
                     }
                 }
+                app.ensure_cursor_visible = true;
             }
             KeyCode::Char('G') => {
                 // Go to bottom of focused panel
                 match app.focus_panel {
                     FocusPanel::Sidebar => {
-                        app.select_last_sidebar(app.sidebar_len.get());
+                        app.select_last_sidebar(app.sidebar_len);
                     }
                     FocusPanel::MainPanel => {
-                        app.select_last_entry(app.entry_list_len.get());
+                        app.select_last_entry(app.entry_list_len);
                         Self::update_visual_selection(app, config, db);
                     }
                 }
+                app.ensure_cursor_visible = true;
             }
 
             // Sort modes (applies to file list)
@@ -250,9 +258,11 @@ impl InputHandler {
             }
             KeyCode::Char('n') if app.search_query.is_some() => {
                 Self::jump_to_next_match(app, config, db);
+                app.ensure_cursor_visible = true;
             }
             KeyCode::Char('N') if app.search_query.is_some() => {
                 Self::jump_to_prev_match(app, config, db);
+                app.ensure_cursor_visible = true;
             }
 
             // Views
@@ -383,12 +393,20 @@ impl InputHandler {
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 app.sidebar_selected_index = app.sidebar_selected_index.saturating_add(1);
+                app.ensure_cursor_visible = true;
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 app.sidebar_selected_index = app.sidebar_selected_index.saturating_sub(1);
+                app.ensure_cursor_visible = true;
             }
-            KeyCode::Char('g') => app.sidebar_selected_index = 0, // Go to top
-            KeyCode::Char('G') => app.select_last_sidebar(app.sidebar_len.get()), // Go to bottom
+            KeyCode::Char('g') => {
+                app.sidebar_selected_index = 0; // Go to top
+                app.ensure_cursor_visible = true;
+            }
+            KeyCode::Char('G') => {
+                app.select_last_sidebar(app.sidebar_len); // Go to bottom
+                app.ensure_cursor_visible = true;
+            }
             _ => {}
         }
     }
@@ -536,7 +554,7 @@ impl InputHandler {
                 if let Some(entries) = &app.pending_entry_delete {
                     let audit = AuditService::new(db);
                     let user = AuditService::current_user();
-                    let root_id = app.current_root_id.get();
+                    let root_id = app.current_root_id;
 
                     let mut success_count = 0;
                     let mut fail_count = 0;
@@ -716,7 +734,7 @@ impl InputHandler {
                     let audit = AuditService::new(db);
                     let user = AuditService::current_user();
                     let details = Some(format!("Deferred for {days} days"));
-                    let root_id = app.current_root_id.get();
+                    let root_id = app.current_root_id;
 
                     for entry in &deferral.entries {
                         if let Err(e) = db.defer_entry(entry.id, deferred_until) {
@@ -841,7 +859,7 @@ impl InputHandler {
                 if let Some(entries) = &app.pending_entry_ignore {
                     let audit = AuditService::new(db);
                     let user = AuditService::current_user();
-                    let root_id = app.current_root_id.get();
+                    let root_id = app.current_root_id;
 
                     for entry in entries {
                         if let Err(e) = db.update_entry_status(entry.id, "ignored") {
@@ -970,7 +988,7 @@ impl InputHandler {
                 if let Some(entries) = &app.pending_entry_approval {
                     let audit = AuditService::new(db);
                     let user = AuditService::current_user();
-                    let root_id = app.current_root_id.get();
+                    let root_id = app.current_root_id;
 
                     for entry in entries {
                         if let Err(e) = db.update_entry_status(entry.id, "approved") {
@@ -1093,7 +1111,7 @@ impl InputHandler {
         // Perform the unignore
         let audit = AuditService::new(db);
         let user = AuditService::current_user();
-        let root_id = app.current_root_id.get();
+        let root_id = app.current_root_id;
 
         let mut success_count = 0;
         for entry in &entries_to_unignore {
@@ -1154,6 +1172,7 @@ impl InputHandler {
                 // Confirm search and jump to first match
                 app.search_input_active = false;
                 Self::jump_to_first_match(app, config, db);
+                app.ensure_cursor_visible = true;
             }
             KeyCode::Esc => {
                 // Cancel search entirely
@@ -1377,7 +1396,7 @@ impl InputHandler {
                                 // If we were browsing this root, clear the view
                                 if app.current_path.starts_with(path_to_remove) {
                                     app.current_path = PathBuf::new();
-                                    app.current_root_id.set(None);
+                                    app.current_root_id = None;
                                     app.focus_panel = FocusPanel::Sidebar;
                                 }
                             }
@@ -1767,8 +1786,8 @@ mod tests {
         let config = test_config();
 
         // Simulate list lengths (normally set by render)
-        app.sidebar_len.set(10);
-        app.entry_list_len.set(20);
+        app.sidebar_len = 10;
+        app.entry_list_len = 20;
 
         // Go to bottom in sidebar
         app.focus_panel = FocusPanel::Sidebar;
@@ -2001,7 +2020,7 @@ mod tests {
         let (dir_id, file_ids) = setup_with_files(&db);
 
         // Set up app state to simulate viewing directory with first entry selected
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
@@ -2037,7 +2056,7 @@ mod tests {
         let (dir_id, _file_ids) = setup_with_files(&db);
 
         // Focus sidebar (not main panel)
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
         app.focus_panel = FocusPanel::Sidebar;
 
         // Press 'd' key
@@ -2069,7 +2088,7 @@ mod tests {
             .upsert_entry(root_id, &file_path, temp_dir.path(), false, 13, Some(100))
             .expect("Failed to create entry");
 
-        app.current_root_id.set(Some(root_id));
+        app.current_root_id = Some(root_id);
 
         // Manually set pending delete (simulating 'd' key press)
         app.pending_entry_delete = Some(vec![PendingEntry {
@@ -2123,7 +2142,7 @@ mod tests {
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
 
         // Manually set pending delete
         app.pending_entry_delete = Some(vec![PendingEntry {
@@ -2165,7 +2184,7 @@ mod tests {
         let (dir_id, _file_ids) = setup_with_files(&db);
 
         // Set up app state
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
@@ -2198,7 +2217,7 @@ mod tests {
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
 
         // Manually set pending deferral (empty input means use default)
         app.pending_entry_deferral = Some(PendingDeferral {
@@ -2246,7 +2265,7 @@ mod tests {
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
 
         // Manually set pending deferral with input
         app.pending_entry_deferral = Some(PendingDeferral {
@@ -2300,7 +2319,7 @@ mod tests {
         let (dir_id, file_ids) = setup_with_files(&db);
 
         // Set up app state
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
@@ -2330,7 +2349,7 @@ mod tests {
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
 
         // Manually set pending ignore
         app.pending_entry_ignore = Some(vec![PendingEntry {
@@ -2369,7 +2388,7 @@ mod tests {
         let (dir_id, file_ids) = setup_with_files(&db);
 
         // Set up app state
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
@@ -2399,7 +2418,7 @@ mod tests {
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
-        app.current_root_id.set(Some(dir_id));
+        app.current_root_id = Some(dir_id);
 
         // Manually set pending approval
         app.pending_entry_approval = Some(vec![PendingEntry {
@@ -2932,7 +2951,7 @@ mod tests {
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
-        app.entry_list_len.set(5);
+        app.entry_list_len = 5;
         app.entry_selected_index = 1; // bravo
 
         // Enter visual mode at index 1
@@ -2960,7 +2979,7 @@ mod tests {
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
-        app.entry_list_len.set(5);
+        app.entry_list_len = 5;
         app.entry_selected_index = 3; // delta
 
         // Enter visual mode at index 3
@@ -2988,7 +3007,7 @@ mod tests {
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
-        app.entry_list_len.set(5);
+        app.entry_list_len = 5;
         app.entry_selected_index = 0;
 
         let ids = visual_entry_ids(&db, &config);
@@ -3025,7 +3044,7 @@ mod tests {
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
-        app.entry_list_len.set(5);
+        app.entry_list_len = 5;
         app.entry_selected_index = 1; // bravo
 
         // Enter visual mode
@@ -3059,7 +3078,7 @@ mod tests {
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
-        app.entry_list_len.set(5);
+        app.entry_list_len = 5;
         app.entry_selected_index = 1;
 
         // Enter visual mode and extend
@@ -3086,7 +3105,7 @@ mod tests {
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
-        app.entry_list_len.set(5);
+        app.entry_list_len = 5;
         app.entry_selected_index = 2;
 
         // Enter visual mode
@@ -3126,7 +3145,7 @@ mod tests {
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
-        app.entry_list_len.set(5);
+        app.entry_list_len = 5;
         app.entry_selected_index = 3; // delta
 
         // Enter visual mode at index 3
