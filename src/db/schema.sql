@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS entries (
     size_bytes INTEGER NOT NULL DEFAULT 0,
     mtime INTEGER,
     tracked_since INTEGER,
+    countdown_start INTEGER,
     status TEXT NOT NULL DEFAULT 'tracked'
         CHECK (status IN ('tracked', 'pending', 'approved', 'deferred', 'ignored', 'removed', 'blocked')),
     deferred_until INTEGER,

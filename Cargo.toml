@@ -37,6 +37,7 @@ tokio = { version = "1.49.0", features = ["full"] }
 toml = "0.9.11"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+trash = "5.2.5"
 tui-piechart = "0.2.8"
 xdg = "3.0.0"
 

@@ -6,56 +6,93 @@ use crate::audit::{AuditAction, AuditService};
 use crate::db::Database;
 use crate::error::{Error, Result};
 
-/// Handles file and directory removal with safety checks.
-pub struct RemovalService {
-    dry_run: bool,
+/// Method for removing files from the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemovalMethod {
+    /// Move to system trash (recoverable).
+    #[default]
+    Trash,
+    /// Permanently delete (irreversible).
+    PermanentDelete,
 }
 
-impl RemovalService {
-    /// Create a new removal service.
+impl RemovalMethod {
+    /// Human-readable description for UI display.
     #[must_use]
-    pub fn new(dry_run: bool) -> Self {
-        Self { dry_run }
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Trash => "move to trash",
+            Self::PermanentDelete => "permanently delete",
+        }
     }
 
-    /// Attempt to remove a path (file or directory).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Permission is denied
-    /// - Path doesn't exist
-    /// - Other filesystem errors occur
-    pub fn remove(&self, path: &Path) -> Result<RemovalOutcome> {
-        if !path.exists() {
-            return Err(Error::PathNotFound(path.to_path_buf()));
+    /// Past tense for status messages.
+    #[must_use]
+    pub const fn past_tense(self) -> &'static str {
+        match self {
+            Self::Trash => "Trashed",
+            Self::PermanentDelete => "Deleted",
         }
+    }
+}
 
-        if self.dry_run {
-            tracing::info!(?path, "Dry run: would remove");
-            return Ok(RemovalOutcome::DryRun);
+/// Attempt to remove a path using the specified method.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Permission is denied
+/// - Path doesn't exist
+/// - Other filesystem errors occur
+pub fn remove(path: &Path, method: RemovalMethod) -> Result<RemovalOutcome> {
+    if !path.exists() {
+        return Err(Error::PathNotFound(path.to_path_buf()));
+    }
+
+    match method {
+        RemovalMethod::Trash => trash(path),
+        RemovalMethod::PermanentDelete => permanent_delete(path),
+    }
+}
+
+/// Move a path to the system trash.
+fn trash(path: &Path) -> Result<RemovalOutcome> {
+    match trash::delete(path) {
+        Ok(()) => {
+            tracing::info!(?path, "Moved to trash successfully");
+            Ok(RemovalOutcome::Trashed)
         }
-
-        let result = if path.is_dir() {
-            std::fs::remove_dir_all(path)
-        } else {
-            std::fs::remove_file(path)
-        };
-
-        match result {
-            Ok(()) => {
-                tracing::info!(?path, "Removed successfully");
-                Ok(RemovalOutcome::Removed)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                tracing::warn!(?path, "Permission denied");
-                Err(Error::PermissionDenied(path.to_path_buf()))
-            }
-            Err(e) => Err(Error::Filesystem {
+        Err(e) => {
+            tracing::warn!(?path, error = %e, "Failed to move to trash");
+            Err(Error::Trash {
                 path: path.to_path_buf(),
-                source: e,
-            }),
+                message: e.to_string(),
+            })
         }
+    }
+}
+
+/// Permanently delete a path from the filesystem.
+fn permanent_delete(path: &Path) -> Result<RemovalOutcome> {
+    let result = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+
+    match result {
+        Ok(()) => {
+            tracing::info!(?path, "Permanently deleted");
+            Ok(RemovalOutcome::Deleted)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::warn!(?path, "Permission denied");
+            Err(Error::PermissionDenied(path.to_path_buf()))
+        }
+        Err(e) => Err(Error::Filesystem {
+            path: path.to_path_buf(),
+            source: e,
+        }),
     }
 }
 
@@ -64,10 +101,10 @@ impl RemovalService {
 #[must_use = "removal outcome should be checked"]
 #[non_exhaustive]
 pub enum RemovalOutcome {
-    /// File was removed.
-    Removed,
-    /// Dry run mode - no actual removal.
-    DryRun,
+    /// File was moved to trash.
+    Trashed,
+    /// File was permanently deleted.
+    Deleted,
 }
 
 /// Process all approved entries for removal.
@@ -93,7 +130,6 @@ pub enum RemovalOutcome {
 pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
     let audit = AuditService::new(db);
     let user = AuditService::current_user();
-    let service = RemovalService::new(false);
 
     // Query all approved entries
     let approved_entries = db.list_entries(Some("approved"))?;
@@ -107,8 +143,9 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
 
         tracing::info!(path = ?entry.path, is_dir = entry.is_dir, "Processing approved entry for removal");
 
-        match service.remove(&path) {
-            Ok(RemovalOutcome::Removed) => {
+        // Daemon uses permanent delete for approved entries
+        match remove(&path, RemovalMethod::PermanentDelete) {
+            Ok(RemovalOutcome::Deleted) => {
                 // Success: Update status to removed
                 db.update_entry_status(entry.id, "removed")?;
                 removed_count += 1;
@@ -121,13 +158,13 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
                     &user,
                     AuditAction::Remove,
                     Some(entry.path.as_path()),
-                    Some(&format!("Removed {} bytes", entry.size_bytes)),
+                    Some(&format!("Permanently deleted {} bytes", entry.size_bytes)),
                     Some(entry.id),
                 )?;
             }
-            Ok(RemovalOutcome::DryRun) => {
-                // This shouldn't happen in production (dry_run=false above)
-                tracing::warn!(path = ?entry.path, "Unexpected dry run outcome");
+            Ok(RemovalOutcome::Trashed) => {
+                // This shouldn't happen (we use PermanentDelete)
+                tracing::warn!(path = ?entry.path, "Unexpected removal outcome: Trashed");
             }
             Err(Error::PermissionDenied(_)) => {
                 // Permission error: Update status to blocked
@@ -355,7 +392,7 @@ mod tests {
                     .details
                     .as_ref()
                     .expect("expected audit entry to have details - verify audit trail is working")
-                    .contains("Removed")
+                    .contains("Permanently deleted")
             );
         }
     }

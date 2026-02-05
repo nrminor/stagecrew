@@ -32,6 +32,9 @@ pub enum Error {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("trash error at {path}: {message}")]
+    Trash { path: PathBuf, message: String },
 }
 
 /// Convenience type alias for Results using our Error type.

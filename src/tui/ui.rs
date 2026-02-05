@@ -14,6 +14,7 @@ use ratatui::widgets::{
 use crate::audit::AuditService;
 use crate::config::Config;
 use crate::db::Database;
+use crate::removal::RemovalMethod;
 use crate::scanner::calculate_expiration;
 
 use super::{App, FocusPanel, PendingQuotaTarget, QuotaTargetFocus, SortMode, View};
@@ -43,12 +44,17 @@ pub(crate) fn render(app: &mut App, config: &Config, db: &Database, frame: &mut 
     render_footer(app, frame, chunks[1]);
 
     // Render entry deletion confirmation modal if pending entry delete
-    if let Some(entries) = app.pending_entry_delete() {
-        let count = entries.len();
+    if let Some(deletion) = app.pending_entry_delete() {
+        let count = deletion.entries.len();
         if count == 1 {
-            render_entry_delete_modal(frame, &entries[0].path.to_string_lossy(), entries[0].is_dir);
+            render_entry_delete_modal(
+                frame,
+                &deletion.entries[0].path.to_string_lossy(),
+                deletion.entries[0].is_dir,
+                deletion.method,
+            );
         } else {
-            render_entry_delete_modal_multi(frame, count);
+            render_entry_delete_modal_multi(frame, count, deletion.method);
         }
     }
 
@@ -237,8 +243,8 @@ impl LifecycleView {
                 })
             } else {
                 entry
-                    .mtime
-                    .map(|m| calculate_expiration(m, config.expiration_days))
+                    .countdown_start
+                    .map(|cs| calculate_expiration(cs, config.expiration_days))
             };
 
             match days_remaining {
@@ -250,7 +256,7 @@ impl LifecycleView {
                     warning.files += 1;
                     warning.bytes += size;
                 }
-                // None (no mtime) or Some with days > warning_days: assume healthy
+                // None (no countdown_start) or Some with days > warning_days: assume healthy
                 _ => {
                     healthy.files += 1;
                     healthy.bytes += size;
@@ -450,8 +456,8 @@ fn render_expiration_timeline(
             Some(0)
         } else {
             entry
-                .mtime
-                .map(|m| calculate_expiration(m, config.expiration_days))
+                .countdown_start
+                .map(|cs| calculate_expiration(cs, config.expiration_days))
         };
 
         if let Some(days) = days_remaining {
@@ -750,14 +756,14 @@ fn render_quota_widget(
                     })
                 } else {
                     entry
-                        .mtime
-                        .map(|m| calculate_expiration(m, config.expiration_days))
+                        .countdown_start
+                        .map(|cs| calculate_expiration(cs, config.expiration_days))
                 };
 
                 match days_remaining {
                     Some(d) if d <= 0 => overdue += entry.size_bytes,
                     Some(d) if d <= i64::from(config.warning_days) => warning += entry.size_bytes,
-                    // None (no mtime) or Some with days > warning_days: assume healthy
+                    // None (no countdown_start) or Some with days > warning_days: assume healthy
                     _ => healthy += entry.size_bytes,
                 }
             }
@@ -1177,13 +1183,13 @@ fn render_main_entry_panel(
     }
 
     // Sort entries by expiration (most urgent first) by default
-    // For directories (no mtime), use a large positive value so they sort to end
+    // For directories (no countdown_start), use a large positive value so they sort to end
     let mut entry_rows: Vec<_> = entries
         .into_iter()
         .map(|entry| {
-            // Directories have no mtime
-            let days_remaining = entry.mtime.map_or(i64::MAX, |mtime| {
-                calculate_expiration(mtime, config.expiration_days)
+            // Directories have no countdown_start
+            let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                calculate_expiration(cs, config.expiration_days)
             });
             (entry, days_remaining)
         })
@@ -2196,8 +2202,9 @@ fn render_deferral_modal(
 /// Render an entry deletion confirmation modal.
 ///
 /// Displays a centered modal prompting the user to confirm deletion
-/// of the selected entry (file or directory).
-fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool) {
+/// of the selected entry (file or directory). The modal text varies
+/// based on the removal method (trash vs permanent delete).
+fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool, method: RemovalMethod) {
     use ratatui::layout::{Alignment, Rect};
 
     // Calculate centered rectangle for modal (50% width, 7 lines height)
@@ -2214,20 +2221,36 @@ fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool) {
         height: modal_height,
     };
 
-    // Create the modal content
-    let (title, type_name) = if is_dir {
-        ("Delete Directory", "directory")
-    } else {
-        ("Delete File", "file")
+    // Create the modal content based on method
+    let type_name = if is_dir { "directory" } else { "file" };
+    let (title, action_verb, border_color) = match method {
+        RemovalMethod::Trash => (
+            if is_dir {
+                "Move Directory to Trash"
+            } else {
+                "Move File to Trash"
+            },
+            "Move to trash",
+            Color::Yellow,
+        ),
+        RemovalMethod::PermanentDelete => (
+            if is_dir {
+                "Permanently Delete Directory"
+            } else {
+                "Permanently Delete File"
+            },
+            "Permanently delete",
+            Color::Red,
+        ),
     };
-    let message = format!("Delete {type_name}:\n\n{path}\n\n(y/n)");
+    let message = format!("{action_verb} {type_name}:\n\n{path}\n\n(y/n)");
 
     let modal = Paragraph::new(message)
         .block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
+                .border_style(Style::default().fg(border_color)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2238,7 +2261,9 @@ fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool) {
 }
 
 /// Render a multi-entry deletion confirmation modal.
-fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize) {
+///
+/// The modal text varies based on the removal method (trash vs permanent delete).
+fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize, method: RemovalMethod) {
     use ratatui::layout::{Alignment, Rect};
 
     let area = frame.area();
@@ -2254,15 +2279,25 @@ fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize) {
         height: modal_height,
     };
 
-    let title = format!("Delete {count} Entries");
-    let message = format!("Delete {count} entries?\n\n(y/n)");
+    let (title, message, border_color) = match method {
+        RemovalMethod::Trash => (
+            format!("Move {count} Entries to Trash"),
+            format!("Move {count} entries to trash?\n\n(y/n)"),
+            Color::Yellow,
+        ),
+        RemovalMethod::PermanentDelete => (
+            format!("Permanently Delete {count} Entries"),
+            format!("Permanently delete {count} entries?\n\n(y/n)"),
+            Color::Red,
+        ),
+    };
 
     let modal = Paragraph::new(message)
         .block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
+                .border_style(Style::default().fg(border_color)),
         )
         .alignment(Alignment::Center)
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -2585,6 +2620,7 @@ mod tests {
             size_bytes,
             mtime,
             tracked_since: Some(now),
+            countdown_start: Some(now),
             status: "tracked".to_string(),
             deferred_until: None,
             created_at: now,
@@ -2604,6 +2640,7 @@ mod tests {
             size_bytes: 0,
             mtime: None,
             tracked_since: Some(now),
+            countdown_start: None,
             status: "tracked".to_string(),
             deferred_until: None,
             created_at: now,
@@ -2907,6 +2944,7 @@ mod tests {
             size_bytes: 100,
             mtime: Some(0),
             tracked_since: None,
+            countdown_start: Some(0),
             status: status.to_string(),
             deferred_until,
             created_at: 0,

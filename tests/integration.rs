@@ -121,22 +121,21 @@ async fn test_full_workflow() {
     );
     assert!(old_file_entry.mtime.is_some(), "old_file should have mtime");
 
-    // 5b. Manually backdate tracked_since for old file to simulate long-tracked file
-    // With the tracked_since logic, newly-scanned old files get tracked_since = now,
-    // giving them a full expiration period. To test expiration, we need to backdate tracked_since.
+    // 5b. Manually backdate countdown_start for old file to simulate long-tracked file
+    // Expiration is based on countdown_start, so we need to backdate it to test expiration.
     let now = jiff::Timestamp::now();
     let ninetyfive_days_ago = now
         .checked_sub(jiff::SignedDuration::from_secs(95 * 86400))
         .expect("timestamp arithmetic");
 
-    // Update tracked_since for old_file
+    // Update countdown_start for old_file
     let old_file_str = old_file.to_string_lossy();
     db.conn()
         .execute(
-            "UPDATE entries SET tracked_since = ?1 WHERE path = ?2",
+            "UPDATE entries SET countdown_start = ?1 WHERE path = ?2",
             (ninetyfive_days_ago.as_second(), &*old_file_str),
         )
-        .expect("failed to backdate tracked_since for old_file");
+        .expect("failed to backdate countdown_start for old_file");
 
     // 6. Transition expired paths (should move old_file to pending)
     let transition_summary = transition_expired_paths(&db, config.expiration_days, false)

@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::ui::sort_entry_rows;
-use super::{App, FocusPanel, SortMode, View};
+use super::{App, FocusPanel, PendingDeletion, PendingEntry, SortMode, View};
 use crate::audit::{AuditAction, AuditService};
 use crate::config::Config;
 use crate::db::Database;
+use crate::removal::RemovalMethod;
 use crate::scanner::calculate_expiration;
 
 /// Handles keyboard input with vim-style bindings.
@@ -57,8 +58,8 @@ pub(super) fn sorted_entry_rows(
     let mut rows: Vec<_> = entries
         .into_iter()
         .map(|entry| {
-            let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
-                calculate_expiration(m, config.expiration_days)
+            let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                calculate_expiration(cs, config.expiration_days)
             });
             (entry, days_remaining)
         })
@@ -235,8 +236,13 @@ impl InputHandler {
             }
 
             // Entry-level actions (only when main panel is focused)
+            // d = move to trash (safe, recoverable)
             KeyCode::Char('d') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::initiate_entry_delete(app, config, db);
+                Self::initiate_entry_delete(app, config, db, RemovalMethod::Trash);
+            }
+            // D = permanent delete (irreversible)
+            KeyCode::Char('D') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::initiate_entry_delete(app, config, db, RemovalMethod::PermanentDelete);
             }
             KeyCode::Char('r') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::initiate_entry_defer(app, config, db);
@@ -478,7 +484,10 @@ impl InputHandler {
     ///
     /// If entries are selected via multi-select, delete all selected entries.
     /// Otherwise, delete the currently focused entry.
-    fn initiate_entry_delete(app: &mut App, config: &Config, db: &Database) {
+    ///
+    /// The `method` parameter determines whether to trash (recoverable) or
+    /// permanently delete (irreversible).
+    fn initiate_entry_delete(app: &mut App, config: &Config, db: &Database, method: RemovalMethod) {
         // Get entries for current path
         if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot delete entry: no path selected");
@@ -498,8 +507,8 @@ impl InputHandler {
         let mut entry_rows: Vec<_> = entries
             .into_iter()
             .map(|entry| {
-                let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
+                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    calculate_expiration(cs, config.expiration_days)
                 });
                 (entry, days_remaining)
             })
@@ -507,10 +516,10 @@ impl InputHandler {
         sort_entry_rows(&mut entry_rows, app.sort_mode());
 
         // Determine which entries to delete
-        let entries_to_delete: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
+        let entries_to_delete: Vec<PendingEntry> = if app.selected_entries.is_empty() {
             // No selection - use currently focused entry
             if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
-                vec![super::PendingEntry {
+                vec![PendingEntry {
                     id: entry.id,
                     path: entry.path.clone(),
                     is_dir: entry.is_dir,
@@ -524,7 +533,7 @@ impl InputHandler {
             entry_rows
                 .into_iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
-                .map(|(e, _)| super::PendingEntry {
+                .map(|(e, _)| PendingEntry {
                     id: e.id,
                     path: e.path.clone(),
                     is_dir: e.is_dir,
@@ -537,8 +546,11 @@ impl InputHandler {
             return;
         }
 
-        // Set pending deletion state
-        app.pending_entry_delete = Some(entries_to_delete);
+        // Set pending deletion state with the chosen method
+        app.pending_entry_delete = Some(PendingDeletion {
+            entries: entries_to_delete,
+            method,
+        });
     }
 
     /// Handle entry deletion confirmation (y/n/Esc).
@@ -551,32 +563,48 @@ impl InputHandler {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 // User confirmed - perform the deletion for all pending entries
-                if let Some(entries) = &app.pending_entry_delete {
+                if let Some(deletion) = &app.pending_entry_delete {
                     let audit = AuditService::new(db);
                     let user = AuditService::current_user();
                     let root_id = app.current_root_id;
+                    let method = deletion.method;
+                    let action_past = method.past_tense();
 
                     let mut success_count = 0;
                     let mut fail_count = 0;
-                    let total = entries.len();
+                    let total = deletion.entries.len();
 
-                    for entry in entries {
-                        if let Err(e) = db.delete_entry(entry.id, &entry.path, entry.is_dir) {
+                    for entry in &deletion.entries {
+                        if let Err(e) = db.delete_entry(entry.id, &entry.path, entry.is_dir, method)
+                        {
                             tracing::warn!(
-                                "Failed to delete entry {}: {}",
+                                "Failed to {} entry {}: {}",
+                                method.description(),
                                 entry.path.display(),
                                 e
                             );
-                            app.status_message = Some(format!("Delete failed: {e}"));
+                            app.status_message =
+                                Some(format!("{} failed: {e}", method.past_tense()));
                             app.status_message_time = Some(std::time::Instant::now());
                             fail_count += 1;
                         } else {
                             success_count += 1;
-                            // Record audit entry
-                            let detail = if entry.is_dir {
-                                "Directory deleted by user"
-                            } else {
-                                "File deleted by user"
+                            // Record audit entry with method-specific detail
+                            let detail = match method {
+                                RemovalMethod::Trash => {
+                                    if entry.is_dir {
+                                        "Directory moved to trash by user"
+                                    } else {
+                                        "File moved to trash by user"
+                                    }
+                                }
+                                RemovalMethod::PermanentDelete => {
+                                    if entry.is_dir {
+                                        "Directory permanently deleted by user"
+                                    } else {
+                                        "File permanently deleted by user"
+                                    }
+                                }
                             };
                             if let Err(e) = audit.record(
                                 &user,
@@ -592,11 +620,11 @@ impl InputHandler {
 
                     // Show result in status bar
                     if fail_count == 0 && success_count > 0 {
-                        app.status_message = Some(format!("Deleted {success_count} file(s)"));
+                        app.status_message = Some(format!("{action_past} {success_count} file(s)"));
                         app.status_message_time = Some(std::time::Instant::now());
                     } else if fail_count > 0 && success_count > 0 {
                         app.status_message = Some(format!(
-                            "Deleted {success_count}/{total}, {fail_count} failed"
+                            "{action_past} {success_count}/{total}, {fail_count} failed"
                         ));
                         app.status_message_time = Some(std::time::Instant::now());
                     }
@@ -645,8 +673,8 @@ impl InputHandler {
         let mut entry_rows: Vec<_> = entries
             .into_iter()
             .map(|entry| {
-                let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
+                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    calculate_expiration(cs, config.expiration_days)
                 });
                 (entry, days_remaining)
             })
@@ -803,8 +831,8 @@ impl InputHandler {
         let mut entry_rows: Vec<_> = entries
             .into_iter()
             .map(|entry| {
-                let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
+                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    calculate_expiration(cs, config.expiration_days)
                 });
                 (entry, days_remaining)
             })
@@ -932,8 +960,8 @@ impl InputHandler {
         let mut entry_rows: Vec<_> = entries
             .into_iter()
             .map(|entry| {
-                let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
+                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    calculate_expiration(cs, config.expiration_days)
                 });
                 (entry, days_remaining)
             })
@@ -1061,8 +1089,8 @@ impl InputHandler {
         let mut entry_rows: Vec<_> = entries
             .into_iter()
             .map(|entry| {
-                let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
+                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    calculate_expiration(cs, config.expiration_days)
                 });
                 (entry, days_remaining)
             })
@@ -1243,8 +1271,8 @@ impl InputHandler {
         let mut entry_rows: Vec<_> = entries
             .into_iter()
             .map(|entry| {
-                let days_remaining = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
+                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    calculate_expiration(cs, config.expiration_days)
                 });
                 (entry, days_remaining)
             })
@@ -2033,14 +2061,18 @@ mod tests {
             app.pending_entry_delete.is_some(),
             "pending_file_delete should be set"
         );
-        let files = app
+        let deletion = app
             .pending_entry_delete
             .as_ref()
             .expect("Expected pending delete");
-        assert_eq!(files.len(), 1, "Should have one file pending deletion");
-        assert_eq!(files[0].id, file_ids[0], "Should be first file");
         assert_eq!(
-            files[0].path,
+            deletion.entries.len(),
+            1,
+            "Should have one file pending deletion"
+        );
+        assert_eq!(deletion.entries[0].id, file_ids[0], "Should be first file");
+        assert_eq!(
+            deletion.entries[0].path,
             PathBuf::from("/test/dir/file1.txt"),
             "Path should match first file"
         );
@@ -2091,11 +2123,14 @@ mod tests {
         app.current_root_id = Some(root_id);
 
         // Manually set pending delete (simulating 'd' key press)
-        app.pending_entry_delete = Some(vec![PendingEntry {
-            id: entry_id,
-            path: file_path.clone(),
-            is_dir: false,
-        }]);
+        app.pending_entry_delete = Some(PendingDeletion {
+            entries: vec![PendingEntry {
+                id: entry_id,
+                path: file_path.clone(),
+                is_dir: false,
+            }],
+            method: RemovalMethod::Trash,
+        });
 
         // Press 'y' to confirm
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));
@@ -2145,11 +2180,14 @@ mod tests {
         app.current_root_id = Some(dir_id);
 
         // Manually set pending delete
-        app.pending_entry_delete = Some(vec![PendingEntry {
-            id: file_ids[0],
-            path: PathBuf::from("/test/dir/file1.txt"),
-            is_dir: false,
-        }]);
+        app.pending_entry_delete = Some(PendingDeletion {
+            entries: vec![PendingEntry {
+                id: file_ids[0],
+                path: PathBuf::from("/test/dir/file1.txt"),
+                is_dir: false,
+            }],
+            method: RemovalMethod::Trash,
+        });
 
         // Press 'n' to cancel
         InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('n')));
@@ -2498,8 +2536,8 @@ mod tests {
         let mut entry_rows: Vec<_> = entries
             .into_iter()
             .map(|entry| {
-                let days = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
+                let days = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    calculate_expiration(cs, config.expiration_days)
                 });
                 (entry, days)
             })
@@ -2543,8 +2581,8 @@ mod tests {
         let mut entry_rows: Vec<_> = entries
             .into_iter()
             .map(|entry| {
-                let days = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
+                let days = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    calculate_expiration(cs, config.expiration_days)
                 });
                 (entry, days)
             })
@@ -2575,8 +2613,8 @@ mod tests {
         let mut entry_rows: Vec<_> = entries
             .into_iter()
             .map(|entry| {
-                let days = entry.mtime.map_or(i64::MAX, |m| {
-                    calculate_expiration(m, config.expiration_days)
+                let days = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    calculate_expiration(cs, config.expiration_days)
                 });
                 (entry, days)
             })

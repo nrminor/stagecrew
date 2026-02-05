@@ -23,6 +23,7 @@ use ratatui::widgets::{ScrollbarState, TableState};
 use crate::config::Config;
 use crate::db::Database;
 use crate::error::Result;
+use crate::removal::RemovalMethod;
 use crate::scanner::{Scanner, refresh};
 
 use input::InputHandler;
@@ -36,6 +37,15 @@ pub(crate) struct PendingEntry {
     pub path: PathBuf,
     /// Whether this entry is a directory (affects propagation to children).
     pub is_dir: bool,
+}
+
+/// State for an in-progress deletion action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingDeletion {
+    /// Entries to be deleted.
+    pub entries: Vec<PendingEntry>,
+    /// How to remove the files (trash or permanent delete).
+    pub method: RemovalMethod,
 }
 
 /// State for an in-progress deferral action.
@@ -206,7 +216,7 @@ pub struct App {
     pub(crate) current_path: PathBuf,
 
     /// Pending entry deletion confirmation state.
-    pub(crate) pending_entry_delete: Option<Vec<PendingEntry>>,
+    pub(crate) pending_entry_delete: Option<PendingDeletion>,
 
     /// Pending entry deferral input state.
     pub(crate) pending_entry_deferral: Option<PendingDeferral>,
@@ -322,7 +332,7 @@ impl App {
     }
 
     /// Get the pending entry deletion confirmation state.
-    pub fn pending_entry_delete(&self) -> Option<&Vec<PendingEntry>> {
+    pub fn pending_entry_delete(&self) -> Option<&PendingDeletion> {
         self.pending_entry_delete.as_ref()
     }
 

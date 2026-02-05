@@ -13,15 +13,18 @@ use crate::error::{Error, Result};
 /// Seconds in a 24-hour day (not calendar-aware).
 const SECS_PER_DAY: i64 = 86400;
 
-/// Calculate days remaining until expiration based on modification time.
+/// Calculate days remaining until expiration based on countdown start time.
 ///
 /// Calculates the number of days remaining until a file expires, based on its
-/// modification time and the configured expiration period. Returns a negative
-/// value if the file is already expired.
+/// countdown start timestamp and the configured expiration period. Returns a
+/// negative value if the file is already expired.
+///
+/// The countdown start is typically set when a file is first tracked, and can
+/// be reset by user action to give files a fresh expiration period.
 ///
 /// # Arguments
 ///
-/// * `mtime` - Unix timestamp of the file's modification time
+/// * `countdown_start` - Unix timestamp when the expiration countdown began
 /// * `expiration_days` - Number of days until expiration
 ///
 /// # Returns
@@ -32,7 +35,7 @@ const SECS_PER_DAY: i64 = 86400;
 ///
 /// ```no_run
 /// # use jiff::Timestamp;
-/// // File modified 30 days ago, expires in 90 days
+/// // Countdown started 30 days ago, expires in 90 days
 /// const SECS_PER_DAY: i64 = 86400;
 /// let now = Timestamp::now();
 /// let thirty_days_ago = now.checked_sub(jiff::SignedDuration::from_secs(30 * SECS_PER_DAY)).unwrap();
@@ -40,14 +43,14 @@ const SECS_PER_DAY: i64 = 86400;
 /// // assert!(days_remaining > 59 && days_remaining <= 60);
 /// ```
 #[must_use = "expiration calculation result should be used"]
-pub fn calculate_expiration(mtime: i64, expiration_days: u32) -> i64 {
+pub fn calculate_expiration(countdown_start: i64, expiration_days: u32) -> i64 {
     let now = jiff::Timestamp::now();
-    let mtime_ts = jiff::Timestamp::from_second(mtime).unwrap_or(now);
+    let start_ts = jiff::Timestamp::from_second(countdown_start).unwrap_or(now);
 
     // Calculate expiration timestamp (days as 24-hour periods)
     let expiration_secs = i64::from(expiration_days) * SECS_PER_DAY;
     let expiration_duration = jiff::SignedDuration::from_secs(expiration_secs);
-    let expires_at = mtime_ts.checked_add(expiration_duration).unwrap_or(now);
+    let expires_at = start_ts.checked_add(expiration_duration).unwrap_or(now);
 
     // Calculate days remaining (using 86400-second days)
     let duration_remaining = expires_at.duration_since(now);
@@ -107,7 +110,7 @@ pub fn transition_expired_paths(
     // Get all file entries (is_dir = 0) with status 'tracked' or 'deferred'
     let conn = db.conn();
     let mut stmt = conn.prepare(
-        "SELECT id, path, mtime, tracked_since, status, deferred_until
+        "SELECT id, path, countdown_start, status, deferred_until
          FROM entries
          WHERE is_dir = 0 AND status IN ('tracked', 'deferred')",
     )?;
@@ -118,10 +121,9 @@ pub fn transition_expired_paths(
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let path = PathBuf::from(row.get::<_, String>(1)?);
-        let mtime: Option<i64> = row.get(2)?;
-        let tracked_since: Option<i64> = row.get(3)?;
-        let status: String = row.get(4)?;
-        let deferred_until: Option<i64> = row.get(5)?;
+        let countdown_start: Option<i64> = row.get(2)?;
+        let status: String = row.get(3)?;
+        let deferred_until: Option<i64> = row.get(4)?;
 
         // Handle deferred entries
         if status == "deferred"
@@ -136,15 +138,9 @@ pub fn transition_expired_paths(
 
         // Handle tracked entries (check expiration)
         if status == "tracked"
-            && let Some(mtime_ts) = mtime
+            && let Some(countdown_ts) = countdown_start
         {
-            // Use effective timestamp: max(mtime, tracked_since) for newly tracked old files
-            let effective_mtime = match tracked_since {
-                Some(ts) if ts > mtime_ts => ts,
-                _ => mtime_ts,
-            };
-
-            let days_remaining = calculate_expiration(effective_mtime, expiration_days);
+            let days_remaining = calculate_expiration(countdown_ts, expiration_days);
 
             if days_remaining <= 0 {
                 // File has expired
@@ -345,7 +341,8 @@ pub async fn scan_and_persist(
     // Scan each root
     for root in &roots {
         let path = root.path.clone();
-        tracing::info!(?path, "Scanning path");
+        let is_first_scan = root.last_scanned.is_none();
+        tracing::info!(?path, is_first_scan, "Scanning path");
 
         let root_id = root.id;
 
@@ -398,6 +395,17 @@ pub async fn scan_and_persist(
             }
 
             total_directories += 1;
+        }
+
+        // On first scan of a root, reset all countdowns to give files a fresh start.
+        // This prevents old files from immediately appearing overdue when first tracked.
+        if is_first_scan {
+            let reset_count = db.reset_root_countdowns(root_id)?;
+            tracing::info!(
+                root_id,
+                reset_count,
+                "Reset countdowns for newly tracked root"
+            );
         }
 
         // Update root's last_scanned timestamp
@@ -491,11 +499,11 @@ fn update_stats(
     // Calculate files_within_warning, files_pending_approval, and files_overdue
     // using a single UPDATE with subqueries for efficiency.
     //
-    // For files, we use the effective mtime: MAX(mtime, COALESCE(tracked_since, mtime))
-    // This ensures newly-tracked old files get a full expiration period.
+    // Expiration is based on countdown_start, not mtime. The countdown_start is set
+    // when a file is first tracked and can be reset by user action.
     //
     // days_remaining calculation:
-    //   (effective_mtime + (expiration_days * 86400) - now) / 86400
+    //   (countdown_start + (expiration_days * 86400) - now) / 86400
     //
     // files_within_warning: 0 < days_remaining <= warning_days AND status = 'tracked' AND is_dir = 0
     // files_pending_approval: status = 'pending' AND is_dir = 0
@@ -509,9 +517,9 @@ fn update_stats(
                 SELECT COUNT(*)
                 FROM entries
                 WHERE is_dir = 0
-                  AND mtime IS NOT NULL
-                  AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?4 * 86400) - ?5) / 86400) <= ?6
-                  AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?4 * 86400) - ?5) / 86400) > 0
+                  AND countdown_start IS NOT NULL
+                  AND ((countdown_start + (?4 * 86400) - ?5) / 86400) <= ?6
+                  AND ((countdown_start + (?4 * 86400) - ?5) / 86400) > 0
                   AND status = 'tracked'
             ),
             files_pending_approval = (
@@ -523,8 +531,8 @@ fn update_stats(
                 SELECT COUNT(*)
                 FROM entries
                 WHERE is_dir = 0
-                  AND mtime IS NOT NULL
-                  AND ((MAX(mtime, COALESCE(tracked_since, mtime)) + (?4 * 86400) - ?5) / 86400) <= 0
+                  AND countdown_start IS NOT NULL
+                  AND ((countdown_start + (?4 * 86400) - ?5) / 86400) <= 0
                   AND status = 'tracked'
             )
          WHERE id = 1",
@@ -1238,13 +1246,13 @@ mod tests {
             )
             .expect("insert entry");
 
-        // Backdate tracked_since to match the old mtime so effective_mtime = hundred_days_ago
+        // Backdate countdown_start so the entry is expired (expiration is based on countdown_start)
         db.conn()
             .execute(
-                "UPDATE entries SET tracked_since = ?1 WHERE id = ?2",
+                "UPDATE entries SET countdown_start = ?1 WHERE id = ?2",
                 (hundred_days_ago.as_second(), entry_id),
             )
-            .expect("failed to backdate tracked_since");
+            .expect("failed to backdate countdown_start");
 
         // Verify initial status is 'tracked'
         let entry_before = db
@@ -1307,13 +1315,13 @@ mod tests {
             )
             .expect("failed to insert test entry - database connection may be lost");
 
-        // Backdate tracked_since to match the old mtime so effective_mtime = hundred_days_ago
+        // Backdate countdown_start so the entry is expired (expiration is based on countdown_start)
         db.conn()
             .execute(
-                "UPDATE entries SET tracked_since = ?1 WHERE id = ?2",
+                "UPDATE entries SET countdown_start = ?1 WHERE id = ?2",
                 (hundred_days_ago.as_second(), entry_id),
             )
-            .expect("failed to backdate tracked_since");
+            .expect("failed to backdate countdown_start");
 
         // Run transition with auto_remove=true
         let summary = super::transition_expired_paths(&db, 90, true)
@@ -1555,13 +1563,13 @@ mod tests {
             )
             .expect("failed to insert test entry - database connection may be lost");
 
-        // Backdate tracked_since for expired entries
+        // Backdate countdown_start for expired entries (expiration is now based on countdown_start)
         db.conn()
             .execute(
-                "UPDATE entries SET tracked_since = ?1 WHERE id IN (?2, ?3)",
+                "UPDATE entries SET countdown_start = ?1 WHERE id IN (?2, ?3)",
                 (hundred_days_ago.as_second(), expired1_id, expired2_id),
             )
-            .expect("failed to backdate tracked_since");
+            .expect("failed to backdate countdown_start");
 
         // Non-expired tracked file
         db.upsert_entry(
@@ -2140,23 +2148,19 @@ mod tests {
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
-        // Manually set tracked_since to 80 days ago and mtime to even older
-        // to simulate a file tracked for 80 days. The effective timestamp will be
-        // max(mtime, tracked_since) = tracked_since = 80 days ago.
-        // This puts it in the warning period (10 days remaining, within 14-day warning)
+        // Manually set countdown_start to 80 days ago to simulate a file
+        // that has been counting down for 80 days. This puts it in the warning
+        // period (10 days remaining, within 14-day warning).
         let now = jiff::Timestamp::now();
         let eighty_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(80 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed");
-        let ninety_days_ago = now
-            .checked_sub(jiff::SignedDuration::from_secs(90 * SECS_PER_DAY))
-            .expect("timestamp arithmetic should succeed");
         db.conn()
             .execute(
-                "UPDATE entries SET tracked_since = ?1, mtime = ?2 WHERE is_dir = 0",
-                (eighty_days_ago.as_second(), ninety_days_ago.as_second()),
+                "UPDATE entries SET countdown_start = ?1 WHERE is_dir = 0",
+                (eighty_days_ago.as_second(),),
             )
-            .expect("failed to update tracked_since for test");
+            .expect("failed to update countdown_start for test");
 
         // Update stats
         update_stats(&db, 1, 100, now.as_second(), 90, 14).expect("failed to update stats");
@@ -2249,25 +2253,18 @@ mod tests {
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
-        // Manually set tracked_since to 100 days ago and mtime to even older
-        // to simulate a file that's been tracked for a long time.
-        // The effective timestamp will be max(mtime, tracked_since) = tracked_since = 100 days ago.
+        // Manually set countdown_start to 100 days ago to simulate a file
+        // that has been counting down for 100 days (past the 90-day expiration).
         let now = jiff::Timestamp::now();
         let hundred_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(100 * SECS_PER_DAY))
             .expect("timestamp arithmetic should succeed");
-        let two_hundred_days_ago = now
-            .checked_sub(jiff::SignedDuration::from_secs(200 * SECS_PER_DAY))
-            .expect("timestamp arithmetic should succeed");
         db.conn()
             .execute(
-                "UPDATE entries SET tracked_since = ?1, mtime = ?2 WHERE is_dir = 0",
-                (
-                    hundred_days_ago.as_second(),
-                    two_hundred_days_ago.as_second(),
-                ),
+                "UPDATE entries SET countdown_start = ?1 WHERE is_dir = 0",
+                (hundred_days_ago.as_second(),),
             )
-            .expect("failed to update tracked_since for test");
+            .expect("failed to update countdown_start for test");
 
         // Update stats
         update_stats(&db, 1, 100, now.as_second(), 90, 14).expect("failed to update stats");
@@ -2355,18 +2352,18 @@ mod tests {
         .await
         .expect("failed to scan and persist - check permissions and database connection");
 
-        // Backdate tracked_since for the overdue file to simulate
-        // a file that has been tracked for 100 days (not just discovered today).
+        // Backdate countdown_start for the overdue file to simulate
+        // a file that has been counting down for 100 days (past the 90-day expiration).
         let overdue_file_path = overdue_dir.join("overdue.txt");
         db.conn()
             .execute(
-                "UPDATE entries SET tracked_since = ?1 WHERE path = ?2",
+                "UPDATE entries SET countdown_start = ?1 WHERE path = ?2",
                 (
                     hundred_days_ago.as_second(),
                     overdue_file_path.to_string_lossy().as_ref(),
                 ),
             )
-            .expect("failed to backdate tracked_since");
+            .expect("failed to backdate countdown_start");
 
         // Mark warning file as 'pending'
         let warning_file_path = warning_dir.join("warning.txt");
@@ -2483,23 +2480,19 @@ mod tests {
             .await
             .expect("scan_and_persist failed - check file permissions and database connection");
 
-        // Manually set tracked_since to 25 days ago and mtime to even older
-        // to simulate a file tracked for 25 days. The effective timestamp will be
-        // max(mtime, tracked_since) = tracked_since = 25 days ago.
-        // This gives it 5 days remaining, which is within the 7-day warning period
+        // Manually set countdown_start to 25 days ago to simulate a file
+        // that has been counting down for 25 days. This gives it 5 days remaining,
+        // which is within the 7-day warning period.
         let now = jiff::Timestamp::now();
         let twentyfive_days_ago = now
             .checked_sub(jiff::SignedDuration::from_secs(25 * SECS_PER_DAY))
             .expect("timestamp arithmetic overflow");
-        let thirty_days_ago = now
-            .checked_sub(jiff::SignedDuration::from_secs(30 * SECS_PER_DAY))
-            .expect("timestamp arithmetic overflow");
         db.conn()
             .execute(
-                "UPDATE entries SET tracked_since = ?1, mtime = ?2 WHERE is_dir = 0",
-                (twentyfive_days_ago.as_second(), thirty_days_ago.as_second()),
+                "UPDATE entries SET countdown_start = ?1 WHERE is_dir = 0",
+                (twentyfive_days_ago.as_second(),),
             )
-            .expect("failed to update tracked_since for test");
+            .expect("failed to update countdown_start for test");
 
         // Update stats
         update_stats(&db, 1, 50, now.as_second(), 30, 7).expect("failed to update stats");

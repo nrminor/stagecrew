@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::error::{Error, Result};
+use crate::removal::RemovalMethod;
 
 /// A user-configured tracked root path.
 ///
@@ -48,6 +49,12 @@ pub struct Entry {
     pub mtime: Option<i64>,
     /// Unix timestamp when entry was first tracked by stagecrew.
     pub tracked_since: Option<i64>,
+    /// Unix timestamp when the expiration countdown started.
+    ///
+    /// This is the anchor for expiration calculation: the file expires at
+    /// `countdown_start + expiration_days`. Unlike `mtime`, this can be reset
+    /// by user action to give files a fresh expiration period.
+    pub countdown_start: Option<i64>,
     /// Current status in the lifecycle.
     pub status: String,
     /// Unix timestamp when deferral expires, or None if not deferred.
@@ -321,8 +328,8 @@ impl Database {
     /// Insert or update an entry in the database.
     ///
     /// Uses UPSERT to either create a new entry or update an existing one
-    /// based on the path. On first insert, sets `tracked_since` to the current
-    /// timestamp. On update, preserves the existing `tracked_since` value.
+    /// based on the path. On first insert, sets `tracked_since` and `countdown_start`
+    /// to the current timestamp. On update, preserves the existing values for both.
     ///
     /// # Arguments
     ///
@@ -354,8 +361,8 @@ impl Database {
         let path_str = path.to_string_lossy();
         let parent_path_str = parent_path.to_string_lossy();
         self.conn.execute(
-            "INSERT INTO entries (root_id, path, parent_path, is_dir, size_bytes, mtime, tracked_since)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'))
+            "INSERT INTO entries (root_id, path, parent_path, is_dir, size_bytes, mtime, tracked_since, countdown_start)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'), strftime('%s', 'now'))
              ON CONFLICT(path) DO UPDATE SET
                  root_id = excluded.root_id,
                  parent_path = excluded.parent_path,
@@ -389,7 +396,7 @@ impl Database {
         let path_str = path.to_string_lossy();
         let mut stmt = self.conn.prepare(
             "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
-                    tracked_since, status, deferred_until, created_at, updated_at
+                    tracked_since, countdown_start, status, deferred_until, created_at, updated_at
              FROM entries
              WHERE path = ?1",
         )?;
@@ -405,10 +412,11 @@ impl Database {
                 size_bytes: row.get(5)?,
                 mtime: row.get(6)?,
                 tracked_since: row.get(7)?,
-                status: row.get(8)?,
-                deferred_until: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                countdown_start: row.get(8)?,
+                status: row.get(9)?,
+                deferred_until: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             }))
         } else {
             Ok(None)
@@ -435,7 +443,7 @@ impl Database {
         let parent_path_str = parent_path.to_string_lossy();
         let mut stmt = self.conn.prepare(
             "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
-                    tracked_since, status, deferred_until, created_at, updated_at
+                    tracked_since, countdown_start, status, deferred_until, created_at, updated_at
              FROM entries
              WHERE parent_path = ?1 AND status != 'removed'
              ORDER BY path",
@@ -451,10 +459,11 @@ impl Database {
                 size_bytes: row.get(5)?,
                 mtime: row.get(6)?,
                 tracked_since: row.get(7)?,
-                status: row.get(8)?,
-                deferred_until: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                countdown_start: row.get(8)?,
+                status: row.get(9)?,
+                deferred_until: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         })?;
 
@@ -474,7 +483,7 @@ impl Database {
     pub fn list_entries_by_root(&self, root_id: i64) -> Result<Vec<Entry>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
-                    tracked_since, status, deferred_until, created_at, updated_at
+                    tracked_since, countdown_start, status, deferred_until, created_at, updated_at
              FROM entries
              WHERE root_id = ?1 AND status != 'removed'
              ORDER BY path",
@@ -490,10 +499,11 @@ impl Database {
                 size_bytes: row.get(5)?,
                 mtime: row.get(6)?,
                 tracked_since: row.get(7)?,
-                status: row.get(8)?,
-                deferred_until: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                countdown_start: row.get(8)?,
+                status: row.get(9)?,
+                deferred_until: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         })?;
 
@@ -525,22 +535,23 @@ impl Database {
                 size_bytes: row.get(5)?,
                 mtime: row.get(6)?,
                 tracked_since: row.get(7)?,
-                status: row.get(8)?,
-                deferred_until: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                countdown_start: row.get(8)?,
+                status: row.get(9)?,
+                deferred_until: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         };
 
         let query = if status_filter.is_some() {
             "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
-                    tracked_since, status, deferred_until, created_at, updated_at
+                    tracked_since, countdown_start, status, deferred_until, created_at, updated_at
              FROM entries
              WHERE status = ?1
              ORDER BY path"
         } else {
             "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
-                    tracked_since, status, deferred_until, created_at, updated_at
+                    tracked_since, countdown_start, status, deferred_until, created_at, updated_at
              FROM entries
              ORDER BY path"
         };
@@ -661,25 +672,47 @@ impl Database {
     /// For files: removes the file from disk and marks as 'removed'.
     /// For directories: removes the directory recursively and marks as 'removed'.
     ///
+    /// The `method` parameter determines whether to move to trash (recoverable)
+    /// or permanently delete (irreversible).
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The entry doesn't exist
     /// - The filesystem deletion fails (permission denied, etc.)
-    pub fn delete_entry(&self, entry_id: i64, path: &Path, is_dir: bool) -> Result<()> {
-        // Attempt filesystem deletion
-        let fs_result = if is_dir {
-            std::fs::remove_dir_all(path)
-        } else {
-            std::fs::remove_file(path)
-        };
+    /// - The trash operation fails (on platforms that support it)
+    pub fn delete_entry(
+        &self,
+        entry_id: i64,
+        path: &Path,
+        is_dir: bool,
+        method: RemovalMethod,
+    ) -> Result<()> {
+        // Attempt filesystem deletion using the specified method
+        match method {
+            RemovalMethod::Trash => {
+                trash::delete(path).map_err(|e| Error::Trash {
+                    path: path.to_path_buf(),
+                    message: e.to_string(),
+                })?;
+            }
+            RemovalMethod::PermanentDelete => {
+                let fs_result = if is_dir {
+                    std::fs::remove_dir_all(path)
+                } else {
+                    std::fs::remove_file(path)
+                };
 
-        if let Err(e) = fs_result {
-            return Err(match e.kind() {
-                std::io::ErrorKind::PermissionDenied => Error::PermissionDenied(path.to_path_buf()),
-                std::io::ErrorKind::NotFound => Error::PathNotFound(path.to_path_buf()),
-                _ => Error::Io(e),
-            });
+                if let Err(e) = fs_result {
+                    return Err(match e.kind() {
+                        std::io::ErrorKind::PermissionDenied => {
+                            Error::PermissionDenied(path.to_path_buf())
+                        }
+                        std::io::ErrorKind::NotFound => Error::PathNotFound(path.to_path_buf()),
+                        _ => Error::Io(e),
+                    });
+                }
+            }
         }
 
         // Update database status to 'removed'
@@ -691,6 +724,45 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// Reset all countdowns for entries in a root.
+    ///
+    /// This gives all files in the root a fresh expiration period by:
+    /// - Setting `countdown_start` to the current timestamp
+    /// - Resetting `status` to 'tracked' for any 'pending' or 'approved' entries
+    /// - Clearing `deferred_until` for any 'deferred' entries
+    ///
+    /// Entries with status 'ignored' or 'removed' are not affected.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries that were reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub fn reset_root_countdowns(&self, root_id: i64) -> Result<usize> {
+        let now = jiff::Timestamp::now().as_second();
+
+        // Reset countdown_start for all non-ignored, non-removed entries
+        let rows_affected = self.conn.execute(
+            "UPDATE entries
+             SET countdown_start = ?1,
+                 status = CASE
+                     WHEN status IN ('pending', 'approved', 'deferred') THEN 'tracked'
+                     ELSE status
+                 END,
+                 deferred_until = CASE
+                     WHEN status = 'deferred' THEN NULL
+                     ELSE deferred_until
+                 END,
+                 updated_at = strftime('%s', 'now')
+             WHERE root_id = ?2 AND status NOT IN ('ignored', 'removed')",
+            (now, root_id),
+        )?;
+
+        Ok(rows_affected)
     }
 
     // =========================================================================
@@ -765,37 +837,37 @@ impl Database {
                      WHERE is_dir = 0 AND status NOT IN ('removed', 'ignored')),
                     -- 2: files within warning period
                     (SELECT COUNT(*) FROM entries
-                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
-                       AND ((mtime + (?1 * 86400) - ?2) / 86400) <= ?3
-                       AND ((mtime + (?1 * 86400) - ?2) / 86400) > 0),
+                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
+                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= ?3
+                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) > 0),
                     -- 3: files pending approval
                     (SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status = 'pending'),
                     -- 4: files overdue
                     (SELECT COUNT(*) FROM entries
-                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
-                       AND ((mtime + (?1 * 86400) - ?2) / 86400) <= 0),
+                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
+                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= 0),
                     -- 5: last scan completed
                     (SELECT last_scan_completed FROM stats WHERE id = 1),
                     -- 6: healthy files (tracked, outside warning period)
                     (SELECT COUNT(*) FROM entries
-                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
-                       AND ((mtime + (?1 * 86400) - ?2) / 86400) > ?3),
+                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
+                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) > ?3),
                     -- 7: healthy bytes
                     (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
-                       AND ((mtime + (?1 * 86400) - ?2) / 86400) > ?3),
+                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
+                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) > ?3),
                     -- 8: warning bytes
                     (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
-                       AND ((mtime + (?1 * 86400) - ?2) / 86400) <= ?3
-                       AND ((mtime + (?1 * 86400) - ?2) / 86400) > 0),
+                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
+                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= ?3
+                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) > 0),
                     -- 9: pending bytes
                     (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
                      WHERE is_dir = 0 AND status = 'pending'),
                     -- 10: overdue bytes
                     (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND mtime IS NOT NULL AND status = 'tracked'
-                       AND ((mtime + (?1 * 86400) - ?2) / 86400) <= 0),
+                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
+                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= 0),
                     -- 11: ignored files
                     (SELECT COUNT(*) FROM entries
                      WHERE is_dir = 0 AND status = 'ignored'),
@@ -1720,20 +1792,30 @@ mod tests {
         let root_id = db.insert_root(Path::new("/data")).expect("insert root");
 
         // Insert a file entry
-        db.upsert_entry(
-            root_id,
-            Path::new("/data/file1.txt"),
-            Path::new("/data"),
-            false,
-            1024,
-            Some(1_700_000_000),
-        )
-        .expect("upsert");
+        let entry_id = db
+            .upsert_entry(
+                root_id,
+                Path::new("/data/file1.txt"),
+                Path::new("/data"),
+                false,
+                1024,
+                Some(1_700_000_000),
+            )
+            .expect("upsert");
+
+        // Set countdown_start to an old timestamp (Nov 2023) to make it overdue.
+        // Expiration is based on countdown_start, not mtime.
+        db.conn()
+            .execute(
+                "UPDATE entries SET countdown_start = ?1 WHERE id = ?2",
+                (1_700_000_000_i64, entry_id),
+            )
+            .expect("backdate countdown_start");
 
         let stats = db.compute_live_stats(90, 14).expect("compute_live_stats");
         assert_eq!(stats.total_files, 1, "should count one file");
         assert_eq!(stats.total_size_bytes, 1024, "should sum size");
-        // mtime is Nov 2023, well past 90-day expiration
+        // countdown_start is Nov 2023, well past 90-day expiration
         assert_eq!(stats.files_overdue, 1, "old file should be overdue");
     }
 
