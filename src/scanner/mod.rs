@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use jwalk::WalkDir;
 
 use crate::audit::{AuditAction, AuditService};
-use crate::db::Database;
+use crate::config::{AppConfig, Config};
+use crate::db::{Database, Root};
 use crate::error::{Error, Result};
 
 /// Seconds in a 24-hour day (not calendar-aware).
@@ -57,25 +58,20 @@ pub fn calculate_expiration(countdown_start: i64, expiration_days: u32) -> i64 {
     duration_remaining.as_secs() / SECS_PER_DAY
 }
 
-/// Transition entries based on expiration and deferral status.
+/// Transition entries based on expiration and deferral status using per-root config.
 ///
 /// This function implements the core business logic for the removal-by-default
 /// policy. It processes file entries in the database and transitions them between
-/// states based on their expiration status:
+/// states based on their expiration status, using per-root configuration for
+/// expiration periods and auto-remove settings.
 ///
-/// - **Tracked files**: If expired, transition to `pending` (or `approved` if `auto_remove` is enabled)
+/// - **Tracked files**: If expired, transition to `pending` (or `approved` if `auto_remove` is enabled for that root)
 /// - **Deferred files**: If the deferral period has ended, reset status to `tracked` and clear `deferred_until`
 /// - **Ignored files**: Never transitioned (permanent exemption)
 ///
 /// Note: Only files (not directories) are subject to expiration.
 ///
 /// This function is typically called after a scan to update the workflow state.
-///
-/// # Arguments
-///
-/// * `db` - Database connection
-/// * `expiration_days` - Number of days until expiration
-/// * `auto_remove` - If true, expired files go to `approved` instead of `pending`
 ///
 /// # Returns
 ///
@@ -89,17 +85,18 @@ pub fn calculate_expiration(countdown_start: i64, expiration_days: u32) -> i64 {
 ///
 /// ```no_run
 /// # use std::path::Path;
+/// # use stagecrew::config::{AppConfig, Config};
 /// // In real code:
 /// // let db = Database::open(Path::new("test.db"))?;
-/// // let summary = transition_expired_paths(&db, 90, false)?;
+/// // let app_config = AppConfig::from_global(Config::default());
+/// // let summary = transition_expired_paths(&db, &app_config)?;
 /// // println!("Transitioned {} to pending, {} reset from deferred",
 /// //          summary.expired_to_pending, summary.deferred_reset);
 /// ```
 #[must_use = "transition summary should be logged or displayed"]
 pub fn transition_expired_paths(
     db: &Database,
-    expiration_days: u32,
-    auto_remove: bool,
+    app_config: &AppConfig,
 ) -> Result<TransitionSummary> {
     let mut expired_to_pending = 0u64;
     let mut expired_to_approved = 0u64;
@@ -107,10 +104,17 @@ pub fn transition_expired_paths(
 
     let now = jiff::Timestamp::now().as_second();
 
+    // Build root_id -> Config lookup
+    let roots = db.list_roots()?;
+    let root_configs: HashMap<i64, &Config> = roots
+        .iter()
+        .map(|r| (r.id, app_config.for_root(&r.path)))
+        .collect();
+
     // Get all file entries (is_dir = 0) with status 'tracked' or 'deferred'
     let conn = db.conn();
     let mut stmt = conn.prepare(
-        "SELECT id, path, countdown_start, status, deferred_until
+        "SELECT id, root_id, path, countdown_start, status, deferred_until
          FROM entries
          WHERE is_dir = 0 AND status IN ('tracked', 'deferred')",
     )?;
@@ -120,12 +124,19 @@ pub fn transition_expired_paths(
 
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
-        let path = PathBuf::from(row.get::<_, String>(1)?);
-        let countdown_start: Option<i64> = row.get(2)?;
-        let status: String = row.get(3)?;
-        let deferred_until: Option<i64> = row.get(4)?;
+        let root_id: i64 = row.get(1)?;
+        let path = PathBuf::from(row.get::<_, String>(2)?);
+        let countdown_start: Option<i64> = row.get(3)?;
+        let status: String = row.get(4)?;
+        let deferred_until: Option<i64> = row.get(5)?;
 
-        // Handle deferred entries
+        // Get config for this entry's root (fall back to global if root not found)
+        let config = root_configs
+            .get(&root_id)
+            .copied()
+            .unwrap_or(&app_config.global);
+
+        // Handle deferred entries (deferral reset is config-independent)
         if status == "deferred"
             && let Some(deferred_until_ts) = deferred_until
             && now >= deferred_until_ts
@@ -136,18 +147,22 @@ pub fn transition_expired_paths(
             continue;
         }
 
-        // Handle tracked entries (check expiration)
+        // Handle tracked entries (check expiration using per-root config)
         if status == "tracked"
             && let Some(countdown_ts) = countdown_start
         {
-            let days_remaining = calculate_expiration(countdown_ts, expiration_days);
+            let days_remaining = calculate_expiration(countdown_ts, config.expiration_days);
 
             if days_remaining <= 0 {
                 // File has expired
-                let new_status = if auto_remove { "approved" } else { "pending" };
+                let new_status = if config.auto_remove {
+                    "approved"
+                } else {
+                    "pending"
+                };
                 transitions.push((id, path, new_status.to_string(), false));
 
-                if auto_remove {
+                if config.auto_remove {
                     expired_to_approved += 1;
                 } else {
                     expired_to_pending += 1;
@@ -236,7 +251,7 @@ pub struct RefreshSummary {
 /// This is the primary entry point for bringing the database up to date. It
 /// composes two operations: scanning the filesystem to discover and upsert
 /// entries, then transitioning any expired files to the appropriate status
-/// (pending approval or auto-approved, depending on configuration).
+/// (pending approval or auto-approved, depending on per-root configuration).
 ///
 /// All call sites that need a "full refresh" should use this function rather
 /// than calling `scan_and_persist` and `transition_expired_paths` separately,
@@ -251,33 +266,23 @@ pub struct RefreshSummary {
 /// ```no_run
 /// # use stagecrew::scanner::{refresh, Scanner};
 /// # use stagecrew::db::Database;
-/// # use stagecrew::config::Config;
+/// # use stagecrew::config::{AppConfig, Config};
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let db = Database::open(std::path::Path::new("test.db"))?;
 /// let scanner = Scanner::new();
-/// let config = Config::default();
+/// let app_config = AppConfig::from_global(Config::default());
 ///
-/// let summary = refresh(&db, &scanner, &config.tracked_paths, config.expiration_days, config.warning_days, config.auto_remove).await?;
+/// let summary = refresh(&db, &scanner, &app_config).await?;
 /// # Ok::<(), stagecrew::error::Error>(())
 /// # }).unwrap();
 /// ```
 pub async fn refresh(
     db: &Database,
     scanner: &Scanner,
-    config_tracked_paths: &[PathBuf],
-    expiration_days: u32,
-    warning_days: u32,
-    auto_remove: bool,
+    app_config: &AppConfig,
 ) -> Result<RefreshSummary> {
-    let scan = scan_and_persist(
-        db,
-        scanner,
-        config_tracked_paths,
-        expiration_days,
-        warning_days,
-    )
-    .await?;
-    let transitions = transition_expired_paths(db, expiration_days, auto_remove)?;
+    let scan = scan_and_persist(db, scanner, app_config).await?;
+    let transitions = transition_expired_paths(db, app_config)?;
     Ok(RefreshSummary { scan, transitions })
 }
 
@@ -288,7 +293,7 @@ pub async fn refresh(
 /// 2. Query all roots from the database (config baseline + user-added)
 /// 3. Scan each root path using the scanner
 /// 4. Upsert both directory and file entries into the database
-/// 5. Update the stats table with aggregated totals and expiration counts
+/// 5. Update the stats table with aggregated totals and per-root expiration counts
 /// 6. Record the scan action in the audit log
 ///
 /// The database is the source of truth for which paths to scan. Config
@@ -307,23 +312,21 @@ pub async fn refresh(
 /// ```no_run
 /// # use stagecrew::scanner::{scan_and_persist, Scanner};
 /// # use stagecrew::db::Database;
-/// # use stagecrew::config::Config;
+/// # use stagecrew::config::{AppConfig, Config};
 /// # use std::path::PathBuf;
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let db = Database::open(std::path::Path::new("test.db"))?;
 /// let scanner = Scanner::new();
-/// let config = Config::default();
+/// let app_config = AppConfig::from_global(Config::default());
 ///
-/// scan_and_persist(&db, &scanner, &config.tracked_paths, config.expiration_days, config.warning_days).await?;
+/// scan_and_persist(&db, &scanner, &app_config).await?;
 /// # Ok::<(), stagecrew::error::Error>(())
 /// # }).unwrap();
 /// ```
 pub async fn scan_and_persist(
     db: &Database,
     scanner: &Scanner,
-    config_tracked_paths: &[PathBuf],
-    expiration_days: u32,
-    warning_days: u32,
+    app_config: &AppConfig,
 ) -> Result<ScanSummary> {
     let mut total_directories = 0u64;
     let mut total_files = 0u64;
@@ -331,7 +334,7 @@ pub async fn scan_and_persist(
     let scan_timestamp = jiff::Timestamp::now().as_second();
 
     // Seed config baseline paths as roots in the database
-    for path in config_tracked_paths {
+    for path in &app_config.global.tracked_paths {
         db.insert_root(path)?;
     }
 
@@ -415,7 +418,7 @@ pub async fn scan_and_persist(
         total_size_bytes += scan_result.total_size_bytes;
     }
 
-    // Update stats table
+    // Update stats table with per-root expiration awareness
     // Allow: Total counts are realistic filesystem statistics that won't exceed i64::MAX.
     #[allow(clippy::cast_possible_wrap)]
     update_stats(
@@ -423,8 +426,8 @@ pub async fn scan_and_persist(
         total_files as i64,
         total_size_bytes as i64,
         scan_timestamp,
-        expiration_days,
-        warning_days,
+        app_config,
+        &roots,
     )?;
 
     // Record scan in audit log
@@ -458,7 +461,7 @@ pub async fn scan_and_persist(
     })
 }
 
-/// Update the stats table with scan results.
+/// Update the stats table with scan results using per-root expiration settings.
 ///
 /// This updates the singleton stats row (id=1) with total counts, warning counts,
 /// and timestamps. The stats table is used by the status command for fast queries.
@@ -468,83 +471,91 @@ pub async fn scan_and_persist(
 /// - `files_pending_approval`: files with status = 'pending'
 /// - `files_overdue`: files with `days_remaining` <= 0 AND status = 'tracked'
 ///
-/// All calculations are performed in a single SQL UPDATE statement using subqueries
-/// for efficiency. Only files (`is_dir` = 0) are counted.
-///
-/// # Arguments
-///
-/// * `db` - Database connection
-/// * `total_files` - Total number of tracked files
-/// * `total_size_bytes` - Total size in bytes across all tracked files
-/// * `scan_timestamp` - Unix timestamp when the scan completed
-/// * `expiration_days` - Number of days until expiration (from config)
-/// * `warning_days` - Number of days before expiration to start warning (from config)
+/// Unlike the previous implementation that used SQL subqueries with a single global
+/// expiration period, this version computes stats in Rust to support per-root
+/// expiration and warning settings.
 ///
 /// # Errors
 ///
-/// Returns an error if the database UPDATE fails.
+/// Returns an error if database operations fail.
 fn update_stats(
     db: &Database,
     total_files: i64,
     total_size_bytes: i64,
     scan_timestamp: i64,
-    expiration_days: u32,
-    warning_days: u32,
+    app_config: &AppConfig,
+    roots: &[Root],
 ) -> Result<()> {
-    let now = jiff::Timestamp::now().as_second();
+    // Build root_id -> (expiration_days, warning_days) lookup
+    let root_configs: HashMap<i64, (u32, u32)> = roots
+        .iter()
+        .map(|r| {
+            let cfg = app_config.for_root(&r.path);
+            (r.id, (cfg.expiration_days, cfg.warning_days))
+        })
+        .collect();
 
-    let expiration_days_i64 = i64::from(expiration_days);
-    let warning_days_i64 = i64::from(warning_days);
+    // Query entries and compute stats in Rust for per-root awareness
+    let mut files_within_warning = 0i64;
+    let mut files_overdue = 0i64;
 
-    // Calculate files_within_warning, files_pending_approval, and files_overdue
-    // using a single UPDATE with subqueries for efficiency.
-    //
-    // Expiration is based on countdown_start, not mtime. The countdown_start is set
-    // when a file is first tracked and can be reset by user action.
-    //
-    // days_remaining calculation:
-    //   (countdown_start + (expiration_days * 86400) - now) / 86400
-    //
-    // files_within_warning: 0 < days_remaining <= warning_days AND status = 'tracked' AND is_dir = 0
-    // files_pending_approval: status = 'pending' AND is_dir = 0
-    // files_overdue: days_remaining <= 0 AND status = 'tracked' AND is_dir = 0
+    let mut stmt = db.conn().prepare(
+        "SELECT root_id, countdown_start, status
+         FROM entries
+         WHERE is_dir = 0 AND countdown_start IS NOT NULL",
+    )?;
+
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let root_id: i64 = row.get(0)?;
+        let countdown_start: i64 = row.get(1)?;
+        let status: String = row.get(2)?;
+
+        let (expiration_days, warning_days) = root_configs.get(&root_id).copied().unwrap_or((
+            app_config.global.expiration_days,
+            app_config.global.warning_days,
+        ));
+
+        let days_remaining = calculate_expiration(countdown_start, expiration_days);
+
+        if status == "tracked" {
+            if days_remaining <= 0 {
+                files_overdue += 1;
+            } else if days_remaining <= i64::from(warning_days) {
+                files_within_warning += 1;
+            }
+        }
+    }
+
+    drop(rows);
+    drop(stmt);
+
+    // files_pending_approval doesn't depend on expiration config
+    let files_pending: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status = 'pending'",
+        [],
+        |row| row.get(0),
+    )?;
+
     db.conn().execute(
         "UPDATE stats SET
             total_files = ?1,
             total_size_bytes = ?2,
             last_scan_completed = ?3,
-            files_within_warning = (
-                SELECT COUNT(*)
-                FROM entries
-                WHERE is_dir = 0
-                  AND countdown_start IS NOT NULL
-                  AND ((countdown_start + (?4 * 86400) - ?5) / 86400) <= ?6
-                  AND ((countdown_start + (?4 * 86400) - ?5) / 86400) > 0
-                  AND status = 'tracked'
-            ),
-            files_pending_approval = (
-                SELECT COUNT(*)
-                FROM entries
-                WHERE is_dir = 0 AND status = 'pending'
-            ),
-            files_overdue = (
-                SELECT COUNT(*)
-                FROM entries
-                WHERE is_dir = 0
-                  AND countdown_start IS NOT NULL
-                  AND ((countdown_start + (?4 * 86400) - ?5) / 86400) <= 0
-                  AND status = 'tracked'
-            )
+            files_within_warning = ?4,
+            files_pending_approval = ?5,
+            files_overdue = ?6
          WHERE id = 1",
         (
             total_files,
             total_size_bytes,
             scan_timestamp,
-            expiration_days_i64,
-            now,
-            warning_days_i64,
+            files_within_warning,
+            files_pending,
+            files_overdue,
         ),
     )?;
+
     Ok(())
 }
 
@@ -799,6 +810,7 @@ mod tests {
     // Allow: Test code should panic on unexpected errors for fast failure.
     // Using expect() instead of unwrap() in tests adds noise without value.
     use super::*;
+    use crate::config::{AppConfig, Config};
     use filetime::{FileTime, set_file_mtime};
     use std::fs::File;
     use std::io::Write;
@@ -809,6 +821,30 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("failed to create temp file");
         let db = crate::db::Database::open(temp_file.path()).expect("failed to open database");
         (temp_file, db)
+    }
+
+    /// Creates an `AppConfig` for testing with specified expiration settings.
+    fn test_app_config(expiration_days: u32, warning_days: u32, auto_remove: bool) -> AppConfig {
+        AppConfig::from_global(Config {
+            expiration_days,
+            warning_days,
+            auto_remove,
+            ..Config::default()
+        })
+    }
+
+    /// Creates an `AppConfig` with tracked paths for scan tests.
+    fn test_app_config_with_paths(
+        paths: Vec<PathBuf>,
+        expiration_days: u32,
+        warning_days: u32,
+    ) -> AppConfig {
+        AppConfig::from_global(Config {
+            tracked_paths: paths,
+            expiration_days,
+            warning_days,
+            ..Config::default()
+        })
     }
 
     /// Helper to create a temporary directory with test files.
@@ -1264,7 +1300,8 @@ mod tests {
         assert_eq!(entry_before.status, "tracked");
 
         // Run transition with 90-day expiration policy and auto_remove=false
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 1);
@@ -1324,7 +1361,8 @@ mod tests {
             .expect("failed to backdate countdown_start");
 
         // Run transition with auto_remove=true
-        let summary = super::transition_expired_paths(&db, 90, true)
+        let app_config = test_app_config(90, 14, true);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
@@ -1361,7 +1399,8 @@ mod tests {
         .expect("failed to insert test entry - database connection may be lost");
 
         // Run transition with 90-day policy
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
@@ -1417,7 +1456,8 @@ mod tests {
         assert!(entry_before.deferred_until.is_some());
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
@@ -1464,7 +1504,8 @@ mod tests {
             .expect("failed to update entry status in test - database connection may be lost");
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
@@ -1507,7 +1548,8 @@ mod tests {
             .expect("failed to update entry status - database connection may be lost");
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
@@ -1601,7 +1643,8 @@ mod tests {
             .expect("failed to update entry status in test - database connection may be lost");
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 2);
@@ -1656,7 +1699,8 @@ mod tests {
         .expect("failed to insert test entry - database connection may be lost");
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         // Should not transition entries without mtime
@@ -1689,7 +1733,8 @@ mod tests {
         .expect("failed to insert test entry - database connection may be lost");
 
         // Run transition
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         // Directory should not be transitioned
@@ -1731,7 +1776,8 @@ mod tests {
                 .expect("failed to update entry status - database connection may be lost");
         }
 
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
@@ -1777,7 +1823,8 @@ mod tests {
             )
             .expect("failed to update entry status in test - database connection may be lost");
 
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         // Should NOT reset because deferred_until is None
@@ -1794,7 +1841,8 @@ mod tests {
     fn transition_expired_paths_handles_empty_database() {
         let (_temp, db) = temp_database();
 
-        let summary = super::transition_expired_paths(&db, 90, false)
+        let app_config = test_app_config(90, 14, false);
+        let summary = super::transition_expired_paths(&db, &app_config)
             .expect("failed to transition expired paths - database connection may be lost");
 
         assert_eq!(summary.expired_to_pending, 0);
@@ -1833,7 +1881,8 @@ mod tests {
 
         // Run scan_and_persist
         let scanner = Scanner::new();
-        let summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+        let app_config = test_app_config_with_paths(vec![project_dir.clone()], 90, 14);
+        let summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -1896,7 +1945,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+        let app_config = test_app_config_with_paths(vec![project_dir.clone()], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -1938,7 +1988,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, &[project_dir], 90, 14)
+        let app_config = test_app_config_with_paths(vec![project_dir], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -1979,7 +2030,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, &[project_dir], 90, 14)
+        let app_config = test_app_config_with_paths(vec![project_dir], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2033,7 +2085,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let summary = scan_and_persist(&db, &scanner, &[dir1.clone(), dir2.clone()], 90, 14)
+        let app_config = test_app_config_with_paths(vec![dir1.clone(), dir2.clone()], 90, 14);
+        let summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2082,7 +2135,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+        let app_config = test_app_config_with_paths(vec![project_dir.clone()], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2102,7 +2156,7 @@ mod tests {
             .expect("failed to write test data to file - disk may be full");
 
         // Scan again
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2144,7 +2198,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&warning_dir), 90, 14)
+        let app_config = test_app_config_with_paths(vec![warning_dir.clone()], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2162,8 +2217,10 @@ mod tests {
             )
             .expect("failed to update countdown_start for test");
 
-        // Update stats
-        update_stats(&db, 1, 100, now.as_second(), 90, 14).expect("failed to update stats");
+        // Scan again to update stats with the modified countdown_start
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Verify stats were calculated correctly
         let stats = db
@@ -2201,7 +2258,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&pending_dir), 90, 14)
+        let app_config = test_app_config_with_paths(vec![pending_dir.clone()], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2215,7 +2273,7 @@ mod tests {
             .expect("failed to update entry status - database connection may be lost");
 
         // Scan again to update stats
-        let _summary = scan_and_persist(&db, &scanner, &[pending_dir], 90, 14)
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2249,7 +2307,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&overdue_dir), 90, 14)
+        let app_config = test_app_config_with_paths(vec![overdue_dir.clone()], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2266,8 +2325,10 @@ mod tests {
             )
             .expect("failed to update countdown_start for test");
 
-        // Update stats
-        update_stats(&db, 1, 100, now.as_second(), 90, 14).expect("failed to update stats");
+        // Scan again to update stats with the modified countdown_start
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Verify stats - should have 1 overdue file (status is still 'tracked')
         let stats = db
@@ -2342,15 +2403,14 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(
-            &db,
-            &scanner,
-            &[safe_dir.clone(), warning_dir.clone(), overdue_dir.clone()],
+        let app_config = test_app_config_with_paths(
+            vec![safe_dir.clone(), warning_dir.clone(), overdue_dir.clone()],
             90,
             14,
-        )
-        .await
-        .expect("failed to scan and persist - check permissions and database connection");
+        );
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Backdate countdown_start for the overdue file to simulate
         // a file that has been counting down for 100 days (past the 90-day expiration).
@@ -2375,10 +2435,9 @@ mod tests {
             .expect("failed to update entry status - database connection may be lost");
 
         // Scan again to update stats
-        let _summary =
-            scan_and_persist(&db, &scanner, &[safe_dir, warning_dir, overdue_dir], 90, 14)
-                .await
-                .expect("failed to scan and persist - check permissions and database connection");
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to scan and persist - check permissions and database connection");
 
         // Verify stats
         let stats = db
@@ -2428,7 +2487,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to open test database - check permissions and disk space");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&ignored_dir), 90, 14)
+        let app_config = test_app_config_with_paths(vec![ignored_dir.clone()], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2442,7 +2502,7 @@ mod tests {
             .expect("failed to update entry status - database connection may be lost");
 
         // Scan again to update stats
-        let _summary = scan_and_persist(&db, &scanner, &[ignored_dir], 90, 14)
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("failed to scan and persist - check permissions and database connection");
 
@@ -2476,7 +2536,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to initialize database - check disk space and SQLite is functioning");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, std::slice::from_ref(&dir), 30, 7)
+        let app_config = test_app_config_with_paths(vec![dir.clone()], 30, 7);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("scan_and_persist failed - check file permissions and database connection");
 
@@ -2494,8 +2555,10 @@ mod tests {
             )
             .expect("failed to update countdown_start for test");
 
-        // Update stats
-        update_stats(&db, 1, 50, now.as_second(), 30, 7).expect("failed to update stats");
+        // Scan again to update stats with the modified countdown_start
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("scan_and_persist failed - check file permissions and database connection");
 
         // Verify stats
         let stats = db.get_stats().expect(
@@ -2527,7 +2590,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to initialize database - check disk space and SQLite is functioning");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, &[empty_dir], 90, 14)
+        let app_config = test_app_config_with_paths(vec![empty_dir], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("scan_and_persist failed on empty directory - check permissions and database connection");
 
@@ -2565,7 +2629,8 @@ mod tests {
         let db = Database::open(&db_path)
             .expect("failed to initialize database - check disk space and SQLite is functioning");
         let scanner = Scanner::new();
-        let _summary = scan_and_persist(&db, &scanner, &[dir], 90, 14)
+        let app_config = test_app_config_with_paths(vec![dir], 90, 14);
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("scan_and_persist failed - check file permissions and database connection");
 
@@ -2627,9 +2692,10 @@ mod tests {
         let db_path = root.join("test.db");
         let db = Database::open(&db_path).expect("failed to open database - check permissions");
         let scanner = Scanner::new();
+        let app_config = test_app_config_with_paths(vec![project_dir.clone()], 90, 14);
         let before_scan = jiff::Timestamp::now().as_second();
 
-        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+        let _ = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("scan failed - check permissions");
 
@@ -2685,8 +2751,9 @@ mod tests {
         let db_path = root.join("test.db");
         let db = Database::open(&db_path).expect("failed to open database - check permissions");
         let scanner = Scanner::new();
+        let app_config = test_app_config_with_paths(vec![project_dir.clone()], 90, 14);
 
-        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+        let _ = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("first scan failed");
 
@@ -2713,7 +2780,7 @@ mod tests {
         file.sync_all().expect("failed to sync updated file");
 
         // Do second scan
-        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("second scan failed");
 
@@ -2777,8 +2844,9 @@ mod tests {
         let db_path = root.join("test.db");
         let db = Database::open(&db_path).expect("failed to open database - check permissions");
         let scanner = Scanner::new();
+        let app_config = test_app_config_with_paths(vec![project_dir.clone()], 90, 14);
 
-        let _ = scan_and_persist(&db, &scanner, std::slice::from_ref(&project_dir), 90, 14)
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
             .await
             .expect("scan failed - check permissions");
 

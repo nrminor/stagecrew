@@ -18,8 +18,9 @@ use color_eyre::eyre::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Command};
-use config::{AppPaths, Config};
+use config::{AppConfig, AppPaths, Config};
 use db::Database;
+use error::Error;
 use scanner::{Scanner, refresh};
 
 #[tokio::main]
@@ -54,22 +55,27 @@ async fn main() -> Result<()> {
     }
 
     // For all other commands, load config and open database
-    let config = Config::load(&paths).context("Failed to load configuration")?;
+    let global_config = Config::load(&paths).context("Failed to load configuration")?;
 
     // Open database (path derived from config)
     let db_path = paths
-        .database_file(&config)
+        .database_file(&global_config)
         .context("Failed to get database path")?;
     let db = Database::open(&db_path).context("Failed to open database")?;
+
+    // Build AppConfig with per-root overrides
+    let mut app_config = AppConfig::from_global(global_config);
+    let db_roots: Vec<_> = db.list_roots()?.into_iter().map(|r| r.path).collect();
+    app_config.load_per_root(&db_roots);
 
     match command {
         Command::Tui => {
             let mut app = tui::App::new();
-            app.run(&config, &db, &db_path).await?;
+            app.run(&app_config, &db, &db_path, &paths).await?;
         }
 
         Command::Daemon => {
-            let daemon = daemon::Daemon::new(config);
+            let daemon = daemon::Daemon::new(app_config);
             daemon.run().await?;
         }
 
@@ -78,11 +84,11 @@ async fn main() -> Result<()> {
         }
 
         Command::Scan { path } => {
-            handle_scan(&config, &db, path).await?;
+            handle_scan(&app_config, &db, path).await?;
         }
 
         Command::Add { path, scan } => {
-            handle_add(&config, &db, path, scan).await?;
+            handle_add(&app_config, &db, path, scan).await?;
         }
 
         Command::Init => unreachable!("Init handled above"),
@@ -138,9 +144,12 @@ fn handle_init(paths: &AppPaths) -> Result<()> {
 ///
 /// Validates that the path exists and is a directory, adds it as a root in the
 /// database, and optionally runs an initial scan.
-async fn handle_add(config: &Config, db: &Database, path: PathBuf, run_scan: bool) -> Result<()> {
-    use crate::error::Error;
-
+async fn handle_add(
+    app_config: &AppConfig,
+    db: &Database,
+    path: PathBuf,
+    run_scan: bool,
+) -> Result<()> {
     debug_assert!(!path.as_os_str().is_empty(), "path should not be empty");
 
     // Canonicalize path to resolve symlinks and normalize, preventing duplicate entries
@@ -178,16 +187,9 @@ async fn handle_add(config: &Config, db: &Database, path: PathBuf, run_scan: boo
     if run_scan {
         println!("Refreshing...");
         let scanner = Scanner::new();
-        let summary = refresh(
-            db,
-            &scanner,
-            &config.tracked_paths,
-            config.expiration_days,
-            config.warning_days,
-            config.auto_remove,
-        )
-        .await
-        .context("Failed to refresh tracked paths")?;
+        let summary = refresh(db, &scanner, app_config)
+            .await
+            .context("Failed to refresh tracked paths")?;
 
         println!(
             "Refresh complete: {} directories, {} files, {}",
@@ -218,7 +220,7 @@ async fn handle_add(config: &Config, db: &Database, path: PathBuf, run_scan: boo
 /// expired files. Config `tracked_paths` are seeded as roots in the database,
 /// then all DB roots (config baseline + user-added) are refreshed.
 /// If `--path` is provided, that path is added as a root before refreshing.
-async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> Result<()> {
+async fn handle_scan(app_config: &AppConfig, db: &Database, path: Option<PathBuf>) -> Result<()> {
     let scanner = Scanner::new();
 
     // If a specific path was provided, ensure it exists as a root in the DB
@@ -230,7 +232,8 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
 
     // Check that we'll have something to scan (config paths + DB roots)
     let db_roots = db.list_roots().context("Failed to list roots")?;
-    if config.tracked_paths.is_empty() && db_roots.is_empty() && path.is_none() {
+    let tracked_paths = &app_config.global.tracked_paths;
+    if tracked_paths.is_empty() && db_roots.is_empty() && path.is_none() {
         return Err(color_eyre::eyre::eyre!(
             "No tracked paths configured. Add paths with `stagecrew add` or set tracked_paths in config.toml."
         ));
@@ -241,8 +244,7 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
             // Count unique roots: config paths that aren't already in DB + DB roots
             let db_paths: std::collections::HashSet<&std::path::Path> =
                 db_roots.iter().map(|r| r.path.as_path()).collect();
-            let new_from_config = config
-                .tracked_paths
+            let new_from_config = tracked_paths
                 .iter()
                 .filter(|p| !db_paths.contains(p.as_path()))
                 .count();
@@ -250,7 +252,7 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
         };
         if total_roots == 1 {
             let display_path = db_roots.first().map_or_else(
-                || config.tracked_paths[0].display().to_string(),
+                || tracked_paths[0].display().to_string(),
                 |r| r.path.display().to_string(),
             );
             println!("Scanning {display_path}...");
@@ -259,17 +261,10 @@ async fn handle_scan(config: &Config, db: &Database, path: Option<PathBuf>) -> R
         }
     }
 
-    // Refresh: scan filesystem then transition expired files
-    let summary = refresh(
-        db,
-        &scanner,
-        &config.tracked_paths,
-        config.expiration_days,
-        config.warning_days,
-        config.auto_remove,
-    )
-    .await
-    .context("Failed to refresh tracked paths")?;
+    // Refresh: scan filesystem then transition expired files using per-root configs
+    let summary = refresh(db, &scanner, app_config)
+        .await
+        .context("Failed to refresh tracked paths")?;
 
     // Print summary
     println!(

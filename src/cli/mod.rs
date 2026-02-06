@@ -1,12 +1,37 @@
 //! CLI subcommand definitions and handlers.
 
-use clap::{Parser, Subcommand};
+use clap::{
+    Parser, Subcommand,
+    builder::{
+        Styles,
+        styling::{AnsiColor, Effects},
+    },
+};
 use std::path::PathBuf;
+
+pub const INFO: &str = "
+┏━┓╺┳╸┏━┓┏━╸┏━╸┏━╸┏━┓┏━╸╻ ╻
+┗━┓ ┃ ┣━┫┃╺┓┣╸ ┃  ┣┳┛┣╸ ┃╻┃
+┗━┛ ╹ ╹ ╹┗━┛┗━╸┗━╸╹┗╸┗━╸┗┻┛
+";
+
+// const AFTER_HELP: &str = "\
+// Examples:
+//   samx input.bam -r reference.gbk              Stream to stdout (Arrow IPC)
+//   samx input.bam -r reference.gbk | duckdb     Pipe to DuckDB
+//   samx input.bam -r reference.gbk -o out.parquet   Write to file
+//   samtools view -h input.cram | samx - -r ref.gbk  Read from stdin";
+
+const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Yellow.on_default());
 
 /// Stagecrew: Disk usage management with automatic cleanup policies.
 #[derive(Debug, Parser)]
 #[command(name = "stagecrew")]
-#[command(version, about, long_about = None)]
+#[command(version, about = INFO, styles = STYLES, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

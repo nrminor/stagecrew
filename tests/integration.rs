@@ -63,15 +63,10 @@ async fn test_full_workflow() {
 
     // 3. Perform initial scan
     let scanner = Scanner::new();
-    let scan_summary = scan_and_persist(
-        &db,
-        &scanner,
-        &config.tracked_paths,
-        config.expiration_days,
-        config.warning_days,
-    )
-    .await
-    .expect("scan should succeed");
+    let app_config = stagecrew::config::AppConfig::from_global(config.clone());
+    let scan_summary = scan_and_persist(&db, &scanner, &app_config)
+        .await
+        .expect("scan should succeed");
 
     // Verify scan results
     assert_eq!(
@@ -138,8 +133,8 @@ async fn test_full_workflow() {
         .expect("failed to backdate countdown_start for old_file");
 
     // 6. Transition expired paths (should move old_file to pending)
-    let transition_summary = transition_expired_paths(&db, config.expiration_days, false)
-        .expect("transition should succeed");
+    let transition_summary =
+        transition_expired_paths(&db, &app_config).expect("transition should succeed");
 
     assert_eq!(
         transition_summary.expired_to_pending, 1,

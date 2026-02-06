@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::time::sleep;
 
-use crate::config::{AppPaths, Config};
+use crate::config::{AppConfig, AppPaths};
 use crate::db::Database;
 use crate::error::Result;
 use crate::removal::remove_approved;
@@ -18,13 +18,17 @@ use tokio::signal;
 
 /// Background daemon that handles periodic scanning and removal execution.
 pub struct Daemon {
-    config: Config,
+    app_config: AppConfig,
+    paths: AppPaths,
 }
 
 impl Daemon {
     /// Create a new daemon with the given configuration.
-    pub fn new(config: Config) -> Self {
-        Self { config }
+    pub fn new(app_config: AppConfig) -> Self {
+        Self {
+            app_config,
+            paths: AppPaths::new(),
+        }
     }
 
     /// Run the daemon's main loop.
@@ -44,15 +48,16 @@ impl Daemon {
     /// - Database cannot be opened
     /// - Signal handlers cannot be registered (Unix only)
     pub async fn run(&self) -> Result<()> {
+        let config = &self.app_config.global;
+
         tracing::info!(
-            scan_interval_hours = self.config.scan_interval_hours,
-            tracked_paths = ?self.config.tracked_paths,
+            scan_interval_hours = config.scan_interval_hours,
+            tracked_paths = ?config.tracked_paths,
             "Starting stagecrew daemon"
         );
 
         // Open database (path derived from config)
-        let paths = AppPaths::new();
-        let db_path = paths.database_file(&self.config)?;
+        let db_path = self.paths.database_file(config)?;
         let db = Database::open(&db_path)?;
         let scanner = Scanner::new();
 
@@ -65,6 +70,16 @@ impl Daemon {
         let mut shutdown = Box::pin(signal::ctrl_c());
 
         loop {
+            // Reload configs to pick up any changes to local stagecrew.toml files
+            let db_roots: Vec<_> = db.list_roots()?.into_iter().map(|r| r.path).collect();
+            let app_config = match AppConfig::load(&self.paths, &db_roots) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to reload config, continuing with previous");
+                    self.app_config.clone()
+                }
+            };
+
             // Check for shutdown signal
             #[cfg(unix)]
             tokio::select! {
@@ -76,7 +91,7 @@ impl Daemon {
                     tracing::info!("Received SIGTERM, exiting gracefully");
                     break;
                 }
-                () = self.run_cycle(&db, &scanner) => {}
+                () = Self::run_cycle(&app_config, &db, &scanner) => {}
             }
 
             #[cfg(not(unix))]
@@ -85,12 +100,12 @@ impl Daemon {
                     tracing::info!("Received shutdown signal, exiting gracefully");
                     break;
                 }
-                () = self.run_cycle(&db, &scanner) => {}
+                () = Self::run_cycle(&app_config, &db, &scanner) => {}
             }
 
             // Sleep for configured interval
             let sleep_duration =
-                Duration::from_secs(u64::from(self.config.scan_interval_hours) * 3600);
+                Duration::from_secs(u64::from(app_config.global.scan_interval_hours) * 3600);
 
             tracing::info!(
                 ?sleep_duration,
@@ -131,19 +146,10 @@ impl Daemon {
     ///
     /// Errors are logged but do not stop the daemon. Both steps are attempted
     /// even if one fails, ensuring maximum progress on each cycle.
-    async fn run_cycle(&self, db: &Database, scanner: &Scanner) {
-        // Step 1: Refresh (scan + transition expired files)
+    async fn run_cycle(app_config: &AppConfig, db: &Database, scanner: &Scanner) {
+        // Step 1: Refresh (scan + transition expired files using per-root configs)
         tracing::info!("Starting refresh cycle");
-        match refresh(
-            db,
-            scanner,
-            &self.config.tracked_paths,
-            self.config.expiration_days,
-            self.config.warning_days,
-            self.config.auto_remove,
-        )
-        .await
-        {
+        match refresh(db, scanner, app_config).await {
             Ok(summary) => {
                 tracing::info!(
                     total_directories = summary.scan.total_directories,

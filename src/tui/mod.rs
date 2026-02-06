@@ -20,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::widgets::{ScrollbarState, TableState};
 
-use crate::config::Config;
+use crate::config::{AppConfig, AppPaths};
 use crate::db::Database;
 use crate::error::Result;
 use crate::removal::RemovalMethod;
@@ -747,9 +747,10 @@ impl App {
     /// Returns an error if terminal setup fails or if rendering encounters an I/O error.
     pub async fn run(
         &mut self,
-        config: &Config,
+        app_config: &AppConfig,
         db: &Database,
         db_path: &std::path::Path,
+        _paths: &AppPaths,
     ) -> Result<()> {
         let mut terminal_manager = TerminalManager::setup().map_err(crate::error::Error::Io)?;
         let mut event_stream = EventStream::new();
@@ -764,6 +765,10 @@ impl App {
 
         // Track the scan task handle so we can await it properly
         let mut scan_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+        // For now, use global config for TUI operations. Per-root config support
+        // can be added later by passing app_config through and using for_root().
+        let config = &app_config.global;
 
         // Load initial stats from the entries table
         self.refresh_stats(db, config);
@@ -798,31 +803,21 @@ impl App {
 
                 // Clone what we need for the background task
                 let scanner = Scanner::new();
-                let config_tracked_paths = config.tracked_paths.clone();
-                let expiration_days = config.expiration_days;
-                let warning_days = config.warning_days;
-                let auto_remove = config.auto_remove;
+                let task_app_config = app_config.clone();
                 let task_db_path = db_path.to_path_buf();
                 let tx = scan_tx.clone();
 
                 // Spawn the refresh as a background task.
-                // Scans the filesystem then transitions expired files.
+                // Scans the filesystem then transitions expired files using per-root configs.
                 scan_handle = Some(tokio::spawn(async move {
                     let scan_result = tokio::task::spawn_blocking(move || {
                         let rt = tokio::runtime::Handle::current();
                         rt.block_on(async {
                             match Database::open(&task_db_path) {
-                                Ok(task_db) => refresh(
-                                    &task_db,
-                                    &scanner,
-                                    &config_tracked_paths,
-                                    expiration_days,
-                                    warning_days,
-                                    auto_remove,
-                                )
-                                .await
-                                .map(|_| ())
-                                .map_err(|e| e.to_string()),
+                                Ok(task_db) => refresh(&task_db, &scanner, &task_app_config)
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string()),
                                 Err(e) => Err(format!("Failed to open database: {e}")),
                             }
                         })

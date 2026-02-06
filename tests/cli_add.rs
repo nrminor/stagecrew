@@ -214,15 +214,10 @@ async fn add_with_scan_flag() {
     let db = Database::open(&db_path).expect("failed to open database");
 
     let scanner = stagecrew::scanner::Scanner::new();
-    let summary = stagecrew::scanner::scan_and_persist(
-        &db,
-        &scanner,
-        std::slice::from_ref(&canonical_path),
-        config.expiration_days,
-        config.warning_days,
-    )
-    .await
-    .expect("failed to scan and persist");
+    let app_config = stagecrew::config::AppConfig::from_global(config);
+    let summary = stagecrew::scanner::scan_and_persist(&db, &scanner, &app_config)
+        .await
+        .expect("failed to scan and persist");
 
     // Verify scan results - now counts entries (both directory and file entries)
     // The root directory itself is an entry, plus 2 file entries = 3 total
