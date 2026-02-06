@@ -7,25 +7,80 @@ use xdg::BaseDirectories;
 
 use crate::error::{Error, Result};
 
+/// Environment variable for overriding the config file path.
+pub const ENV_CONFIG_PATH: &str = "STAGECREW_CONFIG_PATH";
+
+/// Environment variable for overriding the database file path.
+pub const ENV_DB_PATH: &str = "STAGECREW_DB_PATH";
+
 /// Manages application paths following XDG Base Directory Specification.
+///
+/// The `STAGECREW_CONFIG_PATH` and `STAGECREW_DB_PATH` environment variables
+/// can override the default config and database locations respectively. The
+/// `with_overrides()` constructor allows tests to specify paths directly without
+/// modifying environment variables.
 pub struct AppPaths {
     xdg: BaseDirectories,
+    config_path_override: Option<PathBuf>,
+    db_path_override: Option<PathBuf>,
 }
 
 impl AppPaths {
-    /// Initialize with application prefix "stagecrew".
+    /// Initialize with application prefix "stagecrew", reading overrides from environment.
+    ///
+    /// Checks `STAGECREW_CONFIG_PATH` and `STAGECREW_DB_PATH` environment variables.
+    /// Empty values are treated as unset.
     #[must_use]
     pub fn new() -> Self {
-        let xdg = BaseDirectories::with_prefix("stagecrew");
-        Self { xdg }
+        Self::with_overrides(Self::env_path(ENV_CONFIG_PATH), Self::env_path(ENV_DB_PATH))
     }
 
-    /// Path to config file: `~/.config/stagecrew/config.toml`
+    /// Initialize with explicit path overrides, primarily for testing.
+    #[must_use]
+    pub fn with_overrides(
+        config_path_override: Option<PathBuf>,
+        db_path_override: Option<PathBuf>,
+    ) -> Self {
+        let xdg = BaseDirectories::with_prefix("stagecrew");
+        Self {
+            xdg,
+            config_path_override,
+            db_path_override,
+        }
+    }
+
+    /// Read a path from an environment variable, treating empty values as unset.
+    fn env_path(var: &str) -> Option<PathBuf> {
+        std::env::var(var)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// Ensure the parent directory of a path exists, creating it if necessary.
+    fn ensure_parent_exists(path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(())
+    }
+
+    /// Path to config file. If `STAGECREW_CONFIG_PATH` is set (or an override was
+    /// provided via `with_overrides()`), that path is used. Otherwise falls back to
+    /// the XDG config directory (`~/.config/stagecrew/config.toml`).
+    ///
+    /// Creates the parent directory if it doesn't exist.
     ///
     /// # Errors
     ///
     /// Returns an error if the config directory cannot be created.
     pub fn config_file(&self) -> std::io::Result<PathBuf> {
+        if let Some(path) = &self.config_path_override {
+            Self::ensure_parent_exists(path)?;
+            return Ok(path.clone());
+        }
         self.xdg.place_config_file("config.toml")
     }
 
@@ -38,35 +93,29 @@ impl AppPaths {
         self.xdg.place_cache_file("stagecrew.log")
     }
 
-    /// Determine the database file path based on configuration.
-    ///
-    /// Priority:
-    /// 1. If `config.database_path` is set, use that directly
-    /// 2. If `config.tracked_paths` is non-empty, use first path's parent + `.stagecrew/stagecrew.db`
-    /// 3. Fall back to XDG data directory: `~/.local/share/stagecrew/stagecrew.db`
+    /// Determine the database file path. Resolution order: environment variable
+    /// override (`STAGECREW_DB_PATH`), then `config.database_path`, then derived
+    /// from the first tracked path's parent, and finally the XDG data directory.
     ///
     /// This allows multiple users on a shared filesystem (like `CephFS`) to share
     /// a database located near the tracked paths.
     ///
-    /// # Side Effects
-    ///
-    /// This method creates the parent directory of the database file if it doesn't
-    /// exist. This is intentional to ensure the database can be created on first use.
+    /// Creates the parent directory if it doesn't exist.
     ///
     /// # Errors
     ///
     /// Returns an error if the database directory cannot be created.
     pub fn database_file(&self, config: &Config) -> std::io::Result<PathBuf> {
-        // Priority 1: Explicit database_path in config
+        if let Some(path) = &self.db_path_override {
+            Self::ensure_parent_exists(path)?;
+            return Ok(path.clone());
+        }
+
         if let Some(db_path) = &config.database_path {
-            // Ensure parent directory exists
-            if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            Self::ensure_parent_exists(db_path)?;
             return Ok(db_path.clone());
         }
 
-        // Priority 2: Derive from first tracked_path's parent
         if let Some(first_tracked) = config.tracked_paths.first()
             && let Some(parent) = first_tracked.parent()
         {
@@ -75,7 +124,6 @@ impl AppPaths {
             return Ok(db_dir.join("stagecrew.db"));
         }
 
-        // Priority 3: Fall back to XDG data directory
         self.xdg.place_data_file("stagecrew.db")
     }
 }
@@ -498,5 +546,81 @@ expiration_days = 90
         let home_dir = dirs::home_dir().expect("home directory should be available");
         let expected = home_dir.join("projects/~backup");
         assert_eq!(config.tracked_paths[0], expected);
+    }
+
+    #[test]
+    fn config_file_uses_override_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let custom_config = temp_dir.path().join("custom/config.toml");
+
+        let paths = AppPaths::with_overrides(Some(custom_config.clone()), None);
+        let result = paths.config_file().expect("should resolve path");
+
+        assert_eq!(result, custom_config);
+        // Parent directory should have been created
+        assert!(custom_config.parent().expect("has parent").exists());
+    }
+
+    #[test]
+    fn database_file_uses_override_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let custom_db = temp_dir.path().join("custom/stagecrew.db");
+
+        let config = Config {
+            database_path: Some(PathBuf::from("/should/be/ignored")),
+            tracked_paths: vec![PathBuf::from("/also/ignored")],
+            ..Config::default()
+        };
+
+        let paths = AppPaths::with_overrides(None, Some(custom_db.clone()));
+        let result = paths.database_file(&config).expect("should resolve path");
+
+        // Override should win over config.database_path and tracked_paths
+        assert_eq!(result, custom_db);
+        // Parent directory should have been created
+        assert!(custom_db.parent().expect("has parent").exists());
+    }
+
+    #[test]
+    fn database_file_override_beats_config_database_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let override_db = temp_dir.path().join("override/db.sqlite");
+        let config_db = temp_dir.path().join("config/db.sqlite");
+
+        let config = Config {
+            database_path: Some(config_db),
+            ..Config::default()
+        };
+
+        let paths = AppPaths::with_overrides(None, Some(override_db.clone()));
+        let result = paths.database_file(&config).expect("should resolve path");
+
+        // Override wins
+        assert_eq!(result, override_db);
+    }
+
+    #[test]
+    fn config_file_falls_back_to_xdg_when_no_override() {
+        let paths = AppPaths::with_overrides(None, None);
+        let result = paths.config_file().expect("should resolve path");
+
+        assert!(result.ends_with(std::path::Path::new("stagecrew/config.toml")));
+    }
+
+    #[test]
+    fn database_file_falls_back_to_config_when_no_override() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config_db = temp_dir.path().join("config/db.sqlite");
+
+        let config = Config {
+            database_path: Some(config_db.clone()),
+            ..Config::default()
+        };
+
+        let paths = AppPaths::with_overrides(None, None);
+        let result = paths.database_file(&config).expect("should resolve path");
+
+        // Should use config.database_path since no override
+        assert_eq!(result, config_db);
     }
 }
