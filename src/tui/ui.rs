@@ -19,6 +19,8 @@ use crate::db::Database;
 use crate::removal::RemovalMethod;
 use crate::scanner::calculate_expiration;
 
+use super::TuiContext;
+
 use super::{App, FocusPanel, PendingQuotaTarget, QuotaTargetFocus, SortMode, View};
 
 /// Semantic color palette for consistent styling across the TUI.
@@ -125,7 +127,7 @@ fn fade_gradient() -> &'static FadeGradient {
 ///
 /// This is the main rendering function that dispatches to view-specific
 /// rendering based on the current `app.view` state.
-pub(crate) fn render(app: &mut App, config: &Config, db: &Database, frame: &mut Frame) {
+pub(crate) fn render(app: &mut App, ctx: &TuiContext, frame: &mut Frame) {
     // Create the main layout with a footer for keybinding hints
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -137,8 +139,11 @@ pub(crate) fn render(app: &mut App, config: &Config, db: &Database, frame: &mut 
 
     // Render the current view in the main area
     match app.view() {
-        View::FileList => render_file_list_view(app, config, db, frame, chunks[0]),
-        View::AuditLog => render_audit_log(app, db, frame, chunks[0]),
+        View::FileList => {
+            let config = ctx.config(app);
+            render_file_list_view(app, config, ctx.db, frame, chunks[0]);
+        }
+        View::AuditLog => render_audit_log(app, ctx.db, frame, chunks[0]),
         View::Help => render_help(app, frame, chunks[0]),
     }
 

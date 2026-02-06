@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::ui::sort_entry_rows;
-use super::{App, FocusPanel, PendingDeletion, PendingEntry, SortMode, View};
+use super::{App, FocusPanel, PendingDeletion, PendingEntry, SortMode, TuiContext, View};
 use crate::audit::{AuditAction, AuditService};
 use crate::config::Config;
 use crate::db::Database;
@@ -41,41 +41,13 @@ pub(super) fn find_search_matches(
         .collect()
 }
 
-/// Query entries for the current path, compute days remaining, and sort them.
-///
-/// Returns `None` if the current path is empty or the database query fails.
-/// The returned vec is sorted according to `sort_mode` and the indices match
-/// what the user sees on screen.
-pub(super) fn sorted_entry_rows(
-    app: &App,
-    config: &Config,
-    db: &Database,
-) -> Option<Vec<(crate::db::Entry, i64)>> {
-    if app.current_path.as_os_str().is_empty() {
-        return None;
-    }
-    let entries = db.list_entries_by_parent(app.current_path()).ok()?;
-    let mut rows: Vec<_> = entries
-        .into_iter()
-        .map(|entry| {
-            let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                calculate_expiration(cs, config.expiration_days)
-            });
-            (entry, days_remaining)
-        })
-        .collect();
-    sort_entry_rows(&mut rows, app.sort_mode());
-    Some(rows)
-}
-
 impl InputHandler {
     /// Process a key event and update app state.
     ///
-    /// Takes a config reference for reading default values and a database reference
-    /// for actions that modify state (approve, defer, ignore).
-    pub fn handle(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+    /// Takes a context reference for database access and per-root config resolution.
+    pub fn handle(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match app.view {
-            View::FileList => Self::handle_file_list(app, config, db, key),
+            View::FileList => Self::handle_file_list(app, ctx, key),
             View::AuditLog => Self::handle_audit_log(app, key),
             View::Help => Self::handle_help(app, key),
         }
@@ -85,16 +57,19 @@ impl InputHandler {
     // modal dispatch, focus management, navigation, actions, and view switching. Breaking
     // it into smaller functions would obscure the input handling flow.
     #[allow(clippy::too_many_lines)]
-    fn handle_file_list(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+    fn handle_file_list(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
+        let config = ctx.config(app);
+        let db = ctx.db;
+
         // Check for search input mode first (highest priority text input)
         if app.search_input_active {
-            Self::handle_search_input(app, config, db, key);
+            Self::handle_search_input(app, ctx, key);
             return;
         }
 
         // Check for pending confirmations/inputs first
         if app.pending_add_path.is_some() {
-            Self::handle_add_path_input(app, config, db, key);
+            Self::handle_add_path_input(app, ctx, key);
             return;
         }
         if app.pending_remove_path.is_some() {
@@ -102,19 +77,19 @@ impl InputHandler {
             return;
         }
         if app.pending_entry_delete.is_some() {
-            Self::handle_entry_delete_confirmation(app, config, db, key);
+            Self::handle_entry_delete_confirmation(app, ctx, key);
             return;
         }
         if app.pending_entry_deferral.is_some() {
-            Self::handle_entry_deferral_input(app, config, db, key);
+            Self::handle_entry_deferral_input(app, ctx, key);
             return;
         }
         if app.pending_entry_ignore.is_some() {
-            Self::handle_entry_ignore_confirmation(app, config, db, key);
+            Self::handle_entry_ignore_confirmation(app, ctx, key);
             return;
         }
         if app.pending_entry_approval.is_some() {
-            Self::handle_entry_approval_confirmation(app, config, db, key);
+            Self::handle_entry_approval_confirmation(app, ctx, key);
             return;
         }
         if app.pending_quota_target.is_some() {
@@ -152,10 +127,10 @@ impl InputHandler {
                 }
             }
             KeyCode::Char('h') => {
-                Self::handle_h_navigation(app, config, db);
+                Self::handle_h_navigation(app, ctx);
             }
             KeyCode::Char('l') => {
-                Self::handle_l_navigation(app, config, db);
+                Self::handle_l_navigation(app, ctx);
             }
 
             // Navigation (vim-style) - operates on focused panel
@@ -175,7 +150,7 @@ impl InputHandler {
                             app.entry_selected_index =
                                 app.entry_selected_index.min(app.entry_list_len - 1);
                         }
-                        Self::update_visual_selection(app, config, db);
+                        Self::update_visual_selection(app, ctx);
                     }
                 }
                 app.ensure_cursor_visible = true;
@@ -188,7 +163,7 @@ impl InputHandler {
                     }
                     FocusPanel::MainPanel => {
                         app.entry_selected_index = app.entry_selected_index.saturating_sub(1);
-                        Self::update_visual_selection(app, config, db);
+                        Self::update_visual_selection(app, ctx);
                     }
                 }
                 app.ensure_cursor_visible = true;
@@ -199,7 +174,7 @@ impl InputHandler {
                     FocusPanel::Sidebar => app.sidebar_selected_index = 0,
                     FocusPanel::MainPanel => {
                         app.entry_selected_index = 0;
-                        Self::update_visual_selection(app, config, db);
+                        Self::update_visual_selection(app, ctx);
                     }
                 }
                 app.ensure_cursor_visible = true;
@@ -212,7 +187,7 @@ impl InputHandler {
                     }
                     FocusPanel::MainPanel => {
                         app.select_last_entry(app.entry_list_len);
-                        Self::update_visual_selection(app, config, db);
+                        Self::update_visual_selection(app, ctx);
                     }
                 }
                 app.ensure_cursor_visible = true;
@@ -230,13 +205,13 @@ impl InputHandler {
 
             // Selection mode (only when main panel is focused)
             KeyCode::Char(' ') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::toggle_entry_selection(app, config, db);
+                Self::toggle_entry_selection(app, ctx);
             }
             KeyCode::Char('v') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::toggle_visual_mode(app, config, db);
+                Self::toggle_visual_mode(app, ctx);
             }
             KeyCode::Char('a') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::select_all_entries(app, config, db);
+                Self::select_all_entries(app, ctx);
             }
             KeyCode::Esc if app.focus_panel == FocusPanel::MainPanel => {
                 if app.is_visual_mode() {
@@ -267,15 +242,15 @@ impl InputHandler {
                 Self::initiate_entry_approve(app, config, db);
             }
             KeyCode::Char('u') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::unignore_entry(app, config, db);
+                Self::unignore_entry(app, ctx);
             }
 
             // Open in external application
             KeyCode::Char('e') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::request_open_in_editor(app, config, db);
+                Self::request_open_in_editor(app, ctx);
             }
             KeyCode::Char('o') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::request_open_in_system_viewer(app, config, db);
+                Self::request_open_in_system_viewer(app, ctx);
             }
 
             // Search
@@ -284,11 +259,11 @@ impl InputHandler {
                 app.search_input_active = true;
             }
             KeyCode::Char('n') if app.search_query.is_some() => {
-                Self::jump_to_next_match(app, config, db);
+                Self::jump_to_next_match(app, ctx);
                 app.ensure_cursor_visible = true;
             }
             KeyCode::Char('N') if app.search_query.is_some() => {
-                Self::jump_to_prev_match(app, config, db);
+                Self::jump_to_prev_match(app, ctx);
                 app.ensure_cursor_visible = true;
             }
 
@@ -333,7 +308,7 @@ impl InputHandler {
                 app.pending_add_path = Some(String::new());
             }
             KeyCode::Char('X') if app.focus_panel == FocusPanel::Sidebar => {
-                Self::initiate_remove_path(app, config, db);
+                Self::initiate_remove_path(app, ctx);
             }
 
             // Quota target (t = set target for selected root, works from sidebar or entries panel)
@@ -348,8 +323,8 @@ impl InputHandler {
     }
 
     /// Toggle selection of the currently focused file.
-    fn toggle_entry_selection(app: &mut App, config: &Config, db: &Database) {
-        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+    fn toggle_entry_selection(app: &mut App, ctx: &TuiContext) {
+        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
             tracing::warn!("Cannot toggle selection: no path selected or query failed");
             return;
         };
@@ -370,11 +345,11 @@ impl InputHandler {
     /// Recompute the visual selection after a cursor movement.
     ///
     /// No-op if visual mode is not active.
-    fn update_visual_selection(app: &mut App, config: &Config, db: &Database) {
+    fn update_visual_selection(app: &mut App, ctx: &TuiContext) {
         if !app.is_visual_mode() {
             return;
         }
-        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
             return;
         };
         let entry_ids: Vec<i64> = entry_rows.iter().map(|(e, _)| e.id).collect();
@@ -386,13 +361,13 @@ impl InputHandler {
     /// On entry: snapshots the current selection, sets the anchor at the cursor,
     /// and selects the entry under the cursor.
     /// On exit (pressing `v` again): keeps the selection, clears visual state.
-    fn toggle_visual_mode(app: &mut App, config: &Config, db: &Database) {
+    fn toggle_visual_mode(app: &mut App, ctx: &TuiContext) {
         if app.is_visual_mode() {
             app.exit_visual_mode();
             return;
         }
 
-        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
             tracing::warn!("Cannot enter visual mode: no path selected or query failed");
             return;
         };
@@ -417,8 +392,8 @@ impl InputHandler {
     }
 
     /// Select all entries in the current directory.
-    fn select_all_entries(app: &mut App, config: &Config, db: &Database) {
-        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+    fn select_all_entries(app: &mut App, ctx: &TuiContext) {
+        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
             tracing::warn!("Cannot select all: no path selected or query failed");
             return;
         };
@@ -468,18 +443,18 @@ impl InputHandler {
     /// - Main panel, inside a subdirectory: navigate up to parent
     /// - Main panel, at root level: return focus to sidebar
     /// - Sidebar: no-op
-    fn handle_h_navigation(app: &mut App, config: &Config, db: &Database) {
+    fn handle_h_navigation(app: &mut App, ctx: &TuiContext) {
         match app.focus_panel {
             FocusPanel::Sidebar => {}
             FocusPanel::MainPanel => {
                 app.exit_visual_mode();
-                if let Ok(roots) = db.list_roots() {
+                if let Ok(roots) = ctx.db.list_roots() {
                     let at_root_level = roots.iter().any(|r| r.path == app.current_path);
                     if at_root_level {
                         app.sidebar_visible = true;
                         app.focus_panel = FocusPanel::Sidebar;
                     } else {
-                        app.navigate_up(config, db);
+                        app.navigate_up(ctx);
                     }
                 }
             }
@@ -491,11 +466,11 @@ impl InputHandler {
     /// - Sidebar: enter the selected root (same as Enter)
     /// - Main panel, cursor on a directory: navigate into it
     /// - Main panel, cursor on a file: no-op
-    fn handle_l_navigation(app: &mut App, config: &Config, db: &Database) {
+    fn handle_l_navigation(app: &mut App, ctx: &TuiContext) {
         match app.focus_panel {
             FocusPanel::Sidebar => {
                 // Enter the selected root (same behavior as Enter)
-                if let Ok(roots) = db.list_roots() {
+                if let Ok(roots) = ctx.db.list_roots() {
                     let idx = app
                         .sidebar_selected_index
                         .min(roots.len().saturating_sub(1));
@@ -506,7 +481,7 @@ impl InputHandler {
                 }
             }
             FocusPanel::MainPanel => {
-                let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+                let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
                     return;
                 };
 
@@ -594,17 +569,12 @@ impl InputHandler {
     }
 
     /// Handle entry deletion confirmation (y/n/Esc).
-    fn handle_entry_delete_confirmation(
-        app: &mut App,
-        config: &Config,
-        db: &Database,
-        key: KeyEvent,
-    ) {
+    fn handle_entry_delete_confirmation(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 // User confirmed - perform the deletion for all pending entries
                 if let Some(deletion) = &app.pending_entry_delete {
-                    let audit = AuditService::new(db);
+                    let audit = AuditService::new(ctx.db);
                     let user = AuditService::current_user();
                     let root_id = app.current_root_id;
                     let method = deletion.method;
@@ -615,7 +585,9 @@ impl InputHandler {
                     let total = deletion.entries.len();
 
                     for entry in &deletion.entries {
-                        if let Err(e) = db.delete_entry(entry.id, &entry.path, entry.is_dir, method)
+                        if let Err(e) =
+                            ctx.db
+                                .delete_entry(entry.id, &entry.path, entry.is_dir, method)
                         {
                             tracing::warn!(
                                 "Failed to {} entry {}: {}",
@@ -677,7 +649,7 @@ impl InputHandler {
                 app.pending_entry_delete = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_stats(db, config);
+                app.refresh_stats(ctx);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel deletion
@@ -761,7 +733,7 @@ impl InputHandler {
     }
 
     /// Handle entry deferral input (digits/backspace/enter/esc).
-    fn handle_entry_deferral_input(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+    fn handle_entry_deferral_input(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 // Append digit to input buffer
@@ -799,19 +771,20 @@ impl InputHandler {
                     let days_i64 = i64::from(days);
                     let deferred_until = now.as_second() + (days_i64 * 86400);
 
-                    let audit = AuditService::new(db);
+                    let audit = AuditService::new(ctx.db);
                     let user = AuditService::current_user();
                     let details = Some(format!("Deferred for {days} days"));
                     let root_id = app.current_root_id;
 
                     for entry in &deferral.entries {
-                        if let Err(e) = db.defer_entry(entry.id, deferred_until) {
+                        if let Err(e) = ctx.db.defer_entry(entry.id, deferred_until) {
                             tracing::warn!("Failed to defer entry {}: {}", entry.path.display(), e);
                         } else {
                             // Propagate to children if this is a directory
                             if entry.is_dir
-                                && let Err(e) =
-                                    db.defer_entries_by_path_prefix(&entry.path, deferred_until)
+                                && let Err(e) = ctx
+                                    .db
+                                    .defer_entries_by_path_prefix(&entry.path, deferred_until)
                             {
                                 tracing::warn!(
                                     "Failed to propagate deferral to children of {}: {}",
@@ -835,7 +808,7 @@ impl InputHandler {
                 app.pending_entry_deferral = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_stats(db, config);
+                app.refresh_stats(ctx);
             }
             KeyCode::Esc => {
                 // Cancel deferral input
@@ -915,22 +888,17 @@ impl InputHandler {
     }
 
     /// Handle entry ignore confirmation (y/n/Esc).
-    fn handle_entry_ignore_confirmation(
-        app: &mut App,
-        config: &Config,
-        db: &Database,
-        key: KeyEvent,
-    ) {
+    fn handle_entry_ignore_confirmation(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 // User confirmed - perform the ignore for all pending entries
                 if let Some(entries) = &app.pending_entry_ignore {
-                    let audit = AuditService::new(db);
+                    let audit = AuditService::new(ctx.db);
                     let user = AuditService::current_user();
                     let root_id = app.current_root_id;
 
                     for entry in entries {
-                        if let Err(e) = db.update_entry_status(entry.id, "ignored") {
+                        if let Err(e) = ctx.db.update_entry_status(entry.id, "ignored") {
                             tracing::warn!(
                                 "Failed to ignore entry {}: {}",
                                 entry.path.display(),
@@ -940,7 +908,7 @@ impl InputHandler {
                             // Propagate to children if this is a directory
                             if entry.is_dir
                                 && let Err(e) =
-                                    db.update_entries_by_path_prefix(&entry.path, "ignored")
+                                    ctx.db.update_entries_by_path_prefix(&entry.path, "ignored")
                             {
                                 tracing::warn!(
                                     "Failed to propagate ignore to children of {}: {}",
@@ -964,7 +932,7 @@ impl InputHandler {
                 app.pending_entry_ignore = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_stats(db, config);
+                app.refresh_stats(ctx);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel ignore
@@ -1044,22 +1012,17 @@ impl InputHandler {
     }
 
     /// Handle entry approval confirmation (y/n/Esc).
-    fn handle_entry_approval_confirmation(
-        app: &mut App,
-        config: &Config,
-        db: &Database,
-        key: KeyEvent,
-    ) {
+    fn handle_entry_approval_confirmation(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 // User confirmed - perform the approval for all pending entries
                 if let Some(entries) = &app.pending_entry_approval {
-                    let audit = AuditService::new(db);
+                    let audit = AuditService::new(ctx.db);
                     let user = AuditService::current_user();
                     let root_id = app.current_root_id;
 
                     for entry in entries {
-                        if let Err(e) = db.update_entry_status(entry.id, "approved") {
+                        if let Err(e) = ctx.db.update_entry_status(entry.id, "approved") {
                             tracing::warn!(
                                 "Failed to approve entry {}: {}",
                                 entry.path.display(),
@@ -1068,8 +1031,9 @@ impl InputHandler {
                         } else {
                             // Propagate to children if this is a directory
                             if entry.is_dir
-                                && let Err(e) =
-                                    db.update_entries_by_path_prefix(&entry.path, "approved")
+                                && let Err(e) = ctx
+                                    .db
+                                    .update_entries_by_path_prefix(&entry.path, "approved")
                             {
                                 tracing::warn!(
                                     "Failed to propagate approval to children of {}: {}",
@@ -1093,7 +1057,7 @@ impl InputHandler {
                 app.pending_entry_approval = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_stats(db, config);
+                app.refresh_stats(ctx);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel approval
@@ -1109,15 +1073,17 @@ impl InputHandler {
     ///
     /// This is a direct action without confirmation since it's non-destructive.
     /// Works on selected entries if any, otherwise the currently focused entry.
-    fn unignore_entry(app: &mut App, config: &Config, db: &Database) {
+    fn unignore_entry(app: &mut App, ctx: &TuiContext) {
         // Get entries for current path
         if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot unignore entry: no path selected");
             return;
         }
 
+        let config = ctx.config(app);
+
         // Query entries for current browsing path
-        let entries = match db.list_entries_by_parent(app.current_path()) {
+        let entries = match ctx.db.list_entries_by_parent(app.current_path()) {
             Ok(entries) => entries,
             Err(e) => {
                 tracing::warn!("Failed to query entries: {}", e);
@@ -1177,13 +1143,13 @@ impl InputHandler {
         }
 
         // Perform the unignore
-        let audit = AuditService::new(db);
+        let audit = AuditService::new(ctx.db);
         let user = AuditService::current_user();
         let root_id = app.current_root_id;
 
         let mut success_count = 0;
         for entry in &entries_to_unignore {
-            if let Err(e) = db.update_entry_status(entry.id, "tracked") {
+            if let Err(e) = ctx.db.update_entry_status(entry.id, "tracked") {
                 tracing::warn!("Failed to unignore entry {}: {}", entry.path.display(), e);
                 app.status_message = Some(format!("Unignore failed: {e}"));
                 app.status_message_time = Some(std::time::Instant::now());
@@ -1191,7 +1157,7 @@ impl InputHandler {
                 success_count += 1;
                 // Propagate to children if this is a directory
                 if entry.is_dir
-                    && let Err(e) = db.update_entries_by_path_prefix(&entry.path, "tracked")
+                    && let Err(e) = ctx.db.update_entries_by_path_prefix(&entry.path, "tracked")
                 {
                     tracing::warn!(
                         "Failed to propagate unignore to children of {}: {}",
@@ -1214,7 +1180,7 @@ impl InputHandler {
         if success_count > 0 {
             app.status_message = Some(format!("Unignored {success_count} entry/entries"));
             app.status_message_time = Some(std::time::Instant::now());
-            app.refresh_stats(db, config);
+            app.refresh_stats(ctx);
         }
         app.exit_visual_mode();
         app.clear_selection();
@@ -1224,8 +1190,8 @@ impl InputHandler {
     ///
     /// Collects paths from selected entries (or the focused entry if none selected)
     /// and sets `external_open_request` for the main loop to handle.
-    fn request_open_in_editor(app: &mut App, config: &Config, db: &Database) {
-        let paths = Self::collect_paths_for_external_open(app, config, db);
+    fn request_open_in_editor(app: &mut App, ctx: &TuiContext) {
+        let paths = Self::collect_paths_for_external_open(app, ctx);
         if paths.is_empty() {
             app.status_message = Some("No files to open".to_string());
             app.status_message_time = Some(std::time::Instant::now());
@@ -1238,8 +1204,8 @@ impl InputHandler {
     ///
     /// Collects paths from selected entries (or the focused entry if none selected)
     /// and sets `external_open_request` for the main loop to handle.
-    fn request_open_in_system_viewer(app: &mut App, config: &Config, db: &Database) {
-        let paths = Self::collect_paths_for_external_open(app, config, db);
+    fn request_open_in_system_viewer(app: &mut App, ctx: &TuiContext) {
+        let paths = Self::collect_paths_for_external_open(app, ctx);
         if paths.is_empty() {
             app.status_message = Some("No files to open".to_string());
             app.status_message_time = Some(std::time::Instant::now());
@@ -1252,8 +1218,8 @@ impl InputHandler {
     ///
     /// Returns paths from selected entries if any are selected, otherwise
     /// returns the path of the currently focused entry.
-    fn collect_paths_for_external_open(app: &App, config: &Config, db: &Database) -> Vec<PathBuf> {
-        let Some(entry_rows) = sorted_entry_rows(app, config, db) else {
+    fn collect_paths_for_external_open(app: &App, ctx: &TuiContext) -> Vec<PathBuf> {
+        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
             return Vec::new();
         };
 
@@ -1277,7 +1243,7 @@ impl InputHandler {
     ///
     /// Characters append to the query, Backspace removes, Enter confirms and
     /// jumps to the first match, Esc cancels the search entirely.
-    fn handle_search_input(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+    fn handle_search_input(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) if !c.is_control() => {
                 if let Some(ref mut query) = app.search_query {
@@ -1292,7 +1258,7 @@ impl InputHandler {
             KeyCode::Enter => {
                 // Confirm search and jump to first match
                 app.search_input_active = false;
-                Self::jump_to_first_match(app, config, db);
+                Self::jump_to_first_match(app, ctx);
                 app.ensure_cursor_visible = true;
             }
             KeyCode::Esc => {
@@ -1304,16 +1270,16 @@ impl InputHandler {
     }
 
     /// Jump the cursor to the first search match in the current entry list.
-    fn jump_to_first_match(app: &mut App, config: &Config, db: &Database) {
-        let matches = Self::compute_current_matches(app, config, db);
+    fn jump_to_first_match(app: &mut App, ctx: &TuiContext) {
+        let matches = ctx.compute_current_matches(app);
         if let Some(&first) = matches.first() {
             app.entry_selected_index = first;
         }
     }
 
     /// Jump the cursor to the next search match after the current position.
-    fn jump_to_next_match(app: &mut App, config: &Config, db: &Database) {
-        let matches = Self::compute_current_matches(app, config, db);
+    fn jump_to_next_match(app: &mut App, ctx: &TuiContext) {
+        let matches = ctx.compute_current_matches(app);
         if matches.is_empty() {
             return;
         }
@@ -1329,8 +1295,8 @@ impl InputHandler {
     }
 
     /// Jump the cursor to the previous search match before the current position.
-    fn jump_to_prev_match(app: &mut App, config: &Config, db: &Database) {
-        let matches = Self::compute_current_matches(app, config, db);
+    fn jump_to_prev_match(app: &mut App, ctx: &TuiContext) {
+        let matches = ctx.compute_current_matches(app);
         if matches.is_empty() {
             return;
         }
@@ -1346,37 +1312,8 @@ impl InputHandler {
         }
     }
 
-    /// Compute search match indices for the current directory's sorted entry list.
-    fn compute_current_matches(app: &App, config: &Config, db: &Database) -> Vec<usize> {
-        let query = match &app.search_query {
-            Some(q) if !q.is_empty() => q,
-            _ => return Vec::new(),
-        };
-
-        if app.current_path.as_os_str().is_empty() {
-            return Vec::new();
-        }
-
-        let Ok(entries) = db.list_entries_by_parent(app.current_path()) else {
-            return Vec::new();
-        };
-
-        let mut entry_rows: Vec<_> = entries
-            .into_iter()
-            .map(|entry| {
-                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    calculate_expiration(cs, config.expiration_days)
-                });
-                (entry, days_remaining)
-            })
-            .collect();
-        sort_entry_rows(&mut entry_rows, app.sort_mode());
-
-        find_search_matches(&entry_rows, query)
-    }
-
     /// Handle add path text input (characters/backspace/enter/esc).
-    fn handle_add_path_input(app: &mut App, config: &Config, db: &Database, key: KeyEvent) {
+    fn handle_add_path_input(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) if !c.is_control() => {
                 // Append character to input buffer
@@ -1427,7 +1364,12 @@ impl InputHandler {
                     };
 
                     // Check if already tracked in config or database
-                    if config.tracked_paths.contains(&canonical_path) {
+                    if ctx
+                        .app_config
+                        .global
+                        .tracked_paths
+                        .contains(&canonical_path)
+                    {
                         tracing::warn!(
                             "Path already tracked (in config): {}",
                             canonical_path.display()
@@ -1436,7 +1378,7 @@ impl InputHandler {
                         return;
                     }
 
-                    if let Ok(roots) = db.list_roots()
+                    if let Ok(roots) = ctx.db.list_roots()
                         && roots.iter().any(|r| r.path == canonical_path)
                     {
                         tracing::warn!("Path already tracked: {}", canonical_path.display());
@@ -1445,7 +1387,7 @@ impl InputHandler {
                     }
 
                     // Insert as a root in the database
-                    if let Err(e) = db.insert_root(&canonical_path) {
+                    if let Err(e) = ctx.db.insert_root(&canonical_path) {
                         tracing::warn!("Failed to add root to database: {}", e);
                         app.pending_add_path = None;
                         return;
@@ -1475,8 +1417,8 @@ impl InputHandler {
     /// Roots defined in `config.tracked_paths` cannot be removed from the TUI
     /// because they are re-seeded on every refresh. The user must edit the config
     /// file directly to remove those.
-    fn initiate_remove_path(app: &mut App, config: &Config, db: &Database) {
-        let roots = match db.list_roots() {
+    fn initiate_remove_path(app: &mut App, ctx: &TuiContext) {
+        let roots = match ctx.db.list_roots() {
             Ok(roots) => roots,
             Err(e) => {
                 tracing::warn!("Failed to query roots: {}", e);
@@ -1485,7 +1427,7 @@ impl InputHandler {
         };
 
         if let Some(root) = roots.get(app.sidebar_selected_index) {
-            let is_config_root = config.tracked_paths.contains(&root.path);
+            let is_config_root = ctx.app_config.global.tracked_paths.contains(&root.path);
 
             if is_config_root {
                 app.status_message =
@@ -1667,7 +1609,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::config::Config;
+    use crate::config::{AppConfig, Config};
     use crate::db::Database;
     use crate::tui::{PendingDeferral, PendingEntry};
     use tempfile::tempdir;
@@ -1691,23 +1633,28 @@ mod tests {
         Config::default()
     }
 
+    fn test_context<'a>(db: &'a Database, app_config: &'a AppConfig) -> TuiContext<'a> {
+        TuiContext { db, app_config }
+    }
+
     // ===== Navigation and Focus Tests =====
 
     #[test]
     fn tab_switches_focus_between_panels() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Start with main panel focused (default for immediate file interaction)
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
 
         // Tab to sidebar
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Tab));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Tab));
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
 
         // Tab back to main panel
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Tab));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Tab));
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
     }
 
@@ -1715,14 +1662,15 @@ mod tests {
     fn h_at_root_level_returns_to_sidebar() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
 
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/downloads");
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('h')));
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
         assert!(app.sidebar_visible);
     }
@@ -1731,7 +1679,8 @@ mod tests {
     fn h_in_subdirectory_navigates_up() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
@@ -1740,7 +1689,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/downloads/subdir");
         app.entry_selected_index = 3;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('h')));
 
         assert_eq!(app.current_path, PathBuf::from("/test/downloads"));
         assert_eq!(app.entry_selected_index, 0);
@@ -1751,12 +1700,13 @@ mod tests {
     fn h_in_sidebar_is_noop() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.focus_panel = FocusPanel::Sidebar;
         app.sidebar_selected_index = 2;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('h')));
 
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
         assert_eq!(app.sidebar_selected_index, 2);
@@ -1766,7 +1716,8 @@ mod tests {
     fn l_from_sidebar_enters_root() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
@@ -1774,7 +1725,7 @@ mod tests {
         app.focus_panel = FocusPanel::Sidebar;
         app.sidebar_selected_index = 0;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('l')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('l')));
 
         assert_eq!(app.current_path, PathBuf::from("/test/downloads"));
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
@@ -1785,7 +1736,8 @@ mod tests {
     fn l_on_directory_entry_navigates_into_it() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         let root_id = db
             .insert_root(Path::new("/test/downloads"))
@@ -1815,7 +1767,7 @@ mod tests {
         app.sort_mode = SortMode::Name;
         app.entry_selected_index = 0;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('l')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('l')));
 
         assert_eq!(app.current_path, PathBuf::from("/test/downloads/subdir"));
         assert_eq!(app.entry_selected_index, 0);
@@ -1825,7 +1777,8 @@ mod tests {
     fn l_on_file_entry_is_noop() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         let root_id = db
             .insert_root(Path::new("/test/downloads"))
@@ -1844,7 +1797,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/downloads");
         app.entry_selected_index = 0;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('l')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('l')));
 
         // Should remain in the same directory
         assert_eq!(app.current_path, PathBuf::from("/test/downloads"));
@@ -1854,19 +1807,20 @@ mod tests {
     fn j_navigates_down_in_focused_panel() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Navigate down in sidebar
         app.focus_panel = FocusPanel::Sidebar;
         app.sidebar_selected_index = 0;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
         assert_eq!(app.sidebar_selected_index, 1);
         assert_eq!(app.entry_selected_index, 0, "File index should not change");
 
         // Navigate down in main panel
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
         assert_eq!(app.entry_selected_index, 1);
         assert_eq!(
             app.sidebar_selected_index, 1,
@@ -1878,18 +1832,19 @@ mod tests {
     fn k_navigates_up_in_focused_panel() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Navigate up in sidebar
         app.focus_panel = FocusPanel::Sidebar;
         app.sidebar_selected_index = 5;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
         assert_eq!(app.sidebar_selected_index, 4);
 
         // Navigate up in main panel
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 5;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
         assert_eq!(app.entry_selected_index, 4);
     }
 
@@ -1897,18 +1852,19 @@ mod tests {
     fn g_goes_to_top_of_focused_panel() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Go to top in sidebar
         app.focus_panel = FocusPanel::Sidebar;
         app.sidebar_selected_index = 10;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('g')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('g')));
         assert_eq!(app.sidebar_selected_index, 0);
 
         // Go to top in main panel
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 10;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('g')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('g')));
         assert_eq!(app.entry_selected_index, 0);
     }
 
@@ -1916,7 +1872,8 @@ mod tests {
     fn capital_g_goes_to_bottom_of_focused_panel() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Simulate list lengths (normally set by render)
         app.sidebar_len = 10;
@@ -1925,13 +1882,13 @@ mod tests {
         // Go to bottom in sidebar
         app.focus_panel = FocusPanel::Sidebar;
         app.sidebar_selected_index = 0;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('G')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('G')));
         assert_eq!(app.sidebar_selected_index, 9); // len - 1
 
         // Go to bottom in main panel
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('G')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('G')));
         assert_eq!(app.entry_selected_index, 19); // len - 1
     }
 
@@ -1941,20 +1898,21 @@ mod tests {
     fn s_cycles_sort_modes() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         assert_eq!(app.sort_mode, SortMode::Expiration);
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('s')));
         assert_eq!(app.sort_mode, SortMode::Size);
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('s')));
         assert_eq!(app.sort_mode, SortMode::Name);
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('s')));
         assert_eq!(app.sort_mode, SortMode::Modified);
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('s')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('s')));
         assert_eq!(app.sort_mode, SortMode::Expiration);
     }
 
@@ -1964,10 +1922,11 @@ mod tests {
     fn number_1_switches_to_file_list_view() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.view = View::AuditLog;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('1')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('1')));
         assert_eq!(app.view, View::FileList);
     }
 
@@ -1975,10 +1934,11 @@ mod tests {
     fn number_2_switches_to_audit_log_view() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         assert_eq!(app.view, View::FileList);
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('2')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('2')));
         assert_eq!(app.view, View::AuditLog);
     }
 
@@ -1986,10 +1946,11 @@ mod tests {
     fn question_mark_switches_to_help_view() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         assert_eq!(app.view, View::FileList);
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('?')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('?')));
         assert_eq!(app.view, View::Help);
     }
 
@@ -1997,10 +1958,11 @@ mod tests {
     fn help_view_closes_on_any_key() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.view = View::Help;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('x')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
         assert_eq!(app.view, View::FileList);
     }
 
@@ -2008,10 +1970,11 @@ mod tests {
     fn audit_log_view_returns_to_file_list_on_q() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.view = View::AuditLog;
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('q')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('q')));
         assert_eq!(app.view, View::FileList);
     }
 
@@ -2021,10 +1984,11 @@ mod tests {
     fn q_quits_application() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         assert!(!app.should_quit);
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('q')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('q')));
         assert!(app.should_quit);
     }
 
@@ -2032,13 +1996,13 @@ mod tests {
     fn ctrl_c_quits_application() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         assert!(!app.should_quit);
         InputHandler::handle(
             &mut app,
-            &config,
-            &db,
+            &ctx,
             make_key_event_with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
         assert!(app.should_quit);
@@ -2050,7 +2014,8 @@ mod tests {
     fn enter_in_sidebar_sets_current_path_and_focuses_main_panel() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Create a root in the database
         db.insert_root(Path::new("/test/downloads"))
@@ -2061,7 +2026,7 @@ mod tests {
         app.sidebar_selected_index = 0;
 
         // Press Enter
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
 
         assert_eq!(app.current_path, PathBuf::from("/test/downloads"));
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
@@ -2072,11 +2037,12 @@ mod tests {
     fn enter_in_sidebar_with_no_roots_is_noop() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.focus_panel = FocusPanel::Sidebar;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
 
         assert!(app.current_path.as_os_str().is_empty());
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
@@ -2086,7 +2052,8 @@ mod tests {
     fn backspace_at_root_level_returns_to_sidebar() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
@@ -2096,7 +2063,7 @@ mod tests {
         app.focus_panel = FocusPanel::MainPanel;
 
         // Press Backspace
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Backspace));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Backspace));
 
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
     }
@@ -2105,7 +2072,8 @@ mod tests {
     fn backspace_not_at_root_level_is_noop() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
@@ -2115,7 +2083,7 @@ mod tests {
         app.focus_panel = FocusPanel::MainPanel;
 
         // Press Backspace — should not switch to sidebar since we're not at root level
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Backspace));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Backspace));
 
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
     }
@@ -2158,7 +2126,8 @@ mod tests {
     fn d_key_initiates_file_delete_confirmation() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2170,7 +2139,7 @@ mod tests {
         app.entry_selected_index = 0;
 
         // Press 'd' key
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('d')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('d')));
 
         // Should set pending_file_delete with first file
         assert!(
@@ -2198,7 +2167,8 @@ mod tests {
     fn d_key_ignored_when_sidebar_focused() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, _file_ids) = setup_with_files(&db);
@@ -2208,7 +2178,7 @@ mod tests {
         app.focus_panel = FocusPanel::Sidebar;
 
         // Press 'd' key
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('d')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('d')));
 
         // Should NOT set pending_file_delete when sidebar is focused
         assert!(
@@ -2221,7 +2191,8 @@ mod tests {
     fn file_delete_confirmation_y_deletes_file() {
         let (db, _db_dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Create a real temporary file for deletion
         let temp_dir = tempdir().expect("Failed to create temp dir");
@@ -2249,7 +2220,7 @@ mod tests {
         });
 
         // Press 'y' to confirm
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('y')));
 
         // Should clear pending delete
         assert!(
@@ -2289,7 +2260,8 @@ mod tests {
     fn file_delete_confirmation_n_cancels() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2306,7 +2278,7 @@ mod tests {
         });
 
         // Press 'n' to cancel
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('n')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('n')));
 
         // Should clear pending delete
         assert!(
@@ -2332,7 +2304,8 @@ mod tests {
     fn r_key_initiates_file_deferral() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, _file_ids) = setup_with_files(&db);
@@ -2344,7 +2317,7 @@ mod tests {
         app.entry_selected_index = 0;
 
         // Press 'r' key
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('r')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('r')));
 
         // Should set pending_file_deferral
         assert!(
@@ -2367,7 +2340,8 @@ mod tests {
     fn file_deferral_enter_confirms_with_default_days() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2385,7 +2359,7 @@ mod tests {
         });
 
         // Press Enter to confirm
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
 
         // Should clear pending deferral
         assert!(
@@ -2415,7 +2389,8 @@ mod tests {
     fn file_deferral_enter_confirms_with_custom_days() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2433,7 +2408,7 @@ mod tests {
         });
 
         // Press Enter to confirm
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
 
         // Should clear pending deferral
         assert!(
@@ -2467,7 +2442,8 @@ mod tests {
     fn i_key_initiates_file_ignore() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2479,7 +2455,7 @@ mod tests {
         app.entry_selected_index = 0;
 
         // Press 'i' key
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('i')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('i')));
 
         // Should set pending_file_ignore
         assert!(
@@ -2499,7 +2475,8 @@ mod tests {
     fn file_ignore_confirmation_y_ignores_file() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2513,7 +2490,7 @@ mod tests {
         }]);
 
         // Press 'y' to confirm
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('y')));
 
         // Should clear pending ignore
         assert!(
@@ -2536,7 +2513,8 @@ mod tests {
     fn x_key_initiates_file_approval() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2548,7 +2526,7 @@ mod tests {
         app.entry_selected_index = 0;
 
         // Press 'x' key
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('x')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
 
         // Should set pending_file_approval
         assert!(
@@ -2568,7 +2546,8 @@ mod tests {
     fn file_approval_confirmation_y_approves_file() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2582,7 +2561,7 @@ mod tests {
         }]);
 
         // Press 'y' to confirm
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('y')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('y')));
 
         // Should clear pending approval
         assert!(
@@ -2643,7 +2622,8 @@ mod tests {
     #[test]
     fn find_search_matches_returns_matching_indices() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         let root_id = setup_search_files(&db);
 
         let entries = db
@@ -2653,7 +2633,7 @@ mod tests {
             .into_iter()
             .map(|entry| {
                 let days = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    calculate_expiration(cs, config.expiration_days)
+                    calculate_expiration(cs, ctx.app_config.global.expiration_days)
                 });
                 (entry, days)
             })
@@ -2688,7 +2668,8 @@ mod tests {
     #[test]
     fn find_search_matches_is_case_insensitive() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_search_files(&db);
 
         let entries = db
@@ -2698,7 +2679,7 @@ mod tests {
             .into_iter()
             .map(|entry| {
                 let days = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    calculate_expiration(cs, config.expiration_days)
+                    calculate_expiration(cs, ctx.app_config.global.expiration_days)
                 });
                 (entry, days)
             })
@@ -2720,7 +2701,8 @@ mod tests {
     #[test]
     fn find_search_matches_no_matches_returns_empty() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_search_files(&db);
 
         let entries = db
@@ -2730,7 +2712,7 @@ mod tests {
             .into_iter()
             .map(|entry| {
                 let days = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    calculate_expiration(cs, config.expiration_days)
+                    calculate_expiration(cs, ctx.app_config.global.expiration_days)
                 });
                 (entry, days)
             })
@@ -2745,11 +2727,12 @@ mod tests {
     fn slash_enters_search_mode() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.focus_panel = FocusPanel::MainPanel;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('/')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('/')));
 
         assert!(app.search_input_active, "Search input should be active");
         assert_eq!(
@@ -2763,11 +2746,12 @@ mod tests {
     fn slash_only_works_in_main_panel() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.focus_panel = FocusPanel::Sidebar;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('/')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('/')));
 
         assert!(
             !app.search_input_active,
@@ -2780,16 +2764,17 @@ mod tests {
     fn search_input_appends_characters() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         // Enter search mode
         app.search_query = Some(String::new());
         app.search_input_active = true;
 
         // Type "abc"
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('a')));
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('b')));
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('c')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('a')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('b')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('c')));
 
         assert_eq!(app.search_query, Some("abc".to_string()));
         assert!(app.search_input_active);
@@ -2799,12 +2784,13 @@ mod tests {
     fn search_input_backspace_removes_character() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.search_query = Some("abc".to_string());
         app.search_input_active = true;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Backspace));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Backspace));
 
         assert_eq!(app.search_query, Some("ab".to_string()));
     }
@@ -2813,12 +2799,13 @@ mod tests {
     fn search_input_esc_cancels_search() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.search_query = Some("test".to_string());
         app.search_input_active = true;
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Esc));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Esc));
 
         assert_eq!(app.search_query, None, "Search query should be cleared");
         assert!(
@@ -2831,7 +2818,8 @@ mod tests {
     fn search_enter_confirms_and_jumps_to_first_match() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         setup_search_files(&db);
 
@@ -2844,7 +2832,7 @@ mod tests {
         app.search_input_active = true;
 
         // Press Enter to confirm
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Enter));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
 
         assert!(
             !app.search_input_active,
@@ -2869,7 +2857,8 @@ mod tests {
     fn n_jumps_to_next_match() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         setup_search_files(&db);
 
@@ -2881,7 +2870,7 @@ mod tests {
         app.search_input_active = false;
 
         // Verify matches exist
-        let matches = InputHandler::compute_current_matches(&app, &config, &db);
+        let matches = ctx.compute_current_matches(&app);
         assert!(
             matches.len() >= 2,
             "Expected at least 2 matches for 're', got {matches:?}"
@@ -2891,7 +2880,7 @@ mod tests {
         app.entry_selected_index = 0;
 
         // Call jump_to_next_match directly to verify wrapping
-        InputHandler::jump_to_next_match(&mut app, &config, &db);
+        InputHandler::jump_to_next_match(&mut app, &ctx);
         let first_jump = app.entry_selected_index;
         assert!(
             matches.contains(&first_jump),
@@ -2899,7 +2888,7 @@ mod tests {
         );
 
         // Jump again — should advance to next match or wrap
-        InputHandler::jump_to_next_match(&mut app, &config, &db);
+        InputHandler::jump_to_next_match(&mut app, &ctx);
         let second_jump = app.entry_selected_index;
         assert!(
             matches.contains(&second_jump),
@@ -2917,7 +2906,8 @@ mod tests {
     fn capital_n_jumps_to_previous_match() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         setup_search_files(&db);
 
@@ -2932,7 +2922,7 @@ mod tests {
         app.entry_selected_index = 3;
 
         // Press 'N' to go to previous match
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('N')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('N')));
 
         // Should have moved to a match before position 3
         assert!(
@@ -2945,7 +2935,8 @@ mod tests {
     fn esc_clears_confirmed_search() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.focus_panel = FocusPanel::MainPanel;
 
@@ -2954,7 +2945,7 @@ mod tests {
         app.search_input_active = false;
 
         // Press Esc
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Esc));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Esc));
 
         assert_eq!(app.search_query, None, "Esc should clear search query");
         assert!(!app.search_input_active);
@@ -2974,13 +2965,14 @@ mod tests {
     #[test]
     fn navigate_up_clears_search() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         let mut app = App::new();
         app.current_path = PathBuf::from("/some/path/child");
         app.search_query = Some("test".to_string());
         app.search_input_active = false;
 
-        app.navigate_up(&config, &db);
+        app.navigate_up(&ctx);
 
         assert_eq!(app.search_query, None, "Navigation up should clear search");
     }
@@ -2989,14 +2981,15 @@ mod tests {
     fn n_without_search_is_noop() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
 
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 2;
 
         // No search active — 'n' should not be intercepted as search navigation
         // (it falls through to the default match arm)
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('n')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('n')));
 
         assert_eq!(
             app.entry_selected_index, 2,
@@ -3037,13 +3030,13 @@ mod tests {
     }
 
     /// Helper to get sorted entry IDs for the visual test directory.
-    fn visual_entry_ids(db: &Database, config: &Config) -> Vec<i64> {
+    fn visual_entry_ids(ctx: &TuiContext) -> Vec<i64> {
         let app = {
             let mut a = App::new();
             a.current_path = PathBuf::from("/test/visual");
             a
         };
-        sorted_entry_rows(&app, config, db)
+        ctx.sorted_entry_rows(&app)
             .expect("should have entries")
             .iter()
             .map(|(e, _)| e.id)
@@ -3053,7 +3046,8 @@ mod tests {
     #[test]
     fn v_enters_visual_mode_with_anchor_at_cursor() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3063,12 +3057,12 @@ mod tests {
 
         assert!(!app.is_visual_mode());
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
 
         assert!(app.is_visual_mode());
         assert_eq!(app.visual_anchor, Some(2));
         // The entry at index 2 should be selected
-        let ids = visual_entry_ids(&db, &config);
+        let ids = visual_entry_ids(&ctx);
         assert!(app.selected_entries.contains(&ids[2]));
         assert_eq!(app.selected_entries.len(), 1);
     }
@@ -3076,7 +3070,8 @@ mod tests {
     #[test]
     fn v_again_exits_visual_mode_keeping_selection() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3085,14 +3080,14 @@ mod tests {
         app.entry_selected_index = 1;
 
         // Enter visual mode
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
         assert!(app.is_visual_mode());
 
-        let ids = visual_entry_ids(&db, &config);
+        let ids = visual_entry_ids(&ctx);
         assert!(app.selected_entries.contains(&ids[1]));
 
         // Exit visual mode with v again
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
         assert!(!app.is_visual_mode());
         // Selection should be preserved
         assert!(app.selected_entries.contains(&ids[1]));
@@ -3101,7 +3096,8 @@ mod tests {
     #[test]
     fn visual_mode_j_extends_selection_downward() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3111,13 +3107,13 @@ mod tests {
         app.entry_selected_index = 1; // bravo
 
         // Enter visual mode at index 1
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
 
         // Move down to index 3
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
-        let ids = visual_entry_ids(&db, &config);
+        let ids = visual_entry_ids(&ctx);
         // Should have indices 1, 2, 3 selected (bravo, charlie, delta)
         assert!(app.selected_entries.contains(&ids[1]));
         assert!(app.selected_entries.contains(&ids[2]));
@@ -3129,7 +3125,8 @@ mod tests {
     #[test]
     fn visual_mode_k_extends_selection_upward() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3139,13 +3136,13 @@ mod tests {
         app.entry_selected_index = 3; // delta
 
         // Enter visual mode at index 3
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
 
         // Move up to index 1
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('k')));
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
 
-        let ids = visual_entry_ids(&db, &config);
+        let ids = visual_entry_ids(&ctx);
         // Should have indices 1, 2, 3 selected
         assert!(app.selected_entries.contains(&ids[1]));
         assert!(app.selected_entries.contains(&ids[2]));
@@ -3157,7 +3154,8 @@ mod tests {
     #[test]
     fn visual_mode_preserves_pre_existing_space_selections() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3166,19 +3164,19 @@ mod tests {
         app.entry_list_len = 5;
         app.entry_selected_index = 0;
 
-        let ids = visual_entry_ids(&db, &config);
+        let ids = visual_entry_ids(&ctx);
 
         // Space-select item 0 (alpha) — Space also advances cursor to 1
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char(' ')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char(' ')));
         assert!(app.selected_entries.contains(&ids[0]));
         assert_eq!(app.entry_selected_index, 1);
 
         // Now enter visual mode at index 1 (bravo)
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
 
         // Move down to index 3 (delta)
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
         // Alpha (pre-visual) + bravo, charlie, delta (visual range) should all be selected
         assert!(
@@ -3194,7 +3192,8 @@ mod tests {
     #[test]
     fn visual_mode_shrinks_when_cursor_reverses() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3204,17 +3203,17 @@ mod tests {
         app.entry_selected_index = 1; // bravo
 
         // Enter visual mode
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
 
         // Extend down to index 3
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
-        let ids = visual_entry_ids(&db, &config);
+        let ids = visual_entry_ids(&ctx);
         assert_eq!(app.selected_entries.len(), 3); // 1, 2, 3
 
         // Now reverse: move back up to index 2
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('k')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
 
         // Range should shrink to [1, 2]
         assert!(app.selected_entries.contains(&ids[1]));
@@ -3228,7 +3227,8 @@ mod tests {
     #[test]
     fn esc_exits_visual_mode_but_keeps_selection() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3238,14 +3238,14 @@ mod tests {
         app.entry_selected_index = 1;
 
         // Enter visual mode and extend
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
-        let ids = visual_entry_ids(&db, &config);
+        let ids = visual_entry_ids(&ctx);
         assert_eq!(app.selected_entries.len(), 2);
 
         // Esc exits visual mode
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Esc));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Esc));
         assert!(!app.is_visual_mode());
         // Selection preserved
         assert!(app.selected_entries.contains(&ids[1]));
@@ -3255,7 +3255,8 @@ mod tests {
     #[test]
     fn space_exits_visual_mode() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3265,18 +3266,19 @@ mod tests {
         app.entry_selected_index = 2;
 
         // Enter visual mode
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
         assert!(app.is_visual_mode());
 
         // Space should exit visual mode
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char(' ')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char(' ')));
         assert!(!app.is_visual_mode());
     }
 
     #[test]
     fn h_navigation_exits_visual_mode() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3288,14 +3290,15 @@ mod tests {
         app.visual_anchor = Some(0);
 
         // h navigates up and should exit visual mode
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('h')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('h')));
         assert!(!app.is_visual_mode());
     }
 
     #[test]
     fn visual_mode_g_extends_to_top() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3305,12 +3308,12 @@ mod tests {
         app.entry_selected_index = 3; // delta
 
         // Enter visual mode at index 3
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
 
         // g jumps to top
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('g')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('g')));
 
-        let ids = visual_entry_ids(&db, &config);
+        let ids = visual_entry_ids(&ctx);
         // Range should be [0, 3] inclusive
         assert!(app.selected_entries.contains(&ids[0]));
         assert!(app.selected_entries.contains(&ids[1]));
@@ -3322,7 +3325,8 @@ mod tests {
     #[test]
     fn v_on_empty_directory_is_noop() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         db.insert_root(Path::new("/test/empty"))
             .expect("Failed to create test root");
 
@@ -3330,14 +3334,15 @@ mod tests {
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/empty");
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('v')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
         assert!(!app.is_visual_mode());
     }
 
     #[test]
     fn a_selects_all_entries_in_current_directory() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3346,9 +3351,9 @@ mod tests {
 
         assert!(app.selected_entries.is_empty());
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('a')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('a')));
 
-        let ids = visual_entry_ids(&db, &config);
+        let ids = visual_entry_ids(&ctx);
         assert_eq!(app.selected_entries.len(), ids.len());
         for id in &ids {
             assert!(app.selected_entries.contains(id));
@@ -3358,7 +3363,8 @@ mod tests {
     #[test]
     fn a_in_sidebar_does_nothing() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3366,7 +3372,7 @@ mod tests {
 
         assert!(app.selected_entries.is_empty());
 
-        InputHandler::handle(&mut app, &config, &db, make_key_event(KeyCode::Char('a')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('a')));
 
         // Should remain empty since we're in sidebar
         assert!(app.selected_entries.is_empty());

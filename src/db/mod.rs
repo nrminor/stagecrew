@@ -199,6 +199,36 @@ impl Database {
         Ok(id)
     }
 
+    /// Look up a root by its database ID.
+    ///
+    /// # Returns
+    ///
+    /// `Some(Root)` if found, `None` if no root has the given ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    // TODO(cleanup): Remove allow once TuiContext::config() is wired into the event loop.
+    #[allow(dead_code)]
+    pub fn get_root(&self, id: i64) -> Result<Option<Root>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, added_at, last_scanned, target_bytes FROM roots WHERE id = ?1",
+        )?;
+
+        let mut rows = stmt.query([id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Root {
+                id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                added_at: row.get(2)?,
+                last_scanned: row.get(3)?,
+                target_bytes: row.get(4)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get a root by its path.
     ///
     /// # Returns

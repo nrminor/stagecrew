@@ -28,6 +28,78 @@ use crate::scanner::{Scanner, refresh};
 
 use input::InputHandler;
 
+/// Shared immutable references available to all TUI operations within a single
+/// frame or event. Constructed once in the event loop and passed to render and
+/// input handlers, replacing the previous pattern of threading `&Config` and
+/// `&Database` as separate parameters through every function.
+pub(crate) struct TuiContext<'a> {
+    /// Database connection for queries and mutations.
+    pub(crate) db: &'a Database,
+    /// Full application config including per-root overrides.
+    pub(crate) app_config: &'a AppConfig,
+}
+
+impl TuiContext<'_> {
+    /// Returns the effective config for the currently selected root, falling
+    /// back to the global config if no root is selected or the root has no
+    /// local override.
+    pub fn config(&self, app: &App) -> &crate::config::Config {
+        let root = app.current_root_id.and_then(|id| match self.db.get_root(id) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(root_id = id, error = %e, "Failed to look up root for config resolution, using global config");
+                None
+            }
+        });
+        root.map_or(&self.app_config.global, |r| {
+            self.app_config.for_root(&r.path)
+        })
+    }
+
+    /// Query entries for the current path, compute days remaining using the
+    /// effective per-root config, and sort them.
+    ///
+    /// Returns `None` if the current path is empty or the database query fails.
+    /// The returned vec is sorted according to the app's current sort mode and
+    /// the indices match what the user sees on screen.
+    pub fn sorted_entry_rows(&self, app: &App) -> Option<Vec<(crate::db::Entry, i64)>> {
+        if app.current_path.as_os_str().is_empty() {
+            return None;
+        }
+        let config = self.config(app);
+        let entries = self.db.list_entries_by_parent(app.current_path()).ok()?;
+        let mut rows: Vec<_> = entries
+            .into_iter()
+            .map(|entry| {
+                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                    crate::scanner::calculate_expiration(cs, config.expiration_days)
+                });
+                (entry, days_remaining)
+            })
+            .collect();
+        ui::sort_entry_rows(&mut rows, app.sort_mode());
+        Some(rows)
+    }
+
+    /// Compute search match indices for the current directory's sorted entry list.
+    ///
+    /// Returns indices into the sorted entry rows where the filename contains
+    /// the active search query (case-insensitive). Returns an empty vec if
+    /// there is no active search query.
+    pub fn compute_current_matches(&self, app: &App) -> Vec<usize> {
+        let query = match &app.search_query {
+            Some(q) if !q.is_empty() => q,
+            _ => return Vec::new(),
+        };
+
+        let Some(entry_rows) = self.sorted_entry_rows(app) else {
+            return Vec::new();
+        };
+
+        input::find_search_matches(&entry_rows, query)
+    }
+}
+
 /// An entry awaiting user confirmation for a pending action (delete, ignore, approve, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingEntry {
@@ -502,7 +574,7 @@ impl App {
     /// If already at a root level, this is a no-op.
     /// Clears any active search since results are directory-specific.
     /// Attempts to restore cursor position to the directory we came from.
-    pub(crate) fn navigate_up(&mut self, config: &crate::config::Config, db: &crate::db::Database) {
+    pub(crate) fn navigate_up(&mut self, ctx: &TuiContext) {
         let Some(parent) = self.current_path.parent() else {
             return;
         };
@@ -515,20 +587,9 @@ impl App {
         self.clear_search();
 
         // Try to find the directory we came from in the parent's entry list
-        // and set the cursor to it (instead of defaulting to index 0)
-        if let Ok(entries) = db.list_entries_by_parent(&self.current_path) {
-            let mut rows: Vec<_> = entries
-                .into_iter()
-                .map(|entry| {
-                    let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                        crate::scanner::calculate_expiration(cs, config.expiration_days)
-                    });
-                    (entry, days_remaining)
-                })
-                .collect();
-            crate::tui::ui::sort_entry_rows(&mut rows, self.sort_mode);
-
-            // Find the index of the directory we just left
+        // and set the cursor to it (instead of defaulting to index 0).
+        // sorted_entry_rows uses self.current_path which we just updated to the parent.
+        if let Some(rows) = ctx.sorted_entry_rows(self) {
             if let Some(idx) = rows.iter().position(|(e, _)| e.path == leaving_path) {
                 self.entry_selected_index = idx;
             } else {
@@ -715,12 +776,12 @@ impl App {
     ///
     /// Call this after any action that changes entry status (ignore, approve,
     /// defer, unignore, delete) and after refresh completion.
-    pub(crate) fn refresh_stats(
-        &mut self,
-        db: &crate::db::Database,
-        config: &crate::config::Config,
-    ) {
-        match db.compute_live_stats(config.expiration_days, config.warning_days) {
+    pub(crate) fn refresh_stats(&mut self, ctx: &TuiContext) {
+        let config = ctx.config(self);
+        match ctx
+            .db
+            .compute_live_stats(config.expiration_days, config.warning_days)
+        {
             Ok(stats) => {
                 tracing::debug!(
                     total_files = stats.total_files,
@@ -766,19 +827,17 @@ impl App {
         // Track the scan task handle so we can await it properly
         let mut scan_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-        // For now, use global config for TUI operations. Per-root config support
-        // can be added later by passing app_config through and using for_root().
-        let config = &app_config.global;
+        let ctx = TuiContext { db, app_config };
 
         // Load initial stats from the entries table
-        self.refresh_stats(db, config);
+        self.refresh_stats(&ctx);
 
         // Main event loop
         loop {
             // Render the current state
             terminal_manager
                 .terminal_mut()
-                .draw(|frame| ui::render(self, config, db, frame))
+                .draw(|frame| ui::render(self, &ctx, frame))
                 .map_err(crate::error::Error::Io)?;
 
             // Check if we should quit (after rendering final state)
@@ -803,7 +862,7 @@ impl App {
 
                 // Clone what we need for the background task
                 let scanner = Scanner::new();
-                let task_app_config = app_config.clone();
+                let task_app_config = ctx.app_config.clone();
                 let task_db_path = db_path.to_path_buf();
                 let tx = scan_tx.clone();
 
@@ -838,7 +897,7 @@ impl App {
                 maybe_event = event_stream.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) => {
-                            InputHandler::handle(self, config, db, key);
+                            InputHandler::handle(self, &ctx, key);
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
                             Self::handle_mouse_event(self, mouse);
@@ -855,8 +914,8 @@ impl App {
                     match result {
                         Ok(()) => {
                             self.status_message = Some("Refresh complete".to_string());
-                            self.refresh_stats(db, config);
-                            self.auto_enter_first_root(db);
+                            self.refresh_stats(&ctx);
+                            self.auto_enter_first_root(ctx.db);
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Refresh failed: {e}"));
@@ -1215,11 +1274,15 @@ mod tests {
     #[test]
     fn app_navigate_up_goes_to_parent() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = crate::config::AppConfig::from_global(test_config());
+        let ctx = TuiContext {
+            db: &db,
+            app_config: &app_config,
+        };
         let mut app = App::new();
         app.current_path = PathBuf::from("/test/path/child");
         app.entry_selected_index = 5;
-        app.navigate_up(&config, &db);
+        app.navigate_up(&ctx);
         assert_eq!(app.current_path, PathBuf::from("/test/path"));
         // With no entries in the database, cursor defaults to 0
         assert_eq!(app.entry_selected_index, 0);
@@ -1228,11 +1291,15 @@ mod tests {
     #[test]
     fn app_navigate_up_at_root_is_noop() {
         let (db, _dir) = temp_database();
-        let config = test_config();
+        let app_config = crate::config::AppConfig::from_global(test_config());
+        let ctx = TuiContext {
+            db: &db,
+            app_config: &app_config,
+        };
         let mut app = App::new();
         app.current_path = PathBuf::from("/");
         app.entry_selected_index = 5;
-        app.navigate_up(&config, &db);
+        app.navigate_up(&ctx);
         // "/" has no parent, so navigate_up is a no-op (path and index unchanged).
         assert_eq!(app.current_path, PathBuf::from("/"));
         assert_eq!(app.entry_selected_index, 5);
