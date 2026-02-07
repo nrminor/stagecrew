@@ -4,13 +4,13 @@ use std::sync::OnceLock;
 
 use ratatui::Frame;
 use ratatui::layout::Margin;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Table,
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table, Wrap,
 };
 
 use crate::audit::AuditService;
@@ -38,6 +38,12 @@ mod palette {
     pub const RED: Color = Color::Rgb(220, 80, 80);
     /// Deferred state - files with extended deadline
     pub const CYAN: Color = Color::Rgb(0, 200, 200);
+    /// Shared modal surface background.
+    pub const MODAL_BG: Color = Color::Rgb(24, 27, 36);
+    /// Shared modal primary text color.
+    pub const MODAL_FG: Color = Color::Rgb(230, 235, 245);
+    /// Shared modal secondary text color.
+    pub const MODAL_MUTED: Color = Color::Rgb(155, 165, 185);
 }
 
 /// Pre-computed gradient for row fading effect.
@@ -2248,43 +2254,84 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     frame.render_widget(footer, chunks[1]);
 }
 
+fn render_modal_shell(
+    frame: &mut Frame,
+    title: &str,
+    border_color: Color,
+    desired_width: u16,
+    desired_height: u16,
+) -> Rect {
+    let area = frame.area();
+
+    // Dim existing UI so modal content has clear visual priority.
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buffer[(x, y)];
+            cell.set_style(cell.style().add_modifier(Modifier::DIM));
+        }
+    }
+
+    let width = desired_width.clamp(44, area.width.saturating_sub(4));
+    let height = desired_height.clamp(8, area.height.saturating_sub(2));
+    let modal_area = Rect {
+        x: area.left() + area.width.saturating_sub(width) / 2,
+        y: area.top() + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    let block = Block::default()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .padding(Padding::symmetric(2, 1))
+        .style(Style::default().bg(palette::MODAL_BG).fg(palette::MODAL_FG));
+    let inner = block.inner(modal_area);
+
+    frame.render_widget(Clear, modal_area);
+    frame.render_widget(block, modal_area);
+
+    inner
+}
+
+fn render_modal_body(frame: &mut Frame, area: Rect, lines: Vec<Line<'_>>) {
+    let body = Paragraph::new(lines)
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(palette::MODAL_FG).bg(palette::MODAL_BG));
+    frame.render_widget(body, area);
+}
+
 /// Render a confirmation modal for approval actions.
 ///
 /// Displays a centered modal asking the user to confirm removal approval.
 fn render_confirmation_modal(frame: &mut Frame, path: &str) {
-    use ratatui::layout::{Alignment, Rect};
-
-    // Calculate centered rectangle for modal (50% width, 7 lines height)
-    let area = frame.area();
-    let modal_width = area.width / 2;
-    let modal_height = 7;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
-    // Create the modal content
-    let title = "Approve Removal";
-    let message = format!("Approve removal of:\n\n{path}\n\n(y/n)");
-
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(palette::YELLOW)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
+    let inner = render_modal_shell(frame, "Approve Removal", palette::YELLOW, 72, 10);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from(vec![Span::styled(
+                "Action",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+            Line::from("Approve removal for:"),
+            Line::from(path.to_string()),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[y] confirm   [n] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
+    );
 }
 
 /// Render a deferral input modal for entering days to defer.
@@ -2299,23 +2346,6 @@ fn render_deferral_modal(
     default_days: u32,
     count: usize,
 ) {
-    use ratatui::layout::{Alignment, Rect};
-
-    // Calculate centered rectangle for modal (60% width, 9 lines height)
-    let area = frame.area();
-    let modal_width = (area.width * 3) / 5;
-    let modal_height = 9;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
-    // Create the modal content
     let title = if count > 1 {
         format!("Defer Expiration ({count} files)")
     } else {
@@ -2331,23 +2361,29 @@ fn render_deferral_modal(
     } else {
         path.to_string()
     };
-    let message = format!(
-        "Defer expiration for:\n{path_display}\n\nDays to defer: {display_input}\n\n(Enter to confirm, Esc to cancel)"
+
+    let inner = render_modal_shell(frame, &title, palette::CYAN, 82, 12);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from(vec![Span::styled(
+                "Target",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+            Line::from(path_display),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Days to defer: ", Style::default().fg(palette::MODAL_MUTED)),
+                Span::raw(display_input),
+            ]),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[Enter] confirm   [Esc] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
     );
-
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(palette::CYAN)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
 }
 
 /// Render an entry deletion confirmation modal.
@@ -2356,23 +2392,6 @@ fn render_deferral_modal(
 /// of the selected entry (file or directory). The modal text varies
 /// based on the removal method (trash vs permanent delete).
 fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool, method: RemovalMethod) {
-    use ratatui::layout::{Alignment, Rect};
-
-    // Calculate centered rectangle for modal (50% width, 7 lines height)
-    let area = frame.area();
-    let modal_width = area.width / 2;
-    let modal_height = 7;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
-    // Create the modal content based on method
     let type_name = if is_dir { "directory" } else { "file" };
     let (title, action_verb, border_color) = match method {
         RemovalMethod::Trash => (
@@ -2394,68 +2413,56 @@ fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool, method
             palette::RED,
         ),
     };
-    let message = format!("{action_verb} {type_name}:\n\n{path}\n\n(y/n)");
-
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
+    let inner = render_modal_shell(frame, title, border_color, 76, 10);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from(vec![Span::styled(
+                "Action",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+            Line::from(format!("{action_verb} {type_name}:")),
+            Line::from(path.to_string()),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[y] confirm   [n] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
+    );
 }
 
 /// Render a multi-entry deletion confirmation modal.
 ///
 /// The modal text varies based on the removal method (trash vs permanent delete).
 fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize, method: RemovalMethod) {
-    use ratatui::layout::{Alignment, Rect};
-
-    let area = frame.area();
-    let modal_width = area.width / 2;
-    let modal_height = 7;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
     let (title, message, border_color) = match method {
         RemovalMethod::Trash => (
             format!("Move {count} Entries to Trash"),
-            format!("Move {count} entries to trash?\n\n(y/n)"),
+            format!("Move {count} entries to trash?"),
             palette::YELLOW,
         ),
         RemovalMethod::PermanentDelete => (
             format!("Permanently Delete {count} Entries"),
-            format!("Permanently delete {count} entries?\n\n(y/n)"),
+            format!("Permanently delete {count} entries?"),
             palette::RED,
         ),
     };
 
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
+    let inner = render_modal_shell(frame, &title, border_color, 66, 9);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from(message),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[y] confirm   [n] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
+    );
 }
 
 /// Render an ignore confirmation modal for permanently exempting a path.
@@ -2463,109 +2470,56 @@ fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize, method: Remo
 /// Displays a centered modal prompting the user to confirm permanent exemption
 /// of the selected directory from auto-removal.
 fn render_ignore_modal(frame: &mut Frame, path: &str) {
-    use ratatui::layout::{Alignment, Rect};
-
-    // Calculate centered rectangle for modal (50% width, 7 lines height)
-    let area = frame.area();
-    let modal_width = area.width / 2;
-    let modal_height = 7;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
-    // Create the modal content
-    let title = "Ignore Path Permanently";
-    let message = format!("Permanently ignore:\n\n{path}\n\n(y/n)");
-
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(palette::CYAN)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
+    let inner = render_modal_shell(frame, "Ignore Path Permanently", palette::CYAN, 76, 10);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from("Permanently ignore:"),
+            Line::from(path.to_string()),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[y] confirm   [n] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
+    );
 }
 
 /// Render a multi-file ignore confirmation modal.
 fn render_ignore_modal_multi(frame: &mut Frame, count: usize) {
-    use ratatui::layout::{Alignment, Rect};
-
-    let area = frame.area();
-    let modal_width = area.width / 2;
-    let modal_height = 7;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
     let title = format!("Ignore {count} Files Permanently");
-    let message = format!("Permanently ignore {count} files?\n\n(y/n)");
-
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(palette::CYAN)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
+    let inner = render_modal_shell(frame, &title, palette::CYAN, 62, 9);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from(format!("Permanently ignore {count} files?")),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[y] confirm   [n] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
+    );
 }
 
 /// Render a multi-file approval confirmation modal.
 fn render_confirmation_modal_multi(frame: &mut Frame, count: usize) {
-    use ratatui::layout::{Alignment, Rect};
-
-    let area = frame.area();
-    let modal_width = area.width / 2;
-    let modal_height = 7;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
     let title = format!("Approve {count} Files for Removal");
-    let message = format!("Approve {count} files for removal?\n\n(y/n)");
-
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(palette::YELLOW)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
+    let inner = render_modal_shell(frame, &title, palette::YELLOW, 64, 9);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from(format!("Approve {count} files for removal?")),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[y] confirm   [n] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
+    );
 }
 
 /// Render add path text input modal.
@@ -2573,79 +2527,49 @@ fn render_confirmation_modal_multi(frame: &mut Frame, count: usize) {
 /// Displays a centered modal prompting the user to enter a path to add to `tracked_paths`.
 /// Supports tilde expansion (~).
 fn render_add_path_modal(frame: &mut Frame, input: &str) {
-    use ratatui::layout::{Alignment, Rect};
-
-    // Calculate centered rectangle for modal (60% width, 7 lines height)
-    let area = frame.area();
-    let modal_width = (area.width * 3) / 5;
-    let modal_height = 7;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
-    // Create the modal content
     let display_input = if input.is_empty() { "_" } else { input };
-    let message = format!(
-        "Add tracked path:\n\n{display_input}\n\n(Supports ~) (Enter to add, Esc to cancel)"
+
+    let inner = render_modal_shell(frame, "Add Tracked Path", palette::GREEN, 84, 11);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from(vec![Span::styled(
+                "Path",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+            Line::from(display_input.to_string()),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Supports ~ expansion",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+            Line::from(vec![Span::styled(
+                "[Enter] add   [Esc] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
     );
-
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title("Add Tracked Path")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(palette::GREEN)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
 }
 
 /// Render remove path confirmation modal.
 ///
 /// Displays a centered modal prompting the user to confirm removal of a tracked path.
 fn render_remove_path_modal(frame: &mut Frame, path: &str) {
-    use ratatui::layout::{Alignment, Rect};
-
-    // Calculate centered rectangle for modal (50% width, 7 lines height)
-    let area = frame.area();
-    let modal_width = area.width / 2;
-    let modal_height = 7;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
-
-    // Create the modal content
-    let message = format!("Remove tracked path:\n{path}\n\n(y/n)");
-
-    let modal = Paragraph::new(message)
-        .block(
-            Block::default()
-                .title("Remove Tracked Path")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(palette::RED)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
+    let inner = render_modal_shell(frame, "Remove Tracked Path", palette::RED, 76, 10);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from("Remove tracked path:"),
+            Line::from(path.to_string()),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[y] confirm   [n] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
+    );
 }
 
 /// Render the quota target input modal.
@@ -2653,21 +2577,7 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
 /// Displays a centered modal with two fields: a numeric input for the size value
 /// and a unit selector (MB/GB/TB). Tab switches focus between fields.
 fn render_quota_target_modal(frame: &mut Frame, target: &PendingQuotaTarget) {
-    use ratatui::layout::{Alignment, Rect};
-
-    // Calculate centered rectangle for modal (50% width, 9 lines height)
-    let area = frame.area();
-    let modal_width = area.width / 2;
-    let modal_height = 9;
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect {
-        x: modal_x,
-        y: modal_y,
-        width: modal_width,
-        height: modal_height,
-    };
+    let inner = render_modal_shell(frame, "Set Quota Target", palette::CYAN, 88, 13);
 
     // Format the current target for display
     let current_display = match target.current_target {
@@ -2711,10 +2621,10 @@ fn render_quota_target_modal(frame: &mut Frame, target: &PendingQuotaTarget) {
             Style::default()
                 .fg(palette::CYAN)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::MODAL_FG),
         ),
         QuotaTargetFocus::Unit => (
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::MODAL_FG),
             Style::default()
                 .fg(palette::CYAN)
                 .add_modifier(Modifier::BOLD),
@@ -2724,33 +2634,33 @@ fn render_quota_target_modal(frame: &mut Frame, target: &PendingQuotaTarget) {
     // Build the content with styled spans
     let path_display = target.root_path.display().to_string();
     let content = vec![
-        Line::from(format!("Root: {path_display}")),
-        Line::from(format!("Current: {current_display}")),
+        Line::from(vec![
+            Span::styled("Root: ", Style::default().fg(palette::MODAL_MUTED)),
+            Span::raw(path_display),
+        ]),
+        Line::from(vec![
+            Span::styled("Current: ", Style::default().fg(palette::MODAL_MUTED)),
+            Span::raw(current_display),
+        ]),
         Line::from(""),
         Line::from(vec![
-            Span::raw("Size: "),
+            Span::styled("Size: ", Style::default().fg(palette::MODAL_MUTED)),
             Span::styled(size_display, size_style),
-            Span::raw("    Unit: "),
+            Span::styled("    Unit: ", Style::default().fg(palette::MODAL_MUTED)),
             Span::styled(unit_display, unit_style),
         ]),
         Line::from(""),
-        Line::from("Tab to switch fields, Enter to confirm"),
-        Line::from("Empty or 0 clears the target, Esc to cancel"),
+        Line::from(vec![Span::styled(
+            "[Tab] switch fields   [Enter] confirm",
+            Style::default().fg(palette::MODAL_MUTED),
+        )]),
+        Line::from(vec![Span::styled(
+            "Empty or 0 clears target   [Esc] cancel",
+            Style::default().fg(palette::MODAL_MUTED),
+        )]),
     ];
 
-    let modal = Paragraph::new(content)
-        .block(
-            Block::default()
-                .title("Set Quota Target")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(palette::CYAN)),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    // Clear the area behind the modal
-    frame.render_widget(Clear, modal_area);
-    frame.render_widget(modal, modal_area);
+    render_modal_body(frame, inner, content);
 }
 
 #[cfg(test)]
