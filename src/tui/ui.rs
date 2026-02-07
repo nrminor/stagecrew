@@ -39,7 +39,10 @@ mod palette {
     /// Deferred state - files with extended deadline
     pub const CYAN: Color = Color::Rgb(0, 200, 200);
     /// Shared modal surface background.
-    pub const MODAL_BG: Color = Color::Rgb(24, 27, 36);
+    ///
+    /// Use terminal-default background so modal surfaces blend with existing pane
+    /// backgrounds instead of creating a dark rectangular cutout.
+    pub const MODAL_BG: Color = Color::Reset;
     /// Shared modal primary text color.
     pub const MODAL_FG: Color = Color::Rgb(230, 235, 245);
     /// Shared modal secondary text color.
@@ -54,7 +57,6 @@ struct FadeGradient {
     green: [Color; 101],
     yellow: [Color; 101],
     red: [Color; 101],
-    cyan: [Color; 101],
     gray: [Color; 101],
 }
 
@@ -70,14 +72,12 @@ impl FadeGradient {
         let green_rgb = (0, 166, 0);
         let yellow_rgb = (220, 200, 0);
         let red_rgb = (220, 80, 80);
-        let cyan_rgb = (0, 200, 200);
 
         Self {
             text: Self::generate((220, 220, 220), fade_end),
             green: Self::generate(green_rgb, fade_end),
             yellow: Self::generate(yellow_rgb, fade_end),
             red: Self::generate(red_rgb, fade_end),
-            cyan: Self::generate(cyan_rgb, fade_end),
             gray: Self::generate((128, 128, 128), fade_end),
         }
     }
@@ -1467,9 +1467,8 @@ fn render_main_entry_panel(
                 let base_gradient = match entry.status.as_str() {
                     "ignored" => &gradient.gray,
                     "pending" | "approved" => &gradient.red,
-                    "deferred" => &gradient.cyan,
                     _ => {
-                        // For tracked entries, color by urgency
+                        // For tracked/deferred entries, color by urgency
                         if effective_days <= 0 {
                             &gradient.red // Overdue
                         } else if effective_days <= i64::from(config.warning_days) {
@@ -2296,6 +2295,7 @@ fn render_modal_shell(
         .style(Style::default().bg(palette::MODAL_BG).fg(palette::MODAL_FG));
     let inner = block.inner(modal_area);
 
+    // Clear modal cells so dim modifier and old symbols do not bleed through.
     frame.render_widget(Clear, modal_area);
     frame.render_widget(block, modal_area);
 
@@ -2310,11 +2310,21 @@ fn render_modal_body(frame: &mut Frame, area: Rect, lines: Vec<Line<'_>>) {
     frame.render_widget(body, area);
 }
 
+const MODAL_WIDTH_CONFIRM: u16 = 64;
+const MODAL_WIDTH_INPUT: u16 = 74;
+const MODAL_WIDTH_FORM: u16 = 82;
+
 /// Render a confirmation modal for approval actions.
 ///
 /// Displays a centered modal asking the user to confirm removal approval.
 fn render_confirmation_modal(frame: &mut Frame, path: &str) {
-    let inner = render_modal_shell(frame, "Approve Removal", palette::YELLOW, 72, 10);
+    let inner = render_modal_shell(
+        frame,
+        "Approve Removal",
+        palette::YELLOW,
+        MODAL_WIDTH_CONFIRM,
+        10,
+    );
     render_modal_body(
         frame,
         inner,
@@ -2362,7 +2372,7 @@ fn render_deferral_modal(
         path.to_string()
     };
 
-    let inner = render_modal_shell(frame, &title, palette::CYAN, 82, 12);
+    let inner = render_modal_shell(frame, &title, palette::CYAN, MODAL_WIDTH_INPUT, 12);
     render_modal_body(
         frame,
         inner,
@@ -2413,7 +2423,7 @@ fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool, method
             palette::RED,
         ),
     };
-    let inner = render_modal_shell(frame, title, border_color, 76, 10);
+    let inner = render_modal_shell(frame, title, border_color, MODAL_WIDTH_CONFIRM, 10);
     render_modal_body(
         frame,
         inner,
@@ -2450,7 +2460,7 @@ fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize, method: Remo
         ),
     };
 
-    let inner = render_modal_shell(frame, &title, border_color, 66, 9);
+    let inner = render_modal_shell(frame, &title, border_color, 58, 9);
     render_modal_body(
         frame,
         inner,
@@ -2470,7 +2480,13 @@ fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize, method: Remo
 /// Displays a centered modal prompting the user to confirm permanent exemption
 /// of the selected directory from auto-removal.
 fn render_ignore_modal(frame: &mut Frame, path: &str) {
-    let inner = render_modal_shell(frame, "Ignore Path Permanently", palette::CYAN, 76, 10);
+    let inner = render_modal_shell(
+        frame,
+        "Ignore Path Permanently",
+        palette::CYAN,
+        MODAL_WIDTH_CONFIRM,
+        10,
+    );
     render_modal_body(
         frame,
         inner,
@@ -2489,7 +2505,7 @@ fn render_ignore_modal(frame: &mut Frame, path: &str) {
 /// Render a multi-file ignore confirmation modal.
 fn render_ignore_modal_multi(frame: &mut Frame, count: usize) {
     let title = format!("Ignore {count} Files Permanently");
-    let inner = render_modal_shell(frame, &title, palette::CYAN, 62, 9);
+    let inner = render_modal_shell(frame, &title, palette::CYAN, 58, 9);
     render_modal_body(
         frame,
         inner,
@@ -2507,7 +2523,7 @@ fn render_ignore_modal_multi(frame: &mut Frame, count: usize) {
 /// Render a multi-file approval confirmation modal.
 fn render_confirmation_modal_multi(frame: &mut Frame, count: usize) {
     let title = format!("Approve {count} Files for Removal");
-    let inner = render_modal_shell(frame, &title, palette::YELLOW, 64, 9);
+    let inner = render_modal_shell(frame, &title, palette::YELLOW, 60, 9);
     render_modal_body(
         frame,
         inner,
@@ -2529,7 +2545,13 @@ fn render_confirmation_modal_multi(frame: &mut Frame, count: usize) {
 fn render_add_path_modal(frame: &mut Frame, input: &str) {
     let display_input = if input.is_empty() { "_" } else { input };
 
-    let inner = render_modal_shell(frame, "Add Tracked Path", palette::GREEN, 84, 11);
+    let inner = render_modal_shell(
+        frame,
+        "Add Tracked Path",
+        palette::GREEN,
+        MODAL_WIDTH_INPUT,
+        11,
+    );
     render_modal_body(
         frame,
         inner,
@@ -2556,7 +2578,13 @@ fn render_add_path_modal(frame: &mut Frame, input: &str) {
 ///
 /// Displays a centered modal prompting the user to confirm removal of a tracked path.
 fn render_remove_path_modal(frame: &mut Frame, path: &str) {
-    let inner = render_modal_shell(frame, "Remove Tracked Path", palette::RED, 76, 10);
+    let inner = render_modal_shell(
+        frame,
+        "Remove Tracked Path",
+        palette::RED,
+        MODAL_WIDTH_CONFIRM,
+        10,
+    );
     render_modal_body(
         frame,
         inner,
@@ -2577,7 +2605,13 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
 /// Displays a centered modal with two fields: a numeric input for the size value
 /// and a unit selector (MB/GB/TB). Tab switches focus between fields.
 fn render_quota_target_modal(frame: &mut Frame, target: &PendingQuotaTarget) {
-    let inner = render_modal_shell(frame, "Set Quota Target", palette::CYAN, 88, 13);
+    let inner = render_modal_shell(
+        frame,
+        "Set Quota Target",
+        palette::CYAN,
+        MODAL_WIDTH_FORM,
+        13,
+    );
 
     // Format the current target for display
     let current_display = match target.current_target {
