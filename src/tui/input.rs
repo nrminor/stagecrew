@@ -270,7 +270,7 @@ impl InputHandler {
             // Views
             KeyCode::Char('1') => app.view = View::FileList,
             KeyCode::Char('2') => app.view = View::AuditLog,
-            KeyCode::Char('?') => app.view = View::Help,
+            KeyCode::Char('3' | '?') => app.view = View::Help,
 
             // Refresh tracked paths (scan filesystem + transition expired files)
             KeyCode::Char('R') => {
@@ -411,6 +411,9 @@ impl InputHandler {
         match key.code {
             KeyCode::Char('q' | 'h' | '1') | KeyCode::Esc => {
                 app.view = View::FileList;
+            }
+            KeyCode::Char('3' | '?') => {
+                app.view = View::Help;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 app.sidebar_selected_index = app.sidebar_selected_index.saturating_add(1);
@@ -1955,6 +1958,18 @@ mod tests {
     }
 
     #[test]
+    fn number_3_switches_to_help_view() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        assert_eq!(app.view, View::FileList);
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('3')));
+        assert_eq!(app.view, View::Help);
+    }
+
+    #[test]
     fn help_view_closes_on_any_key() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
@@ -1976,6 +1991,18 @@ mod tests {
         app.view = View::AuditLog;
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('q')));
         assert_eq!(app.view, View::FileList);
+    }
+
+    #[test]
+    fn audit_log_view_switches_to_help_on_question_mark() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        app.view = View::AuditLog;
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('?')));
+        assert_eq!(app.view, View::Help);
     }
 
     // ===== Quit Tests =====

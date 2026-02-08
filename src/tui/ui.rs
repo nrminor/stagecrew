@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Table, Wrap,
+    ScrollbarOrientation, ScrollbarState, Table, Tabs, Wrap,
 };
 
 use crate::audit::AuditService;
@@ -133,27 +133,31 @@ fn fade_gradient() -> &'static FadeGradient {
 /// This is the main rendering function that dispatches to view-specific
 /// rendering based on the current `app.view` state.
 pub(crate) fn render(app: &mut App, ctx: &TuiContext, frame: &mut Frame) {
-    // Create the main layout with a footer for keybinding hints
+    // Create the main layout with top tabs and footer hints.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3), // View tabs block
             Constraint::Min(0),    // Main content area
             Constraint::Length(1), // Footer
         ])
         .split(frame.area());
 
+    // Render tabs first so they feel like view navigation.
+    render_view_tabs(app, frame, chunks[0]);
+
     // Render the current view in the main area
     match app.view() {
         View::FileList => {
             let config = ctx.config(app);
-            render_file_list_view(app, config, ctx.db, frame, chunks[0]);
+            render_file_list_view(app, config, ctx.db, frame, chunks[1]);
         }
-        View::AuditLog => render_audit_log(app, ctx.db, frame, chunks[0]),
-        View::Help => render_help(app, frame, chunks[0]),
+        View::AuditLog => render_audit_log(app, ctx.db, frame, chunks[1]),
+        View::Help => render_help(app, frame, chunks[1]),
     }
 
-    // Render the footer
-    render_footer(app, frame, chunks[1]);
+    // Render footer
+    render_footer(app, frame, chunks[2]);
 
     // Render entry deletion confirmation modal if pending entry delete
     if let Some(deletion) = app.pending_entry_delete() {
@@ -216,6 +220,46 @@ pub(crate) fn render(app: &mut App, ctx: &TuiContext, frame: &mut Frame) {
     if let Some(target) = app.pending_quota_target() {
         render_quota_target_modal(frame, target);
     }
+}
+
+fn render_view_tabs(app: &App, frame: &mut Frame, area: Rect) {
+    let selected = match app.view() {
+        View::FileList => Some(0),
+        View::AuditLog => Some(1),
+        View::Help => Some(2),
+    };
+
+    let tab_block = Block::default().borders(Borders::ALL);
+    let tabs_inner = tab_block.inner(area);
+    frame.render_widget(tab_block, area);
+
+    let Some(selected) = selected else {
+        frame.render_widget(Paragraph::new(""), tabs_inner);
+        return;
+    };
+
+    let titles = vec![
+        Line::from(vec![
+            Span::styled("MAIN DASHBOARD", Style::default()),
+            Span::raw(" [1]"),
+        ]),
+        Line::from(vec![
+            Span::styled("AUDIT LOG", Style::default()),
+            Span::raw(" [2]"),
+        ]),
+        Line::from(vec![
+            Span::styled("HELP MENU", Style::default()),
+            Span::raw(" [3]"),
+        ]),
+    ];
+
+    let tabs = Tabs::new(titles)
+        .select(selected)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(Style::default().fg(Color::Reset))
+        .divider(Span::styled("│", Style::default().fg(Color::DarkGray)));
+
+    frame.render_widget(tabs, tabs_inner);
 }
 
 /// Render the file list view with sidebar.
@@ -2017,7 +2061,7 @@ const HELP_RIGHT_TEXT: &str = r"Root Management:
 Views:
   1           Main dashboard (file list)
   2           Audit log
-  ?           Show this help screen
+  3 / ?       Show this help screen
 
 Sorting:
   s           Cycle sort mode (Due → Size → Name → Modified)
