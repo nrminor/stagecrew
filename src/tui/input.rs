@@ -88,10 +88,6 @@ impl InputHandler {
             Self::handle_entry_ignore_confirmation(app, ctx, key);
             return;
         }
-        if app.pending_entry_approval.is_some() {
-            Self::handle_entry_approval_confirmation(app, ctx, key);
-            return;
-        }
         if app.pending_quota_target.is_some() {
             Self::handle_quota_target_input(app, db, key);
             return;
@@ -239,7 +235,7 @@ impl InputHandler {
                 Self::initiate_entry_ignore(app, config, db);
             }
             KeyCode::Char('x') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::initiate_entry_approve(app, config, db);
+                Self::toggle_entry_approval(app, ctx);
             }
             KeyCode::Char('u') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::unignore_entry(app, ctx);
@@ -947,129 +943,130 @@ impl InputHandler {
         }
     }
 
-    /// Initiate entry approval by setting up the confirmation state.
+    /// Toggle approval state directly (no confirmation modal).
     ///
-    /// If entries are selected via multi-select, approve all selected entries.
-    /// Otherwise, approve the currently focused entry.
-    fn initiate_entry_approve(app: &mut App, config: &Config, db: &Database) {
+    /// Pressing `x` on an approved entry unapproves it back to tracked.
+    /// Pressing `x` on other entries approves them.
+    ///
+    /// If entries are multi-selected, toggles each selected entry.
+    fn toggle_entry_approval(app: &mut App, ctx: &TuiContext) {
         // Get entries for current path
         if app.current_path.as_os_str().is_empty() {
-            tracing::warn!("Cannot approve entry: no path selected");
+            tracing::warn!("Cannot toggle approval: no path selected");
             return;
         }
 
-        // Query entries for current browsing path
-        let entries = match db.list_entries_by_parent(app.current_path()) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("Failed to query entries: {}", e);
-                return;
-            }
-        };
-
-        // Sort entries the same way the UI does so indices match
-        let mut entry_rows: Vec<_> = entries
-            .into_iter()
-            .map(|entry| {
-                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    calculate_expiration(cs, config.expiration_days)
-                });
-                (entry, days_remaining)
-            })
-            .collect();
-        sort_entry_rows(&mut entry_rows, app.sort_mode());
-
-        // Determine which entries to approve
-        let entries_to_approve: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
-            // No selection - use currently focused entry
-            if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
-                vec![super::PendingEntry {
-                    id: entry.id,
-                    path: entry.path.clone(),
-                    is_dir: entry.is_dir,
-                }]
-            } else {
-                tracing::warn!("No entry selected (index out of bounds)");
-                return;
-            }
-        } else {
-            // Use selected entries (selection is by ID, so sorting doesn't matter here)
-            entry_rows
-                .into_iter()
-                .filter(|(e, _)| app.selected_entries.contains(&e.id))
-                .map(|(e, _)| super::PendingEntry {
-                    id: e.id,
-                    path: e.path.clone(),
-                    is_dir: e.is_dir,
-                })
-                .collect()
-        };
-
-        if entries_to_approve.is_empty() {
-            tracing::warn!("No entries to approve");
+        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
+            tracing::warn!("Failed to query entries");
             return;
-        }
+        };
 
-        // Set pending approval state
-        app.pending_entry_approval = Some(entries_to_approve);
-    }
-
-    /// Handle entry approval confirmation (y/n/Esc).
-    fn handle_entry_approval_confirmation(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y' | 'Y') => {
-                // User confirmed - perform the approval for all pending entries
-                if let Some(entries) = &app.pending_entry_approval {
-                    let audit = AuditService::new(ctx.db);
-                    let user = AuditService::current_user();
-                    let root_id = app.current_root_id;
-
-                    for entry in entries {
-                        if let Err(e) = ctx.db.update_entry_status(entry.id, "approved") {
-                            tracing::warn!(
-                                "Failed to approve entry {}: {}",
-                                entry.path.display(),
-                                e
-                            );
-                        } else {
-                            // Propagate to children if this is a directory
-                            if entry.is_dir
-                                && let Err(e) = ctx
-                                    .db
-                                    .update_entries_by_path_prefix(&entry.path, "approved")
-                            {
-                                tracing::warn!(
-                                    "Failed to propagate approval to children of {}: {}",
-                                    entry.path.display(),
-                                    e
-                                );
-                            }
-                            if let Err(e) = audit.record(
-                                &user,
-                                AuditAction::Approve,
-                                Some(entry.path.as_path()),
-                                None,
-                                root_id,
-                            ) {
-                                tracing::warn!("Failed to record audit entry for approval: {}", e);
-                            }
-                        }
-                    }
+        // Determine which entries to toggle
+        let entries_to_toggle: Vec<(super::PendingEntry, String)> =
+            if app.selected_entries.is_empty() {
+                // No selection - use currently focused entry
+                if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
+                    vec![(
+                        super::PendingEntry {
+                            id: entry.id,
+                            path: entry.path.clone(),
+                            is_dir: entry.is_dir,
+                        },
+                        entry.status.clone(),
+                    )]
+                } else {
+                    tracing::warn!("No entry selected (index out of bounds)");
+                    return;
                 }
-                // Clear pending approval, visual mode, and selection
-                app.pending_entry_approval = None;
-                app.exit_visual_mode();
-                app.clear_selection();
-                app.refresh_stats(ctx);
+            } else {
+                // Use selected entries (selection is by ID, so sorting doesn't matter here)
+                entry_rows
+                    .into_iter()
+                    .filter(|(e, _)| app.selected_entries.contains(&e.id))
+                    .map(|(e, _)| {
+                        (
+                            super::PendingEntry {
+                                id: e.id,
+                                path: e.path.clone(),
+                                is_dir: e.is_dir,
+                            },
+                            e.status,
+                        )
+                    })
+                    .collect()
+            };
+
+        if entries_to_toggle.is_empty() {
+            tracing::warn!("No entries to toggle approval");
+            return;
+        }
+
+        let audit = AuditService::new(ctx.db);
+        let user = AuditService::current_user();
+        let root_id = app.current_root_id;
+
+        let mut approved_count = 0;
+        let mut unapproved_count = 0;
+
+        for (entry, current_status) in &entries_to_toggle {
+            let (next_status, details) = if current_status == "approved" {
+                unapproved_count += 1;
+                ("tracked", Some("Unapproved (set status to tracked)"))
+            } else {
+                approved_count += 1;
+                ("approved", None)
+            };
+
+            if let Err(e) = ctx.db.update_entry_status(entry.id, next_status) {
+                tracing::warn!(
+                    "Failed to set approval status for entry {}: {}",
+                    entry.path.display(),
+                    e
+                );
+                continue;
             }
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                // Cancel approval
-                app.pending_entry_approval = None;
+
+            // Propagate to children if this is a directory
+            if entry.is_dir
+                && let Err(e) = ctx
+                    .db
+                    .update_entries_by_path_prefix(&entry.path, next_status)
+            {
+                tracing::warn!(
+                    "Failed to propagate {} to children of {}: {}",
+                    next_status,
+                    entry.path.display(),
+                    e
+                );
             }
-            _ => {
-                // Ignore other keys during confirmation
+
+            if let Err(e) = audit.record(
+                &user,
+                AuditAction::Approve,
+                Some(entry.path.as_path()),
+                details,
+                root_id,
+            ) {
+                tracing::warn!("Failed to record audit entry for approval toggle: {}", e);
             }
         }
+
+        // Clear interaction state and refresh.
+        app.exit_visual_mode();
+        app.clear_selection();
+        app.refresh_stats(ctx);
+
+        app.status_message = Some(match (approved_count, unapproved_count) {
+            (a, 0) => format!("Approved {a} entr{}", if a == 1 { "y" } else { "ies" }),
+            (0, u) => format!("Unapproved {u} entr{}", if u == 1 { "y" } else { "ies" }),
+            (a, u) => format!(
+                "Updated approval for {} entries ({} approved, {} unapproved)",
+                a + u,
+                a,
+                u
+            ),
+        });
+        app.status_message_time = Some(std::time::Instant::now());
     }
 
     /// Unignore an entry (reset status from "ignored" back to "tracked").
@@ -2537,7 +2534,7 @@ mod tests {
     }
 
     #[test]
-    fn x_key_initiates_file_approval() {
+    fn x_key_approves_file_immediately() {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
@@ -2555,48 +2552,7 @@ mod tests {
         // Press 'x' key
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
 
-        // Should set pending_file_approval
-        assert!(
-            app.pending_entry_approval.is_some(),
-            "pending_file_approval should be set"
-        );
-        let entries = app
-            .pending_entry_approval
-            .as_ref()
-            .expect("Expected pending approval");
-        assert_eq!(entries.len(), 1, "Should have one entry pending approval");
-        assert_eq!(entries[0].id, file_ids[0]);
-        assert_eq!(entries[0].path, PathBuf::from("/test/dir/file1.txt"));
-    }
-
-    #[test]
-    fn file_approval_confirmation_y_approves_file() {
-        let (db, _dir) = temp_database();
-        let mut app = App::new();
-        let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
-
-        // Set up database with files
-        let (dir_id, file_ids) = setup_with_files(&db);
-        app.current_root_id = Some(dir_id);
-
-        // Manually set pending approval
-        app.pending_entry_approval = Some(vec![PendingEntry {
-            id: file_ids[0],
-            path: PathBuf::from("/test/dir/file1.txt"),
-            is_dir: false,
-        }]);
-
-        // Press 'y' to confirm
-        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('y')));
-
-        // Should clear pending approval
-        assert!(
-            app.pending_entry_approval.is_none(),
-            "pending_file_approval should be cleared"
-        );
-
-        // Entry should be marked as approved
+        // Entry should be marked as approved without modal confirmation
         let entries = db
             .list_entries_by_parent(Path::new("/test/dir"))
             .expect("Failed to list entries");
@@ -2608,6 +2564,37 @@ mod tests {
             entry.status, "approved",
             "Entry status should be 'approved'"
         );
+    }
+
+    #[test]
+    fn x_key_toggles_approved_entry_back_to_tracked() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        // Set up database with files
+        let (dir_id, file_ids) = setup_with_files(&db);
+        app.current_root_id = Some(dir_id);
+
+        app.current_path = PathBuf::from("/test/dir");
+        app.focus_panel = FocusPanel::MainPanel;
+        app.entry_selected_index = 0;
+
+        // First press approves
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
+        // Second press unapproves
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
+
+        // Entry should be marked as tracked
+        let entries = db
+            .list_entries_by_parent(Path::new("/test/dir"))
+            .expect("Failed to list entries");
+        let entry = entries
+            .iter()
+            .find(|e| e.id == file_ids[0])
+            .expect("Entry should exist");
+        assert_eq!(entry.status, "tracked", "Entry status should be 'tracked'");
     }
 
     // ===== Search Tests =====
