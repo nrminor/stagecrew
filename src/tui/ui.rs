@@ -20,7 +20,9 @@ use crate::scanner::calculate_expiration;
 
 use super::TuiContext;
 
-use super::{App, FocusPanel, PendingQuotaTarget, QuotaTargetFocus, SortMode, View};
+use super::{
+    App, FocusPanel, PendingAuditExport, PendingQuotaTarget, QuotaTargetFocus, SortMode, View,
+};
 
 /// Semantic color palette for consistent styling across the TUI.
 /// Using RGB values ensures colors look the same regardless of terminal theme,
@@ -219,6 +221,11 @@ pub(crate) fn render(app: &mut App, ctx: &TuiContext, frame: &mut Frame) {
     // Render quota target input modal if pending
     if let Some(target) = app.pending_quota_target() {
         render_quota_target_modal(frame, target);
+    }
+
+    // Render audit export modal if pending
+    if let Some(export) = app.pending_audit_export() {
+        render_audit_export_modal(frame, export);
     }
 }
 
@@ -1989,7 +1996,7 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
         .block(
             Block::default()
                 .title(format!(
-                    "AUDIT LOG (Most Recent First | {} entries)",
+                    "AUDIT LOG (Most Recent First | {} entries | E export)",
                     entries.len()
                 ))
                 .borders(Borders::ALL),
@@ -2143,6 +2150,7 @@ Sorting:
   s           Cycle sort mode (Due → Size → Name → Modified)
 
 Other:
+  E           Export audit log (from Audit Log view)
   R           Refresh tracked paths (rescan filesystem)
   q           Quit application (or return from audit log)
   Ctrl+C      Quit application";
@@ -2355,7 +2363,12 @@ fn context_hints(app: &App) -> (Vec<Hint>, Vec<Hint>) {
                 }
             }
         }
-        View::AuditLog => vec![("j/k", "Navigate"), ("Esc", "Back"), ("g/G", "Top/Bottom")],
+        View::AuditLog => vec![
+            ("j/k", "Navigate"),
+            ("g/G", "Top/Bottom"),
+            ("E", "Export"),
+            ("Esc", "Back"),
+        ],
         View::Help => {
             // Help view is simple enough to not need pinned right hints
             return (vec![("Any key", "Close")], vec![]);
@@ -2423,13 +2436,16 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         || app.pending_entry_ignore().is_some()
         || app.pending_entry_approval().is_some()
         || app.pending_add_path().is_some()
-        || app.pending_remove_path().is_some();
+        || app.pending_remove_path().is_some()
+        || app.pending_audit_export().is_some();
 
     if modal_open {
         let hints = if app.pending_entry_deferral().is_some() {
             "[0-9] Enter days [Backspace] Delete [Enter] Confirm [Esc] Cancel"
         } else if app.pending_add_path().is_some() {
             "[Type path] (supports ~) [Backspace] Delete [Enter] Add [Esc] Cancel"
+        } else if app.pending_audit_export().is_some() {
+            "[Type path] [Tab] Format [Backspace] Delete [Enter] Export [Esc] Cancel"
         } else {
             "[y] Yes [n] No [Esc] Cancel"
         };
@@ -2785,6 +2801,47 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
             Line::from(""),
             Line::from(vec![Span::styled(
                 "[y] confirm   [n] cancel",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+        ],
+    );
+}
+
+/// Render audit export modal.
+fn render_audit_export_modal(frame: &mut Frame, export: &PendingAuditExport) {
+    let inner = render_modal_shell(frame, "Export Audit Log", palette::CYAN, 86, 12);
+    let display_input = if export.path_input.is_empty() {
+        "_".to_string()
+    } else {
+        export.path_input.clone()
+    };
+
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from(vec![Span::styled(
+                "Output path",
+                Style::default().fg(palette::MODAL_MUTED),
+            )]),
+            Line::from(display_input),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Format: ", Style::default().fg(palette::MODAL_MUTED)),
+                Span::styled(
+                    export.format.label(),
+                    Style::default()
+                        .fg(palette::CYAN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  (Tab to switch)",
+                    Style::default().fg(palette::MODAL_MUTED),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[Enter] export   [Esc] cancel",
                 Style::default().fg(palette::MODAL_MUTED),
             )]),
         ],

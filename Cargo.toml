@@ -25,12 +25,14 @@ unwrap_used = "deny"
 clap = { version = "4.5.56", features = ["derive"] }
 color-eyre = "0.6.5"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
+csv = "1.4.0"
 futures = "0.3"
 jiff = "0.2.18"
 jwalk = "0.8.1"
 ratatui = "0.29.0"
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 shellexpand = "3.1.1"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }

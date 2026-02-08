@@ -5,8 +5,10 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::ui::sort_entry_rows;
-use super::{App, FocusPanel, PendingDeletion, PendingEntry, SortMode, TuiContext, View};
-use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditService};
+use super::{
+    App, FocusPanel, PendingAuditExport, PendingDeletion, PendingEntry, SortMode, TuiContext, View,
+};
+use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditExportFormat, AuditService};
 use crate::config::Config;
 use crate::db::Database;
 use crate::removal::RemovalMethod;
@@ -48,7 +50,7 @@ impl InputHandler {
     pub fn handle(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match app.view {
             View::FileList => Self::handle_file_list(app, ctx, key),
-            View::AuditLog => Self::handle_audit_log(app, key),
+            View::AuditLog => Self::handle_audit_log(app, ctx, key),
             View::Help => Self::handle_help(app, key),
         }
     }
@@ -403,13 +405,24 @@ impl InputHandler {
         }
     }
 
-    fn handle_audit_log(app: &mut App, key: KeyEvent) {
+    fn handle_audit_log(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
+        if app.pending_audit_export.is_some() {
+            Self::handle_audit_export_input(app, ctx, key);
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q' | 'h' | '1') | KeyCode::Esc => {
                 app.view = View::FileList;
             }
             KeyCode::Char('3' | '?') => {
                 app.view = View::Help;
+            }
+            KeyCode::Char('E') => {
+                app.pending_audit_export = Some(PendingAuditExport {
+                    path_input: String::new(),
+                    format: AuditExportFormat::Jsonl,
+                });
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 app.sidebar_selected_index = app.sidebar_selected_index.saturating_add(1);
@@ -426,6 +439,56 @@ impl InputHandler {
             KeyCode::Char('G') => {
                 app.select_last_sidebar(app.sidebar_len); // Go to bottom
                 app.ensure_cursor_visible = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_audit_export_input(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
+        let Some(export) = app.pending_audit_export.as_mut() else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                app.pending_audit_export = None;
+            }
+            KeyCode::Tab => {
+                export.format = export.format.next();
+            }
+            KeyCode::Backspace => {
+                export.path_input.pop();
+            }
+            KeyCode::Enter => {
+                if export.path_input.trim().is_empty() {
+                    app.status_message = Some("Export path cannot be empty".to_string());
+                    app.status_message_time = Some(std::time::Instant::now());
+                    return;
+                }
+
+                let expanded = shellexpand::tilde(export.path_input.trim()).to_string();
+                let export_path = PathBuf::from(expanded);
+                let audit = AuditService::new(ctx.db);
+
+                match audit.export_recent_to_path(1000, export.format, &export_path) {
+                    Ok(count) => {
+                        app.status_message = Some(format!(
+                            "Exported {count} audit entr{} to {} ({})",
+                            if count == 1 { "y" } else { "ies" },
+                            export_path.display(),
+                            export.format.label()
+                        ));
+                        app.status_message_time = Some(std::time::Instant::now());
+                        app.pending_audit_export = None;
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("Audit export failed: {e}"));
+                        app.status_message_time = Some(std::time::Instant::now());
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                export.path_input.push(c);
             }
             _ => {}
         }
@@ -2037,6 +2100,41 @@ mod tests {
         app.view = View::AuditLog;
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('?')));
         assert_eq!(app.view, View::Help);
+    }
+
+    #[test]
+    fn audit_log_view_e_opens_export_modal() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        app.view = View::AuditLog;
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('E')));
+        assert!(app.pending_audit_export.is_some());
+    }
+
+    #[test]
+    fn audit_export_modal_tab_cycles_format() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        app.view = View::AuditLog;
+        app.pending_audit_export = Some(PendingAuditExport {
+            path_input: String::new(),
+            format: AuditExportFormat::Jsonl,
+        });
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Tab));
+        assert_eq!(
+            app.pending_audit_export
+                .as_ref()
+                .expect("modal should remain open")
+                .format,
+            AuditExportFormat::Csv
+        );
     }
 
     // ===== Quit Tests =====

@@ -1,8 +1,10 @@
 //! Audit trail logging and queries.
 
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use rusqlite::params;
+use serde::Serialize;
 
 use crate::db::Database;
 use crate::error::Result;
@@ -49,6 +51,32 @@ pub enum AuditActorSource {
     Tui,
     Daemon,
     Scanner,
+}
+
+/// Output formats supported when exporting audit logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditExportFormat {
+    Jsonl,
+    Csv,
+}
+
+impl AuditExportFormat {
+    /// Toggle to the next export format in the cycle.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Jsonl => Self::Csv,
+            Self::Csv => Self::Jsonl,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Jsonl => "JSONL",
+            Self::Csv => "CSV",
+        }
+    }
 }
 
 impl AuditActorSource {
@@ -256,6 +284,86 @@ impl<'a> AuditService<'a> {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(entries)
+    }
+
+    /// Export recent audit entries to a file.
+    ///
+    /// Entries are written in timestamp-descending order, matching the audit view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the audit query fails or if writing to disk fails.
+    pub fn export_recent_to_path(
+        &self,
+        limit: usize,
+        format: AuditExportFormat,
+        path: &Path,
+    ) -> Result<usize> {
+        let entries = self.list_recent(limit)?;
+
+        match format {
+            AuditExportFormat::Jsonl => {
+                let file = std::fs::File::create(path)?;
+                let mut writer = BufWriter::new(file);
+                for entry in &entries {
+                    write_jsonl_entry(&mut writer, entry)?;
+                }
+                writer.flush()?;
+            }
+            AuditExportFormat::Csv => {
+                let file = std::fs::File::create(path)?;
+                let mut writer = csv::Writer::from_writer(BufWriter::new(file));
+                for entry in &entries {
+                    write_csv_entry(&mut writer, entry)?;
+                }
+                writer.flush().map_err(|e| {
+                    crate::error::Error::Config(format!("failed to flush CSV export: {e}"))
+                })?;
+            }
+        }
+        Ok(entries.len())
+    }
+}
+
+fn write_jsonl_entry(writer: &mut impl Write, entry: &AuditEntry) -> Result<()> {
+    serde_json::to_writer(&mut *writer, &AuditExportRow::from(entry))
+        .map_err(|e| crate::error::Error::Config(format!("failed to serialize JSONL row: {e}")))?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn write_csv_entry(
+    writer: &mut csv::Writer<BufWriter<std::fs::File>>,
+    entry: &AuditEntry,
+) -> Result<()> {
+    writer
+        .serialize(AuditExportRow::from(entry))
+        .map_err(|e| crate::error::Error::Config(format!("failed to serialize CSV row: {e}")))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct AuditExportRow<'a> {
+    id: i64,
+    timestamp: i64,
+    user: &'a str,
+    action: &'a str,
+    target_path: Option<&'a str>,
+    details: Option<&'a str>,
+    entry_id: Option<i64>,
+}
+
+impl<'a> From<&'a AuditEntry> for AuditExportRow<'a> {
+    fn from(entry: &'a AuditEntry) -> Self {
+        Self {
+            id: entry.id,
+            timestamp: entry.timestamp,
+            user: entry.user.as_str(),
+            action: entry.action.as_str(),
+            target_path: entry.target_path.as_deref(),
+            details: entry.details.as_deref(),
+            entry_id: entry.entry_id,
+        }
     }
 }
 

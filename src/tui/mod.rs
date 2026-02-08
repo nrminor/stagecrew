@@ -20,6 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::widgets::{ScrollbarState, TableState};
 
+use crate::audit::AuditExportFormat;
 use crate::config::{AppConfig, AppPaths};
 use crate::db::Database;
 use crate::error::Result;
@@ -236,6 +237,15 @@ pub(crate) struct PendingQuotaTarget {
     pub current_target: Option<i64>,
 }
 
+/// State for an in-progress audit log export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingAuditExport {
+    /// Output path input buffer.
+    pub path_input: String,
+    /// Selected output format.
+    pub format: AuditExportFormat,
+}
+
 /// Main TUI application state.
 // Allow: The bools represent independent flags (quit, sidebar visibility, scan state,
 // search input) that don't naturally form a state machine. Each has distinct semantics.
@@ -332,6 +342,9 @@ pub struct App {
     /// Pending quota target edit state.
     /// Contains the input state for setting a root's byte quota target.
     pub(crate) pending_quota_target: Option<PendingQuotaTarget>,
+
+    /// Pending audit export modal state.
+    pub(crate) pending_audit_export: Option<PendingAuditExport>,
 
     /// Whether the sidebar is visible.
     pub(crate) sidebar_visible: bool,
@@ -454,6 +467,11 @@ impl App {
     /// Get the pending quota target edit state.
     pub fn pending_quota_target(&self) -> Option<&PendingQuotaTarget> {
         self.pending_quota_target.as_ref()
+    }
+
+    /// Get the pending audit export state.
+    pub fn pending_audit_export(&self) -> Option<&PendingAuditExport> {
+        self.pending_audit_export.as_ref()
     }
 
     /// Check if the sidebar is visible.
@@ -745,6 +763,7 @@ impl App {
             pending_add_path: None,
             pending_remove_path: None,
             pending_quota_target: None,
+            pending_audit_export: None,
             sidebar_visible: true,
             scan_requested: false,
             scan_in_progress: false,
@@ -1191,6 +1210,10 @@ mod tests {
         assert_eq!(
             app.pending_remove_path, None,
             "App should start with no pending remove path"
+        );
+        assert_eq!(
+            app.pending_audit_export, None,
+            "App should start with no pending audit export"
         );
         assert_eq!(
             app.search_query, None,
