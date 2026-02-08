@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::audit::{AuditAction, AuditService};
+use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditService};
 use crate::db::Database;
 use crate::error::{Error, Result};
 
@@ -141,7 +141,7 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
     for entry in approved_entries {
         let path = entry.path.clone();
 
-        tracing::info!(path = ?entry.path, is_dir = entry.is_dir, "Processing approved entry for removal");
+        tracing::debug!(path = ?entry.path, is_dir = entry.is_dir, "Processing approved entry for removal");
 
         // Daemon uses permanent delete for approved entries
         match remove(&path, RemovalMethod::PermanentDelete) {
@@ -154,13 +154,19 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
                 tracing::info!(path = ?entry.path, bytes = entry.size_bytes, "Entry removed successfully");
 
                 // Record audit entry
-                audit.record(
-                    &user,
-                    AuditAction::Remove,
-                    Some(entry.path.as_path()),
-                    Some(&format!("Permanently deleted {} bytes", entry.size_bytes)),
-                    Some(entry.id),
-                )?;
+                let details = format!("Permanently deleted {} bytes", entry.size_bytes);
+                audit.record_event(&AuditEvent {
+                    user: &user,
+                    actor_source: AuditActorSource::Daemon,
+                    action: AuditAction::Remove,
+                    target_path: Some(entry.path.as_path()),
+                    details: Some(&details),
+                    entry_id: Some(entry.id),
+                    root_id: Some(entry.root_id),
+                    status_before: Some("approved"),
+                    status_after: Some("removed"),
+                    outcome: Some("removed"),
+                })?;
             }
             Ok(RemovalOutcome::Trashed) => {
                 // This shouldn't happen (we use PermanentDelete)
@@ -174,13 +180,18 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
                 tracing::warn!(path = ?entry.path, "Removal blocked: permission denied");
 
                 // Record audit entry with error details
-                audit.record(
-                    &user,
-                    AuditAction::Remove,
-                    Some(entry.path.as_path()),
-                    Some("Blocked: permission denied"),
-                    Some(entry.id),
-                )?;
+                audit.record_event(&AuditEvent {
+                    user: &user,
+                    actor_source: AuditActorSource::Daemon,
+                    action: AuditAction::Remove,
+                    target_path: Some(entry.path.as_path()),
+                    details: Some("Blocked: permission denied"),
+                    entry_id: Some(entry.id),
+                    root_id: Some(entry.root_id),
+                    status_before: Some("approved"),
+                    status_after: Some("blocked"),
+                    outcome: Some("blocked"),
+                })?;
             }
             Err(e) => {
                 // Other error: Update status to blocked
@@ -190,13 +201,19 @@ pub fn remove_approved(db: &Database) -> Result<RemovalSummary> {
                 tracing::warn!(path = ?entry.path, error = %e, "Removal blocked: filesystem error");
 
                 // Record audit entry with error details
-                audit.record(
-                    &user,
-                    AuditAction::Remove,
-                    Some(entry.path.as_path()),
-                    Some(&format!("Blocked: {e}")),
-                    Some(entry.id),
-                )?;
+                let details = format!("Blocked: {e}");
+                audit.record_event(&AuditEvent {
+                    user: &user,
+                    actor_source: AuditActorSource::Daemon,
+                    action: AuditAction::Remove,
+                    target_path: Some(entry.path.as_path()),
+                    details: Some(&details),
+                    entry_id: Some(entry.id),
+                    root_id: Some(entry.root_id),
+                    status_before: Some("approved"),
+                    status_after: Some("blocked"),
+                    outcome: Some("blocked"),
+                })?;
             }
         }
     }

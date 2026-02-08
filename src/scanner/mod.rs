@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use jwalk::WalkDir;
 
-use crate::audit::{AuditAction, AuditService};
+use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditService};
 use crate::config::{AppConfig, Config};
 use crate::db::{Database, Root};
 use crate::error::{Error, Result};
@@ -180,6 +180,14 @@ pub fn transition_expired_paths(
     let user = AuditService::current_user();
 
     for (id, path, new_status, is_deferral_reset) in transitions {
+        tracing::trace!(
+            entry_id = id,
+            path = ?path,
+            new_status = %new_status,
+            is_deferral_reset,
+            "Applying scanner transition"
+        );
+
         // Update status
         if is_deferral_reset {
             // Clear deferred_until when resetting to tracked
@@ -191,21 +199,13 @@ pub fn transition_expired_paths(
             db.update_entry_status(id, &new_status)?;
         }
 
-        // Record audit entry
-        let action_desc = if is_deferral_reset {
-            "Deferral period ended, reset to tracked"
-        } else if new_status == "approved" {
-            "Expired and auto-approved for removal"
-        } else {
-            "Expired, pending approval for removal"
-        };
-
-        audit.record(
+        record_transition_audit(
+            &audit,
             &user,
-            AuditAction::Scan,
-            Some(path.as_path()),
-            Some(action_desc),
-            Some(id),
+            id,
+            path.as_path(),
+            &new_status,
+            is_deferral_reset,
         )?;
     }
 
@@ -433,18 +433,13 @@ pub async fn scan_and_persist(
     // Record scan in audit log
     let audit = AuditService::new(db);
     let user = AuditService::current_user();
-    audit.record(
+    record_scan_summary_audit(
+        &audit,
         &user,
-        AuditAction::Scan,
-        None, // System-wide scan, no specific target path
-        Some(&format!(
-            "Scanned {} paths: {} directories, {} files, {} bytes",
-            roots.len(),
-            total_directories,
-            total_files,
-            total_size_bytes
-        )),
-        None,
+        roots.len(),
+        total_directories,
+        total_files,
+        total_size_bytes,
     )?;
 
     tracing::info!(
@@ -458,6 +453,69 @@ pub async fn scan_and_persist(
         total_directories,
         total_files,
         total_size_bytes,
+    })
+}
+
+fn record_transition_audit(
+    audit: &AuditService<'_>,
+    user: &str,
+    entry_id: i64,
+    path: &Path,
+    new_status: &str,
+    is_deferral_reset: bool,
+) -> Result<()> {
+    let details = if is_deferral_reset {
+        "Deferral period ended, reset to tracked"
+    } else if new_status == "approved" {
+        "Expired and auto-approved for removal"
+    } else {
+        "Expired, pending approval for removal"
+    };
+
+    audit.record_event(&AuditEvent {
+        user,
+        actor_source: AuditActorSource::Scanner,
+        action: AuditAction::Scan,
+        target_path: Some(path),
+        details: Some(details),
+        entry_id: Some(entry_id),
+        root_id: None,
+        status_before: Some(if is_deferral_reset {
+            "deferred"
+        } else {
+            "tracked"
+        }),
+        status_after: Some(new_status),
+        outcome: Some(if is_deferral_reset {
+            "deferred_reset"
+        } else {
+            new_status
+        }),
+    })
+}
+
+fn record_scan_summary_audit(
+    audit: &AuditService<'_>,
+    user: &str,
+    root_count: usize,
+    total_directories: u64,
+    total_files: u64,
+    total_size_bytes: u64,
+) -> Result<()> {
+    let details = format!(
+        "Scanned {root_count} paths: {total_directories} directories, {total_files} files, {total_size_bytes} bytes"
+    );
+    audit.record_event(&AuditEvent {
+        user,
+        actor_source: AuditActorSource::Scanner,
+        action: AuditAction::Scan,
+        target_path: None,
+        details: Some(&details),
+        entry_id: None,
+        root_id: None,
+        status_before: None,
+        status_after: None,
+        outcome: Some("completed"),
     })
 }
 

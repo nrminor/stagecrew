@@ -72,6 +72,10 @@ impl Daemon {
         loop {
             // Reload configs to pick up any changes to local stagecrew.toml files
             let db_roots: Vec<_> = db.list_roots()?.into_iter().map(|r| r.path).collect();
+            tracing::debug!(
+                root_count = db_roots.len(),
+                "Reloading per-root configuration"
+            );
             let app_config = match AppConfig::load(&self.paths, &db_roots) {
                 Ok(c) => c,
                 Err(e) => {
@@ -149,6 +153,13 @@ impl Daemon {
     async fn run_cycle(app_config: &AppConfig, db: &Database, scanner: &Scanner) {
         // Step 1: Refresh (scan + transition expired files using per-root configs)
         tracing::info!("Starting refresh cycle");
+        tracing::debug!(
+            tracked_path_count = app_config.global.tracked_paths.len(),
+            auto_remove = app_config.global.auto_remove,
+            expiration_days = app_config.global.expiration_days,
+            warning_days = app_config.global.warning_days,
+            "Daemon cycle config snapshot"
+        );
         match refresh(db, scanner, app_config).await {
             Ok(summary) => {
                 tracing::info!(
@@ -168,6 +179,12 @@ impl Daemon {
                         "State transitions completed"
                     );
                 }
+                tracing::debug!(
+                    expired_to_pending = summary.transitions.expired_to_pending,
+                    expired_to_approved = summary.transitions.expired_to_approved,
+                    deferred_reset = summary.transitions.deferred_reset,
+                    "Transition summary (debug detail)"
+                );
             }
             Err(e) => {
                 tracing::warn!(error = ?e, "Refresh failed, continuing to removal step");

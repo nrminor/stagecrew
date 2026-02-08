@@ -30,7 +30,7 @@ pub enum AuditAction {
 }
 
 impl AuditAction {
-    fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Approve => "approve",
             Self::Defer => "defer",
@@ -41,6 +41,39 @@ impl AuditAction {
             Self::ConfigChange => "config_change",
         }
     }
+}
+
+/// Source subsystem that emitted an audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditActorSource {
+    Tui,
+    Daemon,
+    Scanner,
+}
+
+impl AuditActorSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Daemon => "daemon",
+            Self::Scanner => "scanner",
+        }
+    }
+}
+
+/// Canonical event envelope for audit writes and mirrored disk logs.
+#[derive(Debug)]
+pub struct AuditEvent<'a> {
+    pub user: &'a str,
+    pub actor_source: AuditActorSource,
+    pub action: AuditAction,
+    pub target_path: Option<&'a Path>,
+    pub details: Option<&'a str>,
+    pub entry_id: Option<i64>,
+    pub root_id: Option<i64>,
+    pub status_before: Option<&'a str>,
+    pub status_after: Option<&'a str>,
+    pub outcome: Option<&'a str>,
 }
 
 /// Service for recording and querying audit events.
@@ -83,6 +116,60 @@ impl<'a> AuditService<'a> {
                 entry_id
             ],
         )?;
+        Ok(())
+    }
+
+    /// Record an audit event and mirror it to structured tracing output.
+    ///
+    /// This preserves `SQLite` as the durable source of truth while ensuring
+    /// every audit action is also replicated to the on-disk application log
+    /// with a consistent, machine-parsable field set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying audit database insert fails.
+    pub fn record_event(&self, event: &AuditEvent<'_>) -> Result<()> {
+        self.record(
+            event.user,
+            event.action,
+            event.target_path,
+            event.details,
+            event.entry_id,
+        )?;
+
+        let target_path = event.target_path.map(|p| p.display().to_string());
+        if matches!(event.outcome, Some("blocked" | "failed")) {
+            tracing::warn!(
+                target: "stagecrew::audit",
+                audit_action = event.action.as_str(),
+                audit_user = event.user,
+                audit_actor_source = event.actor_source.as_str(),
+                audit_target_path = target_path.as_deref(),
+                audit_entry_id = event.entry_id,
+                audit_root_id = event.root_id,
+                audit_status_before = event.status_before,
+                audit_status_after = event.status_after,
+                audit_outcome = event.outcome,
+                audit_details = event.details,
+                "audit_event"
+            );
+        } else {
+            tracing::info!(
+                target: "stagecrew::audit",
+                audit_action = event.action.as_str(),
+                audit_user = event.user,
+                audit_actor_source = event.actor_source.as_str(),
+                audit_target_path = target_path.as_deref(),
+                audit_entry_id = event.entry_id,
+                audit_root_id = event.root_id,
+                audit_status_before = event.status_before,
+                audit_status_after = event.status_after,
+                audit_outcome = event.outcome,
+                audit_details = event.details,
+                "audit_event"
+            );
+        }
+
         Ok(())
     }
 

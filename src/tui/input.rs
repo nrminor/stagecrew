@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::ui::sort_entry_rows;
 use super::{App, FocusPanel, PendingDeletion, PendingEntry, SortMode, TuiContext, View};
-use crate::audit::{AuditAction, AuditService};
+use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditService};
 use crate::config::Config;
 use crate::db::Database;
 use crate::removal::RemovalMethod;
@@ -617,13 +617,18 @@ impl InputHandler {
                                     }
                                 }
                             };
-                            if let Err(e) = audit.record(
-                                &user,
-                                AuditAction::Remove,
-                                Some(entry.path.as_path()),
-                                Some(detail),
+                            if let Err(e) = audit.record_event(&AuditEvent {
+                                user: &user,
+                                actor_source: AuditActorSource::Tui,
+                                action: AuditAction::Remove,
+                                target_path: Some(entry.path.as_path()),
+                                details: Some(detail),
+                                entry_id: Some(entry.id),
                                 root_id,
-                            ) {
+                                status_before: Some("tracked"),
+                                status_after: Some("removed"),
+                                outcome: Some("removed"),
+                            }) {
                                 tracing::warn!("Failed to record audit entry for deletion: {}", e);
                             }
                         }
@@ -791,13 +796,18 @@ impl InputHandler {
                                     e
                                 );
                             }
-                            if let Err(e) = audit.record(
-                                &user,
-                                AuditAction::Defer,
-                                Some(entry.path.as_path()),
-                                details.as_deref(),
+                            if let Err(e) = audit.record_event(&AuditEvent {
+                                user: &user,
+                                actor_source: AuditActorSource::Tui,
+                                action: AuditAction::Defer,
+                                target_path: Some(entry.path.as_path()),
+                                details: details.as_deref(),
+                                entry_id: Some(entry.id),
                                 root_id,
-                            ) {
+                                status_before: Some("tracked"),
+                                status_after: Some("deferred"),
+                                outcome: Some("deferred"),
+                            }) {
                                 tracing::warn!("Failed to record audit entry for deferral: {}", e);
                             }
                         }
@@ -915,13 +925,18 @@ impl InputHandler {
                                     e
                                 );
                             }
-                            if let Err(e) = audit.record(
-                                &user,
-                                AuditAction::Ignore,
-                                Some(entry.path.as_path()),
-                                None,
+                            if let Err(e) = audit.record_event(&AuditEvent {
+                                user: &user,
+                                actor_source: AuditActorSource::Tui,
+                                action: AuditAction::Ignore,
+                                target_path: Some(entry.path.as_path()),
+                                details: None,
+                                entry_id: Some(entry.id),
                                 root_id,
-                            ) {
+                                status_before: Some("tracked"),
+                                status_after: Some("ignored"),
+                                outcome: Some("ignored"),
+                            }) {
                                 tracing::warn!("Failed to record audit entry for ignore: {}", e);
                             }
                         }
@@ -962,39 +977,10 @@ impl InputHandler {
         };
 
         // Determine which entries to toggle
-        let entries_to_toggle: Vec<(super::PendingEntry, String)> =
-            if app.selected_entries.is_empty() {
-                // No selection - use currently focused entry
-                if let Some((entry, _)) = entry_rows.get(app.entry_selected_index) {
-                    vec![(
-                        super::PendingEntry {
-                            id: entry.id,
-                            path: entry.path.clone(),
-                            is_dir: entry.is_dir,
-                        },
-                        entry.status.clone(),
-                    )]
-                } else {
-                    tracing::warn!("No entry selected (index out of bounds)");
-                    return;
-                }
-            } else {
-                // Use selected entries (selection is by ID, so sorting doesn't matter here)
-                entry_rows
-                    .into_iter()
-                    .filter(|(e, _)| app.selected_entries.contains(&e.id))
-                    .map(|(e, _)| {
-                        (
-                            super::PendingEntry {
-                                id: e.id,
-                                path: e.path.clone(),
-                                is_dir: e.is_dir,
-                            },
-                            e.status,
-                        )
-                    })
-                    .collect()
-            };
+        let Some(entries_to_toggle) = Self::entries_for_approval_toggle(app, entry_rows) else {
+            tracing::warn!("No entry selected (index out of bounds)");
+            return;
+        };
 
         if entries_to_toggle.is_empty() {
             tracing::warn!("No entries to toggle approval");
@@ -1040,13 +1026,22 @@ impl InputHandler {
                 );
             }
 
-            if let Err(e) = audit.record(
-                &user,
-                AuditAction::Approve,
-                Some(entry.path.as_path()),
+            if let Err(e) = audit.record_event(&AuditEvent {
+                user: &user,
+                actor_source: AuditActorSource::Tui,
+                action: AuditAction::Approve,
+                target_path: Some(entry.path.as_path()),
                 details,
+                entry_id: Some(entry.id),
                 root_id,
-            ) {
+                status_before: Some(current_status.as_str()),
+                status_after: Some(next_status),
+                outcome: Some(if next_status == "approved" {
+                    "approved"
+                } else {
+                    "unapproved"
+                }),
+            }) {
                 tracing::warn!("Failed to record audit entry for approval toggle: {}", e);
             }
         }
@@ -1067,6 +1062,43 @@ impl InputHandler {
             ),
         });
         app.status_message_time = Some(std::time::Instant::now());
+    }
+
+    fn entries_for_approval_toggle(
+        app: &App,
+        entry_rows: Vec<(crate::db::Entry, i64)>,
+    ) -> Option<Vec<(super::PendingEntry, String)>> {
+        if app.selected_entries.is_empty() {
+            // No selection - use currently focused entry
+            entry_rows.get(app.entry_selected_index).map(|(entry, _)| {
+                vec![(
+                    super::PendingEntry {
+                        id: entry.id,
+                        path: entry.path.clone(),
+                        is_dir: entry.is_dir,
+                    },
+                    entry.status.clone(),
+                )]
+            })
+        } else {
+            // Use selected entries (selection is by ID, so sorting doesn't matter here)
+            Some(
+                entry_rows
+                    .into_iter()
+                    .filter(|(e, _)| app.selected_entries.contains(&e.id))
+                    .map(|(e, _)| {
+                        (
+                            super::PendingEntry {
+                                id: e.id,
+                                path: e.path.clone(),
+                                is_dir: e.is_dir,
+                            },
+                            e.status,
+                        )
+                    })
+                    .collect(),
+            )
+        }
     }
 
     /// Unignore an entry (reset status from "ignored" back to "tracked").
@@ -1165,13 +1197,18 @@ impl InputHandler {
                         e
                     );
                 }
-                if let Err(e) = audit.record(
-                    &user,
-                    AuditAction::Unignore,
-                    Some(entry.path.as_path()),
-                    None,
+                if let Err(e) = audit.record_event(&AuditEvent {
+                    user: &user,
+                    actor_source: AuditActorSource::Tui,
+                    action: AuditAction::Unignore,
+                    target_path: Some(entry.path.as_path()),
+                    details: None,
+                    entry_id: Some(entry.id),
                     root_id,
-                ) {
+                    status_before: Some("ignored"),
+                    status_after: Some("tracked"),
+                    outcome: Some("unignored"),
+                }) {
                     tracing::warn!("Failed to record audit entry for unignore: {}", e);
                 }
             }
