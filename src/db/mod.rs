@@ -541,6 +541,50 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// List all entries for a specific root with a given status.
+    ///
+    /// This is the root-scoped counterpart of [`list_entries`](Self::list_entries)
+    /// with a mandatory status filter. Used by the dry run preflight check to
+    /// query only approved entries for a single root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_entries_by_root_and_status(
+        &self,
+        root_id: i64,
+        status: &str,
+    ) -> Result<Vec<Entry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
+                    tracked_since, countdown_start, status, deferred_until, created_at, updated_at
+             FROM entries
+             WHERE root_id = ?1 AND status = ?2
+             ORDER BY path",
+        )?;
+
+        let rows = stmt.query_map((root_id, status), |row| {
+            Ok(Entry {
+                id: row.get(0)?,
+                root_id: row.get(1)?,
+                path: PathBuf::from(row.get::<_, String>(2)?),
+                parent_path: PathBuf::from(row.get::<_, String>(3)?),
+                is_dir: row.get(4)?,
+                size_bytes: row.get(5)?,
+                mtime: row.get(6)?,
+                tracked_since: row.get(7)?,
+                countdown_start: row.get(8)?,
+                status: row.get(9)?,
+                deferred_until: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// List all entries, optionally filtered by status.
     ///
     /// # Arguments
@@ -1884,5 +1928,101 @@ mod tests {
             after.total_files, 1,
             "reader should see writer's committed data"
         );
+    }
+
+    #[test]
+    fn list_entries_by_root_and_status_filters_correctly() {
+        let (_temp, db) = temp_database();
+        let now = jiff::Timestamp::now().as_second();
+
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
+        let other_root_id = db
+            .insert_root(Path::new("/other"))
+            .expect("insert other root");
+
+        // Create entries under /data with various statuses
+        let id1 = db
+            .upsert_entry(
+                root_id,
+                Path::new("/data/approved1.txt"),
+                Path::new("/data"),
+                false,
+                100,
+                Some(now),
+            )
+            .expect("upsert entry");
+        let id2 = db
+            .upsert_entry(
+                root_id,
+                Path::new("/data/approved2.txt"),
+                Path::new("/data"),
+                false,
+                200,
+                Some(now),
+            )
+            .expect("upsert entry");
+        let id3 = db
+            .upsert_entry(
+                root_id,
+                Path::new("/data/tracked.txt"),
+                Path::new("/data"),
+                false,
+                300,
+                Some(now),
+            )
+            .expect("upsert entry");
+
+        // Create an approved entry under a different root
+        let id4 = db
+            .upsert_entry(
+                other_root_id,
+                Path::new("/other/approved.txt"),
+                Path::new("/other"),
+                false,
+                400,
+                Some(now),
+            )
+            .expect("upsert entry");
+
+        db.update_entry_status(id1, "approved")
+            .expect("update status");
+        db.update_entry_status(id2, "approved")
+            .expect("update status");
+        // id3 stays as "tracked"
+        let _ = id3;
+        db.update_entry_status(id4, "approved")
+            .expect("update status");
+
+        // Query approved entries for root_id only
+        let approved = db
+            .list_entries_by_root_and_status(root_id, "approved")
+            .expect("query should succeed");
+        assert_eq!(
+            approved.len(),
+            2,
+            "Should return only approved entries for the specified root"
+        );
+        assert!(approved.iter().all(|e| e.status == "approved"));
+        assert!(approved.iter().all(|e| e.root_id == root_id));
+
+        // Query tracked entries for root_id
+        let tracked = db
+            .list_entries_by_root_and_status(root_id, "tracked")
+            .expect("query should succeed");
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].path, Path::new("/data/tracked.txt"));
+
+        // Query approved entries for other_root_id
+        let other_approved = db
+            .list_entries_by_root_and_status(other_root_id, "approved")
+            .expect("query should succeed");
+        assert_eq!(other_approved.len(), 1);
+        assert_eq!(other_approved[0].path, Path::new("/other/approved.txt"));
+
+        // Query with no matching entries
+        let empty = db
+            .list_entries_by_root_and_status(root_id, "ignored")
+            .expect("query should succeed");
+        assert!(empty.is_empty(), "No ignored entries should exist");
     }
 }

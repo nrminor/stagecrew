@@ -15,7 +15,7 @@ use ratatui::widgets::{
 use crate::audit::AuditService;
 use crate::config::Config;
 use crate::db::Database;
-use crate::removal::RemovalMethod;
+use crate::removal::{DryRunResult, RemovalMethod};
 use crate::scanner::calculate_expiration;
 
 use super::TuiContext;
@@ -226,6 +226,11 @@ pub(crate) fn render(app: &mut App, ctx: &TuiContext, frame: &mut Frame) {
     // Render audit export modal if pending
     if let Some(export) = app.pending_audit_export() {
         render_audit_export_modal(frame, export);
+    }
+
+    // Render dry run results modal if pending
+    if let Some(result) = app.pending_dry_run() {
+        render_dry_run_modal(frame, result);
     }
 }
 
@@ -2152,6 +2157,7 @@ Sorting:
 Other:
   E           Export audit log (from Audit Log view)
   R           Refresh tracked paths (rescan filesystem)
+  Y           Dry run: check if approved entries can be removed
   q           Quit application (or return from audit log)
   Ctrl+C      Quit application";
 
@@ -2355,6 +2361,7 @@ fn context_hints(app: &App) -> (Vec<Hint>, Vec<Hint>) {
                         ("r", "Defer"),
                         ("i", "Ignore"),
                         ("x", "Approve"),
+                        ("Y", "Dry run"),
                         ("Space", "Select"),
                         ("v", "Visual"),
                         ("s", "Sort"),
@@ -2437,10 +2444,13 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         || app.pending_entry_approval().is_some()
         || app.pending_add_path().is_some()
         || app.pending_remove_path().is_some()
-        || app.pending_audit_export().is_some();
+        || app.pending_audit_export().is_some()
+        || app.pending_dry_run().is_some();
 
     if modal_open {
-        let hints = if app.pending_entry_deferral().is_some() {
+        let hints = if app.pending_dry_run().is_some() {
+            "[Any key] Close"
+        } else if app.pending_entry_deferral().is_some() {
             "[0-9] Enter days [Backspace] Delete [Enter] Confirm [Esc] Cancel"
         } else if app.pending_add_path().is_some() {
             "[Type path] (supports ~) [Backspace] Delete [Enter] Add [Esc] Cancel"
@@ -2943,6 +2953,57 @@ fn render_quota_target_modal(frame: &mut Frame, target: &PendingQuotaTarget) {
     ];
 
     render_modal_body(frame, inner, content);
+}
+
+/// Render the dry run results modal showing which approved entries would fail removal.
+fn render_dry_run_modal(frame: &mut Frame, result: &DryRunResult) {
+    let title = format!(
+        "Dry Run: {} of {} removable",
+        result.removable_count, result.total_count
+    );
+
+    let failure_count = result.failures.len();
+    let modal_height = u16::try_from(failure_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(6)
+        .min(24);
+
+    let inner = render_modal_shell(frame, &title, palette::YELLOW, 78, modal_height);
+
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            format!(
+                "{} entr{} would fail removal:",
+                failure_count,
+                if failure_count == 1 { "y" } else { "ies" }
+            ),
+            Style::default().fg(palette::RED),
+        )]),
+        Line::from(""),
+    ];
+
+    for failure in &result.failures {
+        let path_display = failure.path.to_string_lossy();
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                path_display.into_owned(),
+                Style::default().fg(palette::MODAL_FG),
+            ),
+        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("    {}", failure.reason),
+            Style::default().fg(palette::MODAL_MUTED),
+        )]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "[Any key] close",
+        Style::default().fg(palette::MODAL_MUTED),
+    )]));
+
+    render_modal_body(frame, inner, lines);
 }
 
 #[cfg(test)]

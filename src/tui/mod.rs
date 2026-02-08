@@ -24,7 +24,7 @@ use crate::audit::AuditExportFormat;
 use crate::config::{AppConfig, AppPaths};
 use crate::db::Database;
 use crate::error::Result;
-use crate::removal::RemovalMethod;
+use crate::removal::{DryRunResult, RemovalMethod};
 use crate::scanner::{Scanner, refresh};
 
 use input::InputHandler;
@@ -346,6 +346,9 @@ pub struct App {
     /// Pending audit export modal state.
     pub(crate) pending_audit_export: Option<PendingAuditExport>,
 
+    /// Dry run preflight check result for display in a modal.
+    pub(crate) pending_dry_run: Option<DryRunResult>,
+
     /// Whether the sidebar is visible.
     pub(crate) sidebar_visible: bool,
 
@@ -472,6 +475,11 @@ impl App {
     /// Get the pending audit export state.
     pub fn pending_audit_export(&self) -> Option<&PendingAuditExport> {
         self.pending_audit_export.as_ref()
+    }
+
+    /// Get the dry run result for modal display.
+    pub fn pending_dry_run(&self) -> Option<&DryRunResult> {
+        self.pending_dry_run.as_ref()
     }
 
     /// Check if the sidebar is visible.
@@ -764,6 +772,7 @@ impl App {
             pending_remove_path: None,
             pending_quota_target: None,
             pending_audit_export: None,
+            pending_dry_run: None,
             sidebar_visible: true,
             scan_requested: false,
             scan_in_progress: false,
@@ -1214,6 +1223,10 @@ mod tests {
         assert_eq!(
             app.pending_audit_export, None,
             "App should start with no pending audit export"
+        );
+        assert!(
+            app.pending_dry_run.is_none(),
+            "App should start with no pending dry run"
         );
         assert_eq!(
             app.search_query, None,

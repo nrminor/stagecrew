@@ -11,7 +11,7 @@ use super::{
 use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditExportFormat, AuditService};
 use crate::config::Config;
 use crate::db::Database;
-use crate::removal::RemovalMethod;
+use crate::removal::{RemovalMethod, dry_run_approved};
 use crate::scanner::calculate_expiration;
 
 /// Handles keyboard input with vim-style bindings.
@@ -92,6 +92,11 @@ impl InputHandler {
         }
         if app.pending_quota_target.is_some() {
             Self::handle_quota_target_input(app, db, key);
+            return;
+        }
+        if app.pending_dry_run.is_some() {
+            // Any key dismisses the dry run results modal.
+            app.pending_dry_run = None;
             return;
         }
 
@@ -275,6 +280,11 @@ impl InputHandler {
                 if !app.scan_in_progress {
                     app.scan_requested = true;
                 }
+            }
+
+            // Dry run preflight check on approved entries for the current root
+            KeyCode::Char('Y') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::run_dry_run(app, db);
             }
 
             // Enter a root from the sidebar
@@ -1166,6 +1176,39 @@ impl InputHandler {
                     })
                     .collect(),
             )
+        }
+    }
+
+    /// Run a dry run preflight check on all approved entries for the current root.
+    ///
+    /// If all approved entries are removable (or there are none), shows a status
+    /// message. If any would fail, opens the dry run results modal.
+    fn run_dry_run(app: &mut App, db: &Database) {
+        let Some(root_id) = app.current_root_id else {
+            app.status_message = Some("No root selected".to_string());
+            app.status_message_time = Some(std::time::Instant::now());
+            return;
+        };
+
+        match dry_run_approved(db, root_id) {
+            Ok(result) => {
+                if result.total_count == 0 {
+                    app.status_message = Some("No approved entries for this root".to_string());
+                    app.status_message_time = Some(std::time::Instant::now());
+                } else if result.failures.is_empty() {
+                    app.status_message = Some(format!(
+                        "Dry run: {} of {} approved entries removable",
+                        result.removable_count, result.total_count
+                    ));
+                    app.status_message_time = Some(std::time::Instant::now());
+                } else {
+                    app.pending_dry_run = Some(result);
+                }
+            }
+            Err(e) => {
+                app.status_message = Some(format!("Dry run failed: {e}"));
+                app.status_message_time = Some(std::time::Instant::now());
+            }
         }
     }
 
@@ -3534,6 +3577,111 @@ mod tests {
         for id in &ids {
             assert!(app.selected_entries.contains(id));
         }
+    }
+
+    // ===== Dry Run Tests =====
+
+    #[test]
+    fn y_key_shows_status_message_when_no_approved_entries() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        let (root_id, _file_ids) = setup_with_files(&db);
+
+        app.current_root_id = Some(root_id);
+        app.current_path = PathBuf::from("/test/dir");
+        app.focus_panel = FocusPanel::MainPanel;
+
+        // No entries are approved, so Y should show a status message
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('Y')));
+
+        assert!(
+            app.pending_dry_run.is_none(),
+            "No modal should open when there are no approved entries"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("No approved entries for this root")
+        );
+    }
+
+    #[test]
+    fn y_key_opens_modal_when_approved_entries_fail_check() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        let (root_id, file_ids) = setup_with_files(&db);
+
+        // Approve an entry (path /test/dir/file1.txt doesn't exist on disk)
+        db.update_entry_status(file_ids[0], "approved")
+            .expect("Failed to approve entry");
+
+        app.current_root_id = Some(root_id);
+        app.current_path = PathBuf::from("/test/dir");
+        app.focus_panel = FocusPanel::MainPanel;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('Y')));
+
+        assert!(
+            app.pending_dry_run.is_some(),
+            "Modal should open when approved entries fail removability check"
+        );
+        let result = app
+            .pending_dry_run
+            .as_ref()
+            .expect("dry run result should be set");
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.removable_count, 0);
+        assert_eq!(result.failures.len(), 1);
+    }
+
+    #[test]
+    fn y_key_ignored_in_sidebar() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        app.focus_panel = FocusPanel::Sidebar;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('Y')));
+
+        assert!(
+            app.pending_dry_run.is_none(),
+            "Y should not trigger dry run from sidebar"
+        );
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn dry_run_modal_dismissed_by_any_key() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        // Manually set pending_dry_run to simulate an open modal
+        app.pending_dry_run = Some(crate::removal::DryRunResult {
+            removable_count: 0,
+            total_count: 1,
+            failures: vec![crate::removal::DryRunFailure {
+                path: PathBuf::from("/gone"),
+                reason: "not found".to_string(),
+            }],
+        });
+        app.focus_panel = FocusPanel::MainPanel;
+
+        // Any key should dismiss it
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Esc));
+
+        assert!(
+            app.pending_dry_run.is_none(),
+            "Modal should be dismissed after keypress"
+        );
     }
 
     #[test]

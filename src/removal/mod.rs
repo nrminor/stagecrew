@@ -1,6 +1,6 @@
 //! File removal logic and approval workflow.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditService};
 use crate::db::Database;
@@ -36,7 +36,26 @@ impl RemovalMethod {
     }
 }
 
+/// Check whether a path could be removed without actually removing it.
+///
+/// This is a best-effort preflight check that verifies the path exists on
+/// disk. Permission errors and other filesystem failures are left to the
+/// actual removal call, which already handles them gracefully.
+///
+/// # Errors
+///
+/// Returns [`Error::PathNotFound`] if the path does not exist.
+pub fn check_removability(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Err(Error::PathNotFound(path.to_path_buf()));
+    }
+
+    Ok(())
+}
+
 /// Attempt to remove a path using the specified method.
+///
+/// Runs a preflight removability check before attempting the actual removal.
 ///
 /// # Errors
 ///
@@ -45,9 +64,7 @@ impl RemovalMethod {
 /// - Path doesn't exist
 /// - Other filesystem errors occur
 pub fn remove(path: &Path, method: RemovalMethod) -> Result<RemovalOutcome> {
-    if !path.exists() {
-        return Err(Error::PathNotFound(path.to_path_buf()));
-    }
+    check_removability(path)?;
 
     match method {
         RemovalMethod::Trash => trash(path),
@@ -105,6 +122,63 @@ pub enum RemovalOutcome {
     Trashed,
     /// File was permanently deleted.
     Deleted,
+}
+
+/// A single entry that failed the dry run removability check.
+#[derive(Debug, Clone)]
+pub struct DryRunFailure {
+    /// Absolute path of the entry that would fail removal.
+    pub path: PathBuf,
+    /// Human-readable reason the entry cannot be removed.
+    pub reason: String,
+}
+
+/// Summary of a dry run preflight check for approved entries in a single root.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct DryRunResult {
+    /// Number of approved entries that passed the removability check.
+    pub removable_count: usize,
+    /// Total number of approved entries checked.
+    pub total_count: usize,
+    /// Entries that would fail removal, with reasons.
+    pub failures: Vec<DryRunFailure>,
+}
+
+/// Run a preflight removability check on all approved entries for a single root.
+///
+/// Iterates over every entry with status "approved" under the given root,
+/// calling [`check_removability`] on each. Collects successes and failures
+/// into a [`DryRunResult`] without modifying the filesystem or database.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails. Individual removability
+/// check failures are collected in the result (not propagated).
+pub fn dry_run_approved(db: &Database, root_id: i64) -> Result<DryRunResult> {
+    let approved = db.list_entries_by_root_and_status(root_id, "approved")?;
+
+    let total_count = approved.len();
+    let mut removable_count = 0;
+    let mut failures = Vec::new();
+
+    for entry in &approved {
+        match check_removability(&entry.path) {
+            Ok(()) => removable_count += 1,
+            Err(e) => {
+                failures.push(DryRunFailure {
+                    path: entry.path.clone(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(DryRunResult {
+        removable_count,
+        total_count,
+        failures,
+    })
 }
 
 /// Process all approved entries for removal.
@@ -720,6 +794,193 @@ mod tests {
         assert_eq!(
             entries[0].target_path,
             Some(dir_path.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn check_removability_succeeds_for_existing_file() {
+        let temp_dir = TempDir::with_prefix("stagecrew-removability-test-").expect(
+            "failed to create temp directory for removability test - check disk space and permissions",
+        );
+        let file_path = temp_dir.path().join("exists.txt");
+        fs::write(&file_path, "test content")
+            .expect("failed to write test file - disk may be full");
+
+        assert!(
+            check_removability(&file_path).is_ok(),
+            "Existing file should pass removability check"
+        );
+    }
+
+    #[test]
+    fn check_removability_succeeds_for_existing_directory() {
+        let temp_dir = TempDir::with_prefix("stagecrew-removability-test-").expect(
+            "failed to create temp directory for removability test - check disk space and permissions",
+        );
+        let dir_path = temp_dir.path().join("subdir");
+        fs::create_dir(&dir_path)
+            .expect("failed to create test directory - check disk space and permissions");
+
+        assert!(
+            check_removability(&dir_path).is_ok(),
+            "Existing directory should pass removability check"
+        );
+    }
+
+    #[test]
+    fn check_removability_fails_for_nonexistent_path() {
+        let result = check_removability(Path::new("/nonexistent/path/to/file.txt"));
+        assert!(result.is_err(), "Nonexistent path should fail");
+        assert!(
+            matches!(result, Err(Error::PathNotFound(_))),
+            "Error should be PathNotFound"
+        );
+    }
+
+    #[test]
+    fn dry_run_approved_with_no_approved_entries() {
+        let (db, _temp_dir) = temp_database();
+        let root_id = db
+            .insert_root(Path::new("/data"))
+            .expect("failed to insert root - database connection may be lost");
+        let now = jiff::Timestamp::now().as_second();
+        let entry_id = db
+            .upsert_entry(
+                root_id,
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
+                false,
+                1024,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+        db.update_entry_status(entry_id, "tracked")
+            .expect("failed to update entry status - database connection may be lost");
+
+        let result = dry_run_approved(&db, root_id)
+            .expect("dry run should succeed even with no approved entries");
+        assert_eq!(result.total_count, 0);
+        assert_eq!(result.removable_count, 0);
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn dry_run_approved_all_entries_exist() {
+        let (db, _temp_dir) = temp_database();
+        let test_root = TempDir::with_prefix("stagecrew-dryrun-test-").expect(
+            "failed to create temp directory for dry run test - check disk space and permissions",
+        );
+
+        let (dir1_path, dir1_size) = create_test_directory(test_root.path(), "dir1", 2);
+        let (dir2_path, dir2_size) = create_test_directory(test_root.path(), "dir2", 2);
+
+        let root_id = db
+            .insert_root(test_root.path())
+            .expect("failed to insert root - database connection may be lost");
+        let now = jiff::Timestamp::now().as_second();
+        let id1 = db
+            .upsert_entry(
+                root_id,
+                &dir1_path,
+                test_root.path(),
+                true,
+                dir1_size,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+        let id2 = db
+            .upsert_entry(
+                root_id,
+                &dir2_path,
+                test_root.path(),
+                true,
+                dir2_size,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+        db.update_entry_status(id1, "approved")
+            .expect("failed to update entry status - database connection may be lost");
+        db.update_entry_status(id2, "approved")
+            .expect("failed to update entry status - database connection may be lost");
+
+        let result = dry_run_approved(&db, root_id)
+            .expect("dry run should succeed when entries exist on disk");
+        assert_eq!(result.total_count, 2);
+        assert_eq!(result.removable_count, 2);
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn dry_run_approved_mixed_existing_and_nonexistent() {
+        let (db, _temp_dir) = temp_database();
+        let test_root = TempDir::with_prefix("stagecrew-dryrun-test-").expect(
+            "failed to create temp directory for dry run test - check disk space and permissions",
+        );
+
+        let (dir_path, dir_size) = create_test_directory(test_root.path(), "exists", 2);
+        let missing_path = test_root.path().join("gone");
+
+        let root_id = db
+            .insert_root(test_root.path())
+            .expect("failed to insert root - database connection may be lost");
+        let now = jiff::Timestamp::now().as_second();
+        let id1 = db
+            .upsert_entry(
+                root_id,
+                &dir_path,
+                test_root.path(),
+                true,
+                dir_size,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+        let id2 = db
+            .upsert_entry(root_id, &missing_path, test_root.path(), true, 0, Some(now))
+            .expect("failed to insert test entry - database connection may be lost");
+        db.update_entry_status(id1, "approved")
+            .expect("failed to update entry status - database connection may be lost");
+        db.update_entry_status(id2, "approved")
+            .expect("failed to update entry status - database connection may be lost");
+
+        let result =
+            dry_run_approved(&db, root_id).expect("dry run should succeed even with mixed results");
+        assert_eq!(result.total_count, 2);
+        assert_eq!(result.removable_count, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].path, missing_path);
+    }
+
+    #[test]
+    fn dry_run_approved_ignores_non_approved_entries() {
+        let (db, _temp_dir) = temp_database();
+        let test_root = TempDir::with_prefix("stagecrew-dryrun-test-").expect(
+            "failed to create temp directory for dry run test - check disk space and permissions",
+        );
+
+        let (dir_path, dir_size) = create_test_directory(test_root.path(), "dir", 2);
+
+        let root_id = db
+            .insert_root(test_root.path())
+            .expect("failed to insert root - database connection may be lost");
+        let now = jiff::Timestamp::now().as_second();
+        let id1 = db
+            .upsert_entry(
+                root_id,
+                &dir_path,
+                test_root.path(),
+                true,
+                dir_size,
+                Some(now),
+            )
+            .expect("failed to insert test entry - database connection may be lost");
+        // Leave as "tracked" — should not appear in dry run
+        let _ = id1;
+
+        let result = dry_run_approved(&db, root_id)
+            .expect("dry run should succeed with no approved entries");
+        assert_eq!(
+            result.total_count, 0,
+            "Tracked entries should not be checked"
         );
     }
 }
