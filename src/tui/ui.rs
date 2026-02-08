@@ -63,9 +63,9 @@ impl FadeGradient {
     /// Create a new gradient set for row fading.
     /// All gradients fade toward a muted gray endpoint.
     fn new() -> Self {
-        // Endpoint for all fades - a medium gray for subtle dimming effect
-        // Higher values = less contrast = subtler fade
-        let fade_end = (100, 100, 100);
+        // Endpoint for all fades.
+        // Keep this relatively bright so distance fading stays subtle.
+        let fade_end = (130, 130, 130);
 
         // RGB values must match palette constants
         let green_rgb = (0, 166, 0);
@@ -1864,6 +1864,10 @@ fn format_bytes(bytes: u64) -> String {
 ///
 /// Displays recent audit entries showing timestamp, user, action, and path.
 /// The view is scrollable and shows the most recent entries first.
+// Allow: This view coordinates data loading, row styling, scroll state, and
+// scrollbar rendering in one place for readability, similar to the main table
+// renderer pattern.
+#[allow(clippy::too_many_lines)]
 fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Fetch recent audit entries (limit to 1000 for now)
     let audit = AuditService::new(db);
@@ -1895,24 +1899,75 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
         return;
     }
 
-    // Build table rows
+    // Build table rows with distance-based fade similar to the main panel.
+    let gradient = fade_gradient();
+    let max_dist = entries.len().saturating_sub(1).max(1);
     let rows: Vec<Row> = entries
         .iter()
         .enumerate()
         .map(|(idx, entry)| {
+            let is_selected = idx == selected_idx;
+            let distance = idx.abs_diff(selected_idx);
+            let fade_pct = ((distance * 100) / max_dist).min(100);
+            let should_fade = !is_selected;
+
             // Format timestamp as human-readable in local timezone
             let timestamp_str = format_timestamp(entry.timestamp);
-            let timestamp_cell = Cell::from(timestamp_str);
+            let timestamp_cell = if is_selected {
+                Cell::from(timestamp_str)
+            } else {
+                let color = if should_fade {
+                    gradient.text[fade_pct]
+                } else {
+                    Color::DarkGray
+                };
+                Cell::from(timestamp_str).style(Style::default().fg(color))
+            };
 
-            let user_cell = Cell::from(entry.user.as_str());
-            let action_cell = Cell::from(entry.action.as_str());
+            let user_cell = if is_selected {
+                Cell::from(entry.user.as_str())
+            } else {
+                let color = if should_fade {
+                    gradient.text[fade_pct]
+                } else {
+                    Color::Gray
+                };
+                Cell::from(entry.user.as_str()).style(Style::default().fg(color))
+            };
+
+            let action_style = if is_selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                let base = match entry.action.as_str() {
+                    "remove" => &gradient.red,
+                    "defer" => &gradient.green,
+                    "ignore" => &gradient.yellow,
+                    // Approval workflow actions remain neutral in color; state is visible in the row text.
+                    "approve" | "unignore" => &gradient.text,
+                    _ => &gradient.gray,
+                };
+                let color = if should_fade { base[fade_pct] } else { base[0] };
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            };
+            let action_cell = Cell::from(entry.action.as_str()).style(action_style);
 
             let path_str = entry.target_path.as_deref().unwrap_or("<system-wide>");
-            let path_cell = Cell::from(path_str);
+            let path_cell = if is_selected {
+                Cell::from(path_str)
+            } else {
+                let color = if should_fade {
+                    gradient.text[fade_pct]
+                } else {
+                    Color::Gray
+                };
+                Cell::from(path_str).style(Style::default().fg(color))
+            };
 
             // Highlight selected row
-            let style = if idx == selected_idx {
-                Style::default().add_modifier(Modifier::REVERSED)
+            let style = if is_selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -1932,7 +1987,10 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
     let table = Table::new(rows, widths)
         .block(
             Block::default()
-                .title("AUDIT LOG (Most Recent First)")
+                .title(format!(
+                    "AUDIT LOG (Most Recent First | {} entries)",
+                    entries.len()
+                ))
                 .borders(Borders::ALL),
         )
         .header(
@@ -2127,9 +2185,8 @@ fn help_legend_lines() -> Vec<Line<'static>> {
 
 fn render_help(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let block = Block::default()
-        .title("Stagecrew - Keybinding Reference")
+        .title("KEYBIND REFERENCE")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette::CYAN))
         .style(Style::default());
 
     let left_lines = styled_help_lines(HELP_LEFT_TEXT);
