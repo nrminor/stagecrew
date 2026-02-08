@@ -9,11 +9,12 @@ use clap::{
 };
 use std::path::PathBuf;
 
-pub const INFO: &str = "
+pub const INFO: &str = "\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ┏━┓╺┳╸┏━┓┏━╸┏━╸┏━╸┏━┓┏━╸╻ ╻
 ┗━┓ ┃ ┣━┫┃╺┓┣╸ ┃  ┣┳┛┣╸ ┃╻┃
 ┗━┛ ╹ ╹ ╹┗━┛┗━╸┗━╸╹┗╸┗━╸┗┻┛
-";
+━━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
 // const AFTER_HELP: &str = "\
 // Examples:

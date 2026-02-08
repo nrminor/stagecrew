@@ -5,7 +5,6 @@ use std::sync::OnceLock;
 use ratatui::Frame;
 use ratatui::layout::Margin;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -325,7 +324,7 @@ impl LifecycleView {
     /// Categorizes entries by lifecycle status based on their expiration state:
     /// - Healthy: tracked entries with more than `warning_days` until expiration
     /// - Warning: tracked entries within the warning period
-    /// - Overdue: tracked entries past expiration, or pending/approved entries
+    /// - Overdue: entries past expiration
     ///
     /// Directories and ignored/removed entries are excluded from the tally.
     fn from_entries(entries: &[crate::db::Entry], config: &Config) -> Self {
@@ -341,14 +340,7 @@ impl LifecycleView {
             #[allow(clippy::cast_sign_loss)]
             let size = entry.size_bytes.max(0) as u64;
 
-            // pending/approved entries are always "overdue" (require attention)
-            if entry.status == "pending" || entry.status == "approved" {
-                overdue.files += 1;
-                overdue.bytes += size;
-                continue;
-            }
-
-            // For tracked/deferred, calculate days remaining
+            // Calculate days remaining from the active countdown timestamp.
             let days_remaining = if entry.status == "deferred" {
                 entry.deferred_until.map(|until| {
                     let now = jiff::Timestamp::now().as_second();
@@ -358,6 +350,14 @@ impl LifecycleView {
                 entry
                     .countdown_start
                     .map(|cs| calculate_expiration(cs, config.expiration_days))
+                    .or_else(|| {
+                        if entry.status == "pending" || entry.status == "approved" {
+                            // Defensive fallback for historical rows missing countdown_start.
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    })
             };
 
             match days_remaining {
@@ -558,19 +558,25 @@ fn render_expiration_timeline(
         .iter()
         .filter(|e| !e.is_dir && e.status != "removed" && e.status != "ignored")
     {
-        // Calculate days until expiration
+        // Calculate days until expiration using the effective countdown timestamp.
+        // Approved/pending entries still belong on their true due date in the timeline.
         let days_remaining = if entry.status == "deferred" {
             entry.deferred_until.map(|until| {
                 let now = jiff::Timestamp::now().as_second();
                 (until - now) / 86400
             })
-        } else if entry.status == "pending" || entry.status == "approved" {
-            // Already overdue
-            Some(0)
         } else {
             entry
                 .countdown_start
                 .map(|cs| calculate_expiration(cs, config.expiration_days))
+                .or_else(|| {
+                    if entry.status == "pending" || entry.status == "approved" {
+                        // Defensive fallback when historical records are missing countdown_start.
+                        Some(0)
+                    } else {
+                        None
+                    }
+                })
         };
 
         if let Some(days) = days_remaining {
@@ -848,44 +854,17 @@ fn render_quota_widget(
         return;
     };
 
-    // Categorize entries by lifecycle status: healthy, warning, overdue
+    // Categorize bytes using exactly the same lifecycle logic as the top widget.
+    // This keeps the quota pie and lifecycle bars semantically aligned.
     let (healthy_bytes, warning_bytes, overdue_bytes) = match db.list_entries_by_root(root_id) {
         Ok(entries) => {
-            let mut healthy: i64 = 0;
-            let mut warning: i64 = 0;
-            let mut overdue: i64 = 0;
-
-            for entry in entries
-                .iter()
-                .filter(|e| !e.is_dir && e.status != "removed" && e.status != "ignored")
-            {
-                // pending/approved entries are always "overdue" (require attention)
-                if entry.status == "pending" || entry.status == "approved" {
-                    overdue += entry.size_bytes;
-                    continue;
-                }
-
-                // For tracked/deferred, calculate days remaining
-                let days_remaining = if entry.status == "deferred" {
-                    entry.deferred_until.map(|until| {
-                        let now = jiff::Timestamp::now().as_second();
-                        (until - now) / 86400
-                    })
-                } else {
-                    entry
-                        .countdown_start
-                        .map(|cs| calculate_expiration(cs, config.expiration_days))
-                };
-
-                match days_remaining {
-                    Some(d) if d <= 0 => overdue += entry.size_bytes,
-                    Some(d) if d <= i64::from(config.warning_days) => warning += entry.size_bytes,
-                    // None (no countdown_start) or Some with days > warning_days: assume healthy
-                    _ => healthy += entry.size_bytes,
-                }
-            }
-
-            (healthy, warning, overdue)
+            let view = LifecycleView::from_entries(&entries, config);
+            let clamp_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+            (
+                clamp_i64(view.healthy.bytes),
+                clamp_i64(view.warning.bytes),
+                clamp_i64(view.overdue.bytes),
+            )
         }
         Err(_) => (0, 0, 0),
     };
@@ -963,7 +942,7 @@ fn render_quota_widget(
         height: chart_height,
     };
 
-    // Create pie slices based on lifecycle status
+    // Create pie slices based on lifecycle status and quota headroom.
     let slices = if used_bytes > target_bytes {
         // Over quota: show solid red. We use 99.99% + 0.01% because tui-piechart
         // doesn't render single-slice charts correctly (shows as a thin line).
@@ -1362,14 +1341,24 @@ fn render_main_entry_panel(
             // Cursor row = 0% fade (full brightness), edge rows = up to 100% fade
             let fade_pct = FadeGradient::fade_percent(idx, selected_idx, viewport_height);
 
-            // Visual indicator showing attention status
+            // Countdown indicator + workflow marker (pending/approved)
             let (indicator_symbol, indicator_color) = expiration_indicator_entry(
                 &entry.status,
                 *days_remaining,
                 config.warning_days,
                 entry,
             );
-            let indicator_cell = Cell::from(indicator_symbol).fg(indicator_color);
+            let (workflow_symbol, workflow_color) = workflow_indicator(&entry.status);
+            let indicator_cell = Cell::from(Line::from(vec![
+                Span::styled(
+                    indicator_symbol.to_string(),
+                    Style::default().fg(indicator_color),
+                ),
+                Span::styled(
+                    workflow_symbol.to_string(),
+                    Style::default().fg(workflow_color),
+                ),
+            ]));
 
             // Extract filename from path with directory indicator
             let path_str = entry.path.to_string_lossy();
@@ -1458,17 +1447,16 @@ fn render_main_entry_panel(
                 Cell::from(size_str).style(Style::default().fg(color))
             };
 
-            // Due column is color-coded to match the sidebar stats visual language
-            // Colors encode both urgency (days remaining) and special states
-            // The gradient fades each color toward dark gray
+            // Due column is countdown-driven.
+            // Ignored entries are always gray.
+            // The gradient fades each color toward dark gray.
             let due_color = if uses_reversed {
                 Color::Reset
             } else {
                 let base_gradient = match entry.status.as_str() {
                     "ignored" => &gradient.gray,
-                    "pending" | "approved" => &gradient.red,
                     _ => {
-                        // For tracked/deferred entries, color by urgency
+                        // For tracked/pending/approved/deferred entries, color by urgency.
                         if effective_days <= 0 {
                             &gradient.red // Overdue
                         } else if effective_days <= i64::from(config.warning_days) {
@@ -1515,10 +1503,10 @@ fn render_main_entry_panel(
 
     // Build table
     let widths = [
-        Constraint::Length(2),      // Visual indicator (●/⚠/✓)
-        Constraint::Percentage(55), // Filename
+        Constraint::Length(3),      // Countdown + workflow indicator (e.g. "⚠✓")
+        Constraint::Percentage(54), // Filename
         Constraint::Percentage(15), // Size
-        Constraint::Percentage(27), // Due
+        Constraint::Percentage(28), // Due
     ];
 
     let sort_indicator = match app.sort_mode() {
@@ -1751,6 +1739,17 @@ fn expiration_indicator_entry(
     }
 }
 
+/// Workflow-state marker shown alongside the countdown indicator.
+///
+/// Keeps approval workflow state visible without overloading countdown colors.
+fn workflow_indicator(status: &str) -> (&'static str, Color) {
+    match status {
+        "pending" => ("!", palette::YELLOW),
+        "approved" => ("✓", Color::Reset),
+        _ => (" ", Color::Reset),
+    }
+}
+
 /// Generate header cells for the entry table with sort indicators.
 ///
 /// The currently sorted column gets a triangle indicator:
@@ -1846,7 +1845,7 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
     // Handle empty state
     if entries.is_empty() {
         let empty_text = Paragraph::new("No audit entries found.\n\nPress 'q' or Esc to go back")
-            .block(Block::default().borders(Borders::ALL).title("Audit Log"))
+            .block(Block::default().borders(Borders::ALL).title("AUDIT LOG"))
             .style(Style::default());
         frame.render_widget(empty_text, area);
         return;
@@ -1889,7 +1888,7 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
     let table = Table::new(rows, widths)
         .block(
             Block::default()
-                .title("Audit Log (Most Recent First)")
+                .title("AUDIT LOG (Most Recent First)")
                 .borders(Borders::ALL),
         )
         .header(
@@ -1979,14 +1978,7 @@ fn format_timestamp(timestamp: i64) -> String {
 /// Displays all available keybindings organized by sections: File-Centric Workflow,
 /// Navigation, Selection, Actions, Views, Sorting, and Other. Any key press dismisses
 /// this view and returns to the file list.
-fn render_help(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let block = Block::default()
-        .title("Stagecrew - Keybinding Reference")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette::CYAN))
-        .style(Style::default());
-
-    let help_text = r"File-Centric Workflow:
+const HELP_LEFT_TEXT: &str = r"File-Centric Workflow:
   The main panel shows files from the currently selected directory.
   The left sidebar shows tracked directories for filtering.
   Navigate the sidebar with j/k to change which directory's files are shown.
@@ -2015,9 +2007,9 @@ Actions (on focused file or all selected files):
   i           Permanently ignore file(s)
   x           Approve file(s) for daemon removal
   e           Open in $VISUAL/$EDITOR (suspends TUI)
-  o           Open with system viewer (fire-and-forget)
+  o           Open with system viewer (fire-and-forget)";
 
-Root Management:
+const HELP_RIGHT_TEXT: &str = r"Root Management:
   A           Add a new tracked path
   X           Remove selected root (sidebar only)
   t           Set quota target for current root
@@ -2033,13 +2025,93 @@ Sorting:
 Other:
   R           Refresh tracked paths (rescan filesystem)
   q           Quit application (or return from audit log)
-  Ctrl+C      Quit application
+  Ctrl+C      Quit application";
 
-Press any key to close this help screen";
+fn styled_help_lines(text: &str) -> Vec<Line<'static>> {
+    text.lines()
+        .map(|line| {
+            let is_header = line.ends_with(':') && !line.starts_with("  ");
+            if is_header {
+                Line::from(vec![Span::styled(
+                    line.to_string(),
+                    Style::default()
+                        .fg(palette::CYAN)
+                        .add_modifier(Modifier::BOLD),
+                )])
+            } else {
+                Line::from(line.to_string())
+            }
+        })
+        .collect()
+}
 
-    let text = Paragraph::new(help_text).block(block);
+fn help_legend_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Legend:",
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled("  ■", Style::default().fg(palette::GREEN)),
+            Span::raw(" Healthy (beyond warning window)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ■", Style::default().fg(palette::YELLOW)),
+            Span::raw(" Warning (within warning window)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ■", Style::default().fg(palette::RED)),
+            Span::raw(" Overdue (due now or in the past)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ⚠ / ●", Style::default().fg(palette::YELLOW)),
+            Span::raw(" Countdown glyphs (warning / overdue)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  !", Style::default().fg(palette::YELLOW)),
+            Span::raw(" Pending workflow state"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ✓", Style::default().fg(Color::Reset)),
+            Span::raw(" Approved workflow state"),
+        ]),
+    ]
+}
 
-    frame.render_widget(text, area);
+fn render_help(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let block = Block::default()
+        .title("Stagecrew - Keybinding Reference")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::CYAN))
+        .style(Style::default());
+
+    let left_lines = styled_help_lines(HELP_LEFT_TEXT);
+    let mut right_lines = styled_help_lines(HELP_RIGHT_TEXT);
+    right_lines.extend(help_legend_lines());
+    right_lines.push(Line::from(""));
+    right_lines.push(Line::from("Press any key to close this help screen"));
+
+    frame.render_widget(block, area);
+    let inner = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+        ])
+        .split(area.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        }));
+
+    let left = Paragraph::new(left_lines).wrap(Wrap { trim: true });
+    let right = Paragraph::new(right_lines).wrap(Wrap { trim: true });
+
+    frame.render_widget(left, inner[0]);
+    frame.render_widget(right, inner[2]);
 }
 
 /// Build a `Line` of hint spans that fits within `max_width`.
@@ -3047,5 +3119,27 @@ mod tests {
         let (symbol, color) = expiration_indicator_entry("deferred", -100, 14, &entry);
         assert_eq!(symbol, "⚠", "Deferred expiring soon should show warning");
         assert_eq!(color, palette::YELLOW);
+    }
+
+    #[test]
+    fn workflow_indicator_pending_and_approved_have_markers() {
+        let (pending_symbol, pending_color) = workflow_indicator("pending");
+        assert_eq!(pending_symbol, "!");
+        assert_eq!(pending_color, palette::YELLOW);
+
+        let (approved_symbol, approved_color) = workflow_indicator("approved");
+        assert_eq!(approved_symbol, "✓");
+        assert_eq!(approved_color, Color::Reset);
+    }
+
+    #[test]
+    fn workflow_indicator_other_states_are_blank() {
+        let (tracked_symbol, tracked_color) = workflow_indicator("tracked");
+        assert_eq!(tracked_symbol, " ");
+        assert_eq!(tracked_color, Color::Reset);
+
+        let (deferred_symbol, deferred_color) = workflow_indicator("deferred");
+        assert_eq!(deferred_symbol, " ");
+        assert_eq!(deferred_color, Color::Reset);
     }
 }
