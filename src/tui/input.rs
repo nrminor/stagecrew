@@ -426,6 +426,11 @@ impl InputHandler {
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 app.sidebar_selected_index = app.sidebar_selected_index.saturating_add(1);
+                if app.sidebar_len > 0 {
+                    app.sidebar_selected_index = app
+                        .sidebar_selected_index
+                        .min(app.sidebar_len.saturating_sub(1));
+                }
                 app.ensure_cursor_visible = true;
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -2088,6 +2093,28 @@ mod tests {
         app.view = View::AuditLog;
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('q')));
         assert_eq!(app.view, View::FileList);
+    }
+
+    #[test]
+    fn audit_log_j_clamps_at_bottom_without_accumulating_extra_steps() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        app.view = View::AuditLog;
+        app.sidebar_len = 3;
+        app.sidebar_selected_index = 2;
+
+        // Repeated j at bottom should remain clamped to last index.
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
+        assert_eq!(app.sidebar_selected_index, 2);
+
+        // A single k should move up immediately.
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
+        assert_eq!(app.sidebar_selected_index, 1);
     }
 
     #[test]
