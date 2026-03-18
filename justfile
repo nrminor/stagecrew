@@ -6,6 +6,10 @@
 default:
     @just --list
 
+# choose recipe: interactively select a recipe
+choose:
+    @just --choose
+
 # === Development Workflow ===
 
 # Run all pre-commit checks (required before committing)
