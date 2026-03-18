@@ -152,9 +152,76 @@ impl Database {
         // Enable foreign key constraint enforcement.
         self.conn.pragma_update(None, "foreign_keys", "ON")?;
 
+        // Migrate existing tables before applying the current schema, so that
+        // CREATE TABLE IF NOT EXISTS does not silently skip column additions.
+        self.migrate_audit_log_if_needed()?;
+
         // Run schema creation (idempotent with IF NOT EXISTS).
         self.conn.execute_batch(include_str!("schema.sql"))?;
 
+        Ok(())
+    }
+
+    /// Migrate the `audit_log` table if it uses the old schema (missing new columns).
+    ///
+    /// This detects whether the table exists but lacks the `actor_source` column,
+    /// then rebuilds it in a transaction to add the new fields while preserving
+    /// all existing rows. New columns are filled with NULL for historical data.
+    fn migrate_audit_log_if_needed(&self) -> Result<()> {
+        // Check whether audit_log exists at all. If not, schema.sql will create it.
+        let table_exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='audit_log'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(());
+        }
+
+        // Check whether the new columns already exist.
+        let has_actor_source: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('audit_log') WHERE name='actor_source'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_actor_source {
+            return Ok(());
+        }
+
+        tracing::info!("Migrating audit_log table to expanded schema");
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE audit_log_new (
+                id INTEGER PRIMARY KEY,
+                timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                user TEXT NOT NULL,
+                action TEXT NOT NULL
+                    CHECK (action IN ('approve', 'unapprove', 'defer', 'ignore', 'unignore', 'remove', 'scan', 'config_change')),
+                target_path TEXT,
+                details TEXT,
+                entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL,
+                actor_source TEXT,
+                root_id INTEGER,
+                outcome TEXT,
+                status_before TEXT,
+                status_after TEXT
+            );
+
+            INSERT INTO audit_log_new (id, timestamp, user, action, target_path, details, entry_id)
+                SELECT id, timestamp, user, action, target_path, details, entry_id
+                FROM audit_log;
+
+            DROP TABLE audit_log;
+
+            ALTER TABLE audit_log_new RENAME TO audit_log;
+
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);"
+        )?;
+        tx.commit()?;
+
+        tracing::info!("audit_log migration complete");
         Ok(())
     }
 

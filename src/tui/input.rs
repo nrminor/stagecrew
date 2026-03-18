@@ -1104,10 +1104,15 @@ impl InputHandler {
                 );
             }
 
+            let action = if next_status == "approved" {
+                AuditAction::Approve
+            } else {
+                AuditAction::Unapprove
+            };
             if let Err(e) = audit.record_event(&AuditEvent {
                 user: &user,
                 actor_source: AuditActorSource::Tui,
-                action: AuditAction::Approve,
+                action,
                 target_path: Some(entry.path.as_path()),
                 details,
                 entry_id: Some(entry.id),

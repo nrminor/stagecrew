@@ -38,10 +38,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
     timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     user TEXT NOT NULL,
     action TEXT NOT NULL
-        CHECK (action IN ('approve', 'defer', 'ignore', 'unignore', 'remove', 'scan', 'config_change')),
+        CHECK (action IN ('approve', 'unapprove', 'defer', 'ignore', 'unignore', 'remove', 'scan', 'config_change')),
     target_path TEXT,
     details TEXT,
-    entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL
+    entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL,
+    actor_source TEXT,
+    root_id INTEGER,
+    outcome TEXT,
+    status_before TEXT,
+    status_after TEXT
 );
 
 -- Indexes for common queries

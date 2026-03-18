@@ -13,14 +13,9 @@ use crate::error::Result;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuditAction {
-    // Allow: Will be used for file-level actions in US-030.
-    #[allow(dead_code)]
     Approve,
-    // Allow: Will be used for file-level actions in US-030.
-    #[allow(dead_code)]
+    Unapprove,
     Defer,
-    // Allow: Will be used for file-level actions in US-030.
-    #[allow(dead_code)]
     Ignore,
     Unignore,
     Remove,
@@ -35,6 +30,7 @@ impl AuditAction {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Approve => "approve",
+            Self::Unapprove => "unapprove",
             Self::Defer => "defer",
             Self::Ignore => "ignore",
             Self::Unignore => "unignore",
@@ -124,6 +120,11 @@ impl<'a> AuditService<'a> {
     /// # Errors
     ///
     /// Returns an error if the database insert fails.
+    /// Record a minimal audit event without the extended context fields.
+    ///
+    /// Prefer `record_event` for new code. This method is retained for tests
+    /// and any paths that do not yet have full event context available.
+    #[cfg(test)]
     pub fn record(
         &self,
         user: &str,
@@ -147,22 +148,32 @@ impl<'a> AuditService<'a> {
         Ok(())
     }
 
-    /// Record an audit event and mirror it to structured tracing output.
+    /// Record an audit event with full context and mirror it to structured tracing.
     ///
-    /// This preserves `SQLite` as the durable source of truth while ensuring
-    /// every audit action is also replicated to the on-disk application log
-    /// with a consistent, machine-parsable field set.
+    /// This persists all canonical event fields to the database and emits a
+    /// mirrored structured tracing event so the on-disk application log
+    /// contains the same information.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying audit database insert fails.
     pub fn record_event(&self, event: &AuditEvent<'_>) -> Result<()> {
-        self.record(
-            event.user,
-            event.action,
-            event.target_path,
-            event.details,
-            event.entry_id,
+        let target_path_str = event.target_path.map(|p| p.to_string_lossy());
+        self.db.conn().execute(
+            "INSERT INTO audit_log (user, action, target_path, details, entry_id, actor_source, root_id, outcome, status_before, status_after)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.user,
+                event.action.as_str(),
+                target_path_str.as_deref(),
+                event.details,
+                event.entry_id,
+                event.actor_source.as_str(),
+                event.root_id,
+                event.outcome,
+                event.status_before,
+                event.status_after,
+            ],
         )?;
 
         let target_path = event.target_path.map(|p| p.display().to_string());
@@ -222,7 +233,8 @@ impl<'a> AuditService<'a> {
     /// Returns an error if the database query fails.
     pub fn list_recent(&self, limit: usize) -> Result<Vec<AuditEntry>> {
         let mut stmt = self.db.conn().prepare(
-            "SELECT id, timestamp, user, action, target_path, details, entry_id
+            "SELECT id, timestamp, user, action, target_path, details, entry_id,
+                    actor_source, root_id, outcome, status_before, status_after
              FROM audit_log
              ORDER BY timestamp DESC
              LIMIT ?1",
@@ -241,6 +253,11 @@ impl<'a> AuditService<'a> {
                     target_path: row.get(4)?,
                     details: row.get(5)?,
                     entry_id: row.get(6)?,
+                    actor_source: row.get(7)?,
+                    root_id: row.get(8)?,
+                    outcome: row.get(9)?,
+                    status_before: row.get(10)?,
+                    status_after: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -263,7 +280,8 @@ impl<'a> AuditService<'a> {
     pub fn list_by_path(&self, path: &Path) -> Result<Vec<AuditEntry>> {
         let path_str = path.to_string_lossy();
         let mut stmt = self.db.conn().prepare(
-            "SELECT id, timestamp, user, action, target_path, details, entry_id
+            "SELECT id, timestamp, user, action, target_path, details, entry_id,
+                    actor_source, root_id, outcome, status_before, status_after
              FROM audit_log
              WHERE target_path = ?1
              ORDER BY timestamp DESC",
@@ -279,6 +297,11 @@ impl<'a> AuditService<'a> {
                     target_path: row.get(4)?,
                     details: row.get(5)?,
                     entry_id: row.get(6)?,
+                    actor_source: row.get(7)?,
+                    root_id: row.get(8)?,
+                    outcome: row.get(9)?,
+                    status_before: row.get(10)?,
+                    status_after: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -351,6 +374,11 @@ struct AuditExportRow<'a> {
     target_path: Option<&'a str>,
     details: Option<&'a str>,
     entry_id: Option<i64>,
+    actor_source: Option<&'a str>,
+    root_id: Option<i64>,
+    outcome: Option<&'a str>,
+    status_before: Option<&'a str>,
+    status_after: Option<&'a str>,
 }
 
 impl<'a> From<&'a AuditEntry> for AuditExportRow<'a> {
@@ -363,6 +391,11 @@ impl<'a> From<&'a AuditEntry> for AuditExportRow<'a> {
             target_path: entry.target_path.as_deref(),
             details: entry.details.as_deref(),
             entry_id: entry.entry_id,
+            actor_source: entry.actor_source.as_deref(),
+            root_id: entry.root_id,
+            outcome: entry.outcome.as_deref(),
+            status_before: entry.status_before.as_deref(),
+            status_after: entry.status_after.as_deref(),
         }
     }
 }
@@ -386,6 +419,11 @@ pub struct AuditEntry {
     pub target_path: Option<String>,
     pub details: Option<String>,
     pub entry_id: Option<i64>,
+    pub actor_source: Option<String>,
+    pub root_id: Option<i64>,
+    pub outcome: Option<String>,
+    pub status_before: Option<String>,
+    pub status_after: Option<String>,
 }
 
 #[cfg(test)]
@@ -521,6 +559,7 @@ mod tests {
 
         let actions = [
             (AuditAction::Approve, "approve"),
+            (AuditAction::Unapprove, "unapprove"),
             (AuditAction::Defer, "defer"),
             (AuditAction::Ignore, "ignore"),
             (AuditAction::Remove, "remove"),
@@ -804,6 +843,7 @@ mod tests {
     fn audit_action_as_str_matches_schema_check_constraint() {
         // Verify all action strings match the CHECK constraint in schema.sql
         assert_eq!(AuditAction::Approve.as_str(), "approve");
+        assert_eq!(AuditAction::Unapprove.as_str(), "unapprove");
         assert_eq!(AuditAction::Defer.as_str(), "defer");
         assert_eq!(AuditAction::Ignore.as_str(), "ignore");
         assert_eq!(AuditAction::Unignore.as_str(), "unignore");
@@ -881,7 +921,8 @@ mod tests {
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 4, "should have header + 3 data rows");
         assert_eq!(
-            lines[0], "id,timestamp,user,action,target_path,details,entry_id",
+            lines[0],
+            "id,timestamp,user,action,target_path,details,entry_id,actor_source,root_id,outcome,status_before,status_after",
             "first line should be CSV header"
         );
     }
@@ -1012,7 +1053,7 @@ mod tests {
             })
             .expect("record_event should succeed");
 
-        // Verify DB row
+        // Verify DB row including new columns
         let entries = audit.list_recent(10).expect("should list entries");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].user, "testuser");
@@ -1020,6 +1061,11 @@ mod tests {
         assert_eq!(entries[0].target_path, Some("/data/file.txt".to_string()));
         assert_eq!(entries[0].details, Some("approved for removal".to_string()));
         assert_eq!(entries[0].entry_id, Some(entry_id));
+        assert_eq!(entries[0].actor_source, Some("tui".to_string()));
+        assert_eq!(entries[0].root_id, Some(root_id));
+        assert_eq!(entries[0].outcome, Some("approved".to_string()));
+        assert_eq!(entries[0].status_before, Some("tracked".to_string()));
+        assert_eq!(entries[0].status_after, Some("approved".to_string()));
 
         // Verify structured tracing event was emitted with matching fields.
         // tracing-test captures the formatted output which quotes string values.

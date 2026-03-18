@@ -2009,19 +2009,17 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
             let action_style = if is_selected {
                 Style::default().add_modifier(Modifier::BOLD)
             } else {
-                let action_label = display_audit_action(entry);
-                let base = match action_label {
+                let base = match entry.action.as_str() {
                     "remove" => &gradient.red,
                     "defer" => &gradient.green,
                     "ignore" => &gradient.yellow,
-                    // Approval workflow actions remain neutral in color; state is visible in the row text.
                     "approve" | "unapprove" | "unignore" => &gradient.text,
                     _ => &gradient.gray,
                 };
                 let color = if should_fade { base[fade_pct] } else { base[0] };
                 Style::default().fg(color).add_modifier(Modifier::BOLD)
             };
-            let action_cell = Cell::from(display_audit_action(entry)).style(action_style);
+            let action_cell = Cell::from(entry.action.as_str()).style(action_style);
 
             let path_str = entry.target_path.as_deref().unwrap_or("<system-wide>");
             let path_cell = if is_selected {
@@ -2127,23 +2125,6 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
             }),
             &mut app.audit_scrollbar_state,
         );
-    }
-}
-
-/// Return the display action label for an audit entry.
-///
-/// Schema does not currently include a dedicated `unapprove` action, so we
-/// infer it from an `approve` action carrying unapproval details.
-fn display_audit_action(entry: &crate::audit::AuditEntry) -> &str {
-    if entry.action == "approve"
-        && entry
-            .details
-            .as_deref()
-            .is_some_and(|details| details.starts_with("Unapproved"))
-    {
-        "unapprove"
-    } else {
-        entry.action.as_str()
     }
 }
 

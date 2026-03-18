@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use tempfile::TempDir;
 
-use stagecrew::audit::{AuditAction, AuditService};
+use stagecrew::audit::{AuditAction, AuditActorSource, AuditEvent, AuditService};
 use stagecrew::config::Config;
 use stagecrew::db::Database;
 use stagecrew::removal::remove_approved;
@@ -167,13 +167,18 @@ async fn test_full_workflow() {
         .expect("should update status to approved");
 
     audit
-        .record(
-            &user,
-            AuditAction::Approve,
-            Some(old_file.as_path()),
-            Some("Manual approval for removal"),
-            Some(old_file_entry.id),
-        )
+        .record_event(&AuditEvent {
+            user: &user,
+            actor_source: AuditActorSource::Tui,
+            action: AuditAction::Approve,
+            target_path: Some(old_file.as_path()),
+            details: Some("Manual approval for removal"),
+            entry_id: Some(old_file_entry.id),
+            root_id: None,
+            status_before: Some("tracked"),
+            status_after: Some("approved"),
+            outcome: Some("approved"),
+        })
         .expect("should record approval in audit log");
 
     // Verify status change
