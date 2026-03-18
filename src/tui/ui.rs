@@ -44,10 +44,10 @@ mod palette {
     /// Use terminal-default background so modal surfaces blend with existing pane
     /// backgrounds instead of creating a dark rectangular cutout.
     pub const MODAL_BG: Color = Color::Reset;
-    /// Shared modal primary text color.
-    pub const MODAL_FG: Color = Color::Rgb(230, 235, 245);
+    /// Shared modal primary text color. Uses terminal default for light/dark adaptivity.
+    pub const MODAL_FG: Color = Color::Reset;
     /// Shared modal secondary text color.
-    pub const MODAL_MUTED: Color = Color::Rgb(155, 165, 185);
+    pub const MODAL_MUTED: Color = Color::DarkGray;
 }
 
 /// Pre-computed gradient for row fading effect.
@@ -1081,9 +1081,7 @@ fn render_expiration_timeline(
 
     let summary_paragraph = Paragraph::new(Line::from(Span::styled(
         summary_text,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+        Style::default().add_modifier(Modifier::BOLD),
     )))
     .alignment(Alignment::Center);
     let summary_rows = Layout::default()
@@ -1153,7 +1151,7 @@ fn render_overdue_block(
         Paragraph::new(Line::from(vec![
             Span::styled(bar, Style::default().fg(palette::RED)),
             Span::raw(" "),
-            Span::styled(count_text, Style::default().fg(Color::White)),
+            Span::styled(count_text, Style::default().add_modifier(Modifier::BOLD)),
         ])),
         area,
     );
@@ -1313,11 +1311,11 @@ fn render_quota_widget(
     #[allow(clippy::cast_sign_loss)]
     let target_display = crate::format_bytes(target_bytes.max(0) as u64);
 
-    // Text color: red if over quota, otherwise white
+    // Text color: red if over quota, otherwise terminal default
     let text_color = if used_bytes > target_bytes {
         palette::RED
     } else {
-        Color::White
+        Color::Reset
     };
 
     let text_content = if used_bytes > target_bytes {
@@ -1342,7 +1340,7 @@ fn render_quota_widget(
 
     let text_widget = Paragraph::new(text_content)
         .alignment(ratatui::layout::Alignment::Center)
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(text_color));
     frame.render_widget(text_widget, text_area);
 
     // Constrain chart area to be square (use height as the limiting dimension,
@@ -1894,14 +1892,10 @@ fn render_main_entry_panel(
             // Row-level styling for selection and cursor
             let mut row_style = if is_selected && is_cursor {
                 // Cursor on a selected row: combine both indicators
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else if is_selected {
-                // Selected entries get dark gray background
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                // Selected entries get underline to distinguish from cursor
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else if is_cursor {
                 // Currently focused entry
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -2337,9 +2331,7 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
 
             // Highlight selected row
             let style = if is_selected {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
                 Style::default()
             };
@@ -2600,7 +2592,7 @@ fn render_help(_app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
 /// the left group by flexible padding. Each hint is rendered as `[key] Label`
 /// with a single space between hints.
 fn build_hint_line(left: &[(&str, &str)], right: &[(&str, &str)], max_width: u16) -> Line<'static> {
-    let style = Style::default().fg(Color::Black).bg(Color::Gray);
+    let style = Style::default().add_modifier(Modifier::REVERSED);
     let width = usize::from(max_width);
 
     // Format a single hint as "[key] Label"
@@ -2757,10 +2749,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     } else {
         (
             " NORMAL ",
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
         )
     };
 
@@ -2780,7 +2769,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         let query = app.search_query.as_deref().unwrap_or("");
         let search_bar = Paragraph::new(Line::from(vec![Span::styled(
             format!("/{query}█"),
-            Style::default().fg(Color::White).bg(Color::DarkGray),
+            Style::default().add_modifier(Modifier::REVERSED),
         )]));
         frame.render_widget(search_bar, chunks[1]);
         return;
@@ -2809,7 +2798,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
         } else {
             "[y] Yes [n] No [Esc] Cancel"
         };
-        let footer = Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(Color::Gray));
+        let footer = Paragraph::new(hints).style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_widget(footer, chunks[1]);
         return;
     }
