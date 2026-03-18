@@ -877,6 +877,10 @@ impl App {
         db_path: &std::path::Path,
         _paths: &AppPaths,
     ) -> Result<()> {
+        // Detect terminal theme before taking over the screen, since the
+        // detection uses escape sequences that require normal terminal mode.
+        ui::detect_terminal_theme();
+
         let mut terminal_manager = TerminalManager::setup().map_err(crate::error::Error::Io)?;
         let mut event_stream = EventStream::new();
 

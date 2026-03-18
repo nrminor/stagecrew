@@ -50,6 +50,22 @@ mod palette {
     pub const MODAL_MUTED: Color = Color::DarkGray;
 }
 
+/// Whether the terminal background is light. Detected once before the TUI
+/// takes over the terminal, then used to choose fade direction.
+static LIGHT_THEME: OnceLock<bool> = OnceLock::new();
+
+/// Detect whether the terminal uses a light background.
+/// Must be called before ratatui enters alternate screen mode.
+pub(crate) fn detect_terminal_theme() {
+    let is_light = std::time::Duration::from_millis(100);
+    let light = matches!(termbg::theme(is_light), Ok(termbg::Theme::Light));
+    let _ = LIGHT_THEME.set(light);
+}
+
+fn is_light_theme() -> bool {
+    LIGHT_THEME.get().copied().unwrap_or(false)
+}
+
 /// Pre-computed gradient for row fading effect.
 /// Contains 101 colors (indices 0-100) from full brightness to fully faded.
 /// Index 0 = cursor row (full brightness), index 100 = maximally faded.
@@ -63,11 +79,22 @@ struct FadeGradient {
 
 impl FadeGradient {
     /// Create a new gradient set for row fading.
-    /// All gradients fade toward a muted gray endpoint.
+    /// Fades toward a muted endpoint that recedes on the detected background.
     fn new() -> Self {
-        // Endpoint for all fades.
-        // Keep this relatively bright so distance fading stays subtle.
-        let fade_end = (130, 130, 130);
+        // In dark mode, fade toward a dim gray (less visible against dark bg).
+        // In light mode, fade toward a light gray (less visible against light bg).
+        let fade_end = if is_light_theme() {
+            (200, 200, 200)
+        } else {
+            (130, 130, 130)
+        };
+
+        // Text start color also adapts: dark text on light bg, light text on dark bg.
+        let text_start = if is_light_theme() {
+            (40, 40, 40)
+        } else {
+            (220, 220, 220)
+        };
 
         // RGB values must match palette constants
         let green_rgb = (0, 166, 0);
@@ -75,7 +102,7 @@ impl FadeGradient {
         let red_rgb = (220, 80, 80);
 
         Self {
-            text: Self::generate((220, 220, 220), fade_end),
+            text: Self::generate(text_start, fade_end),
             green: Self::generate(green_rgb, fade_end),
             yellow: Self::generate(yellow_rgb, fade_end),
             red: Self::generate(red_rgb, fade_end),
