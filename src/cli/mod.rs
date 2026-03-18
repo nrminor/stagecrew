@@ -136,4 +136,11 @@ pub enum ConfigCommand {
 
     /// Open the configuration file in $VISUAL or $EDITOR.
     Edit,
+
+    /// Print the JSON Schema for the configuration file.
+    ///
+    /// The schema describes all valid configuration fields and their types.
+    /// Pipe to a file for offline editor integration, or use the versioned
+    /// URL in the generated config's `#:schema` comment for automatic support.
+    Schema,
 }

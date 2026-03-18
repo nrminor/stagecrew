@@ -139,7 +139,7 @@ impl Default for AppPaths {
 ///
 /// Use `Config::default()` or `..Config::default()` to construct, as new fields
 /// may be added in future versions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 #[non_exhaustive]
 pub struct Config {
@@ -232,7 +232,9 @@ impl Config {
     /// Returns an error if the config cannot be serialized or written to disk.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let config_path = paths.config_file()?;
-        let contents = toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;
+        let toml_body = toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;
+
+        let contents = format!("{}\n{toml_body}", schema_comment());
 
         std::fs::write(&config_path, contents).map_err(|e| Error::Filesystem {
             path: config_path,
@@ -241,6 +243,20 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// The GitHub repository where release assets (including the JSON schema) are hosted.
+const GITHUB_REPO: &str = "nrminor/stagecrew";
+
+/// Build the versioned schema URL pointing to the release asset for the current version.
+fn schema_url() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    format!("https://github.com/{GITHUB_REPO}/releases/download/v{version}/stagecrew.schema.json")
+}
+
+/// Build the `#:schema` comment line for generated config files.
+fn schema_comment() -> String {
+    format!("#:schema {}", schema_url())
 }
 
 /// The filename used for per-root local configuration files.

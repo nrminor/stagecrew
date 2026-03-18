@@ -203,6 +203,12 @@ fn handle_config_command(cmd: &ConfigCommand, paths: &AppPaths) -> Result<()> {
                 eprintln!("Editor exited with non-zero status");
             }
         }
+        ConfigCommand::Schema => {
+            let schema = schemars::schema_for!(Config);
+            let json =
+                serde_json::to_string_pretty(&schema).context("Failed to serialize JSON schema")?;
+            println!("{json}");
+        }
     }
     Ok(())
 }

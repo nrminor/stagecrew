@@ -140,6 +140,11 @@ run-status:
 init:
     cargo run -- init
 
+# Generate the JSON schema for release asset attachment
+generate-schema:
+    cargo run -- config schema > stagecrew.schema.json
+    @echo "Generated stagecrew.schema.json"
+
 # Count source lines of code (excluding blanks and comments)
 sloc:
     @tokei --types=Rust --compact
