@@ -385,6 +385,10 @@ pub struct App {
     /// Pending request to open files in an external application.
     /// Set by input handler, consumed by main loop.
     pub(crate) external_open_request: Option<ExternalOpenRequest>,
+
+    /// Cached nearest expiration unix timestamp for the countdown widget.
+    /// Refreshed on scan completion and status changes.
+    pub(crate) nearest_expiration: Option<i64>,
 }
 
 impl App {
@@ -797,6 +801,7 @@ impl App {
             search_input_active: false,
             ensure_cursor_visible: false,
             external_open_request: None,
+            nearest_expiration: None,
         }
     }
 
@@ -819,6 +824,11 @@ impl App {
                 self.cached_stats = stats;
             }
             Err(e) => tracing::warn!("Failed to refresh stats: {e}"),
+        }
+
+        match ctx.db.nearest_expiration(config.expiration_days) {
+            Ok(ts) => self.nearest_expiration = ts,
+            Err(e) => tracing::warn!("Failed to query nearest expiration: {e}"),
         }
     }
 
@@ -1227,6 +1237,10 @@ mod tests {
         assert!(
             app.pending_dry_run.is_none(),
             "App should start with no pending dry run"
+        );
+        assert_eq!(
+            app.nearest_expiration, None,
+            "App should start with no cached expiration"
         );
         assert_eq!(
             app.search_query, None,

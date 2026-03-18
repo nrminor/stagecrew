@@ -709,6 +709,38 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Find the nearest expiration unix timestamp across all active entries.
+    ///
+    /// For tracked entries, expiration is `countdown_start + expiration_days * 86400`.
+    /// For deferred entries, expiration is `deferred_until`.
+    /// Ignored, removed, and blocked entries are excluded.
+    ///
+    /// Returns `None` if no active entries have computable expiration times.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn nearest_expiration(&self, expiration_days: u32) -> Result<Option<i64>> {
+        let expiration_seconds = i64::from(expiration_days) * 86400;
+        let result: Option<i64> = self.conn.query_row(
+            "SELECT MIN(
+                CASE
+                    WHEN status = 'deferred' AND deferred_until IS NOT NULL
+                        THEN deferred_until
+                    WHEN countdown_start IS NOT NULL
+                        THEN countdown_start + ?1
+                    ELSE NULL
+                END
+            )
+            FROM entries
+            WHERE is_dir = 0
+              AND status NOT IN ('ignored', 'removed', 'blocked')",
+            [expiration_seconds],
+            |row| row.get(0),
+        )?;
+        Ok(result)
+    }
+
     /// Update the status of an entry.
     ///
     /// # Errors
@@ -983,9 +1015,10 @@ impl Database {
                        AND ((countdown_start + (?1 * 86400) - ?2) / 86400) > 0),
                     -- 3: files pending approval
                     (SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status = 'pending'),
-                    -- 4: files overdue
+                    -- 4: files overdue (tracked, pending, or approved past expiration)
                     (SELECT COUNT(*) FROM entries
-                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
+                     WHERE is_dir = 0 AND countdown_start IS NOT NULL
+                       AND status IN ('tracked', 'pending', 'approved')
                        AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= 0),
                     -- 5: last scan completed
                     (SELECT last_scan_completed FROM stats WHERE id = 1),
@@ -1005,9 +1038,10 @@ impl Database {
                     -- 9: pending bytes
                     (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
                      WHERE is_dir = 0 AND status = 'pending'),
-                    -- 10: overdue bytes
+                    -- 10: overdue bytes (tracked, pending, or approved past expiration)
                     (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
+                     WHERE is_dir = 0 AND countdown_start IS NOT NULL
+                       AND status IN ('tracked', 'pending', 'approved')
                        AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= 0),
                     -- 11: ignored files
                     (SELECT COUNT(*) FROM entries

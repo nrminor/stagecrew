@@ -135,31 +135,35 @@ fn fade_gradient() -> &'static FadeGradient {
 /// This is the main rendering function that dispatches to view-specific
 /// rendering based on the current `app.view` state.
 pub(crate) fn render(app: &mut App, ctx: &TuiContext, frame: &mut Frame) {
-    // Create the main layout with top tabs and footer hints.
+    // Create the main layout with header, tabs, content, and footer.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(5), // Header (logo + countdown dial)
             Constraint::Length(3), // View tabs block
             Constraint::Min(0),    // Main content area
             Constraint::Length(1), // Footer
         ])
         .split(frame.area());
 
-    // Render tabs first so they feel like view navigation.
-    render_view_tabs(app, frame, chunks[0]);
+    // Render header banner with logo and countdown.
+    render_header(app, frame, chunks[0]);
+
+    // Render tabs.
+    render_view_tabs(app, frame, chunks[1]);
 
     // Render the current view in the main area
     match app.view() {
         View::FileList => {
             let config = ctx.config(app);
-            render_file_list_view(app, config, ctx.db, frame, chunks[1]);
+            render_file_list_view(app, config, ctx.db, frame, chunks[2]);
         }
-        View::AuditLog => render_audit_log(app, ctx.db, frame, chunks[1]),
-        View::Help => render_help(app, frame, chunks[1]),
+        View::AuditLog => render_audit_log(app, ctx.db, frame, chunks[2]),
+        View::Help => render_help(app, frame, chunks[2]),
     }
 
     // Render footer
-    render_footer(app, frame, chunks[2]);
+    render_footer(app, frame, chunks[3]);
 
     // Render entry deletion confirmation modal if pending entry delete
     if let Some(deletion) = app.pending_entry_delete() {
@@ -231,6 +235,298 @@ pub(crate) fn render(app: &mut App, ctx: &TuiContext, frame: &mut Frame) {
     // Render dry run results modal if pending
     if let Some(result) = app.pending_dry_run() {
         render_dry_run_modal(frame, result);
+    }
+}
+
+/// The stagecrew ASCII logo, trimmed to the 3 letter rows.
+const LOGO: &str = "\
+┏━┓╺┳╸┏━┓┏━╸┏━╸┏━╸┏━┓┏━╸╻ ╻
+┗━┓ ┃ ┣━┫┃╺┓┣╸ ┃  ┣┳┛┣╸ ┃╻┃
+┗━┛ ╹ ╹ ╹┗━┛┗━╸┗━╸╹┗╸┗━╸┗┻┛";
+
+fn render_header(app: &App, frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::symmetric(1, 0));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let now = jiff::Timestamp::now().as_second();
+    let has_countdown = app.nearest_expiration.is_some();
+
+    if has_countdown {
+        let dial_width: u16 = 16;
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(30),         // Logo
+                Constraint::Length(2),          // Gap
+                Constraint::Min(10),            // Context text
+                Constraint::Length(1),          // Gap before dial
+                Constraint::Length(dial_width), // Timer dial
+            ])
+            .split(inner);
+
+        let logo = Paragraph::new(LOGO);
+        frame.render_widget(logo, h_chunks[0]);
+
+        let expiration_ts = app.nearest_expiration.unwrap_or(now);
+        let remaining = expiration_ts - now;
+        let (context_lines, time_top, time_bottom, color) =
+            build_countdown_display(remaining, &app.cached_stats);
+
+        let context = Paragraph::new(context_lines).alignment(Alignment::Right);
+        frame.render_widget(context, h_chunks[2]);
+
+        render_timer_dial(frame, h_chunks[4], &time_top, &time_bottom, color);
+    } else {
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(30), // Logo
+                Constraint::Length(2),  // Gap
+                Constraint::Min(10),    // Status text
+            ])
+            .split(inner);
+
+        let logo = Paragraph::new(LOGO);
+        frame.render_widget(logo, h_chunks[0]);
+
+        let status_lines = build_idle_display(&app.cached_stats);
+        let status = Paragraph::new(status_lines).alignment(Alignment::Right);
+        frame.render_widget(status, h_chunks[2]);
+    }
+}
+
+fn build_countdown_display(
+    remaining_seconds: i64,
+    stats: &crate::db::Stats,
+) -> (Vec<Line<'static>>, String, String, Color) {
+    let (label, time_top, time_bottom, color) = if remaining_seconds <= 0 {
+        let overdue = remaining_seconds.unsigned_abs();
+        let days = overdue / 86400;
+        let hours = (overdue % 86400) / 3600;
+        let mins = (overdue % 3600) / 60;
+        let secs = overdue % 60;
+
+        let label = if days > 0 {
+            format!(
+                "overdue by {days} day{}, {hours} hour{}",
+                if days == 1 { "" } else { "s" },
+                if hours == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "overdue by {hours} hour{}, {mins} min{}",
+                if hours == 1 { "" } else { "s" },
+                if mins == 1 { "" } else { "s" }
+            )
+        };
+
+        (
+            label,
+            format!("-{days}d {hours:02}h"),
+            format!("{mins:02}:{secs:02}"),
+            palette::RED,
+        )
+    } else {
+        let r = remaining_seconds.unsigned_abs();
+        let days = r / 86400;
+        let hours = (r % 86400) / 3600;
+        let mins = (r % 3600) / 60;
+        let secs = r % 60;
+
+        let color = if days == 0 && hours < 6 {
+            palette::RED
+        } else if remaining_seconds <= 14 * 86400 {
+            palette::YELLOW
+        } else {
+            palette::GREEN
+        };
+
+        let label = if days > 0 {
+            format!(
+                "next removal in {days} day{}, {hours} hour{}",
+                if days == 1 { "" } else { "s" },
+                if hours == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "next removal in {hours} hour{}, {mins} min{}",
+                if hours == 1 { "" } else { "s" },
+                if mins == 1 { "" } else { "s" }
+            )
+        };
+
+        (
+            label,
+            format!("{days}d {hours:02}h"),
+            format!("{mins:02}:{secs:02}"),
+            color,
+        )
+    };
+
+    let is_overdue = remaining_seconds <= 0;
+    let context = build_context_lines(&label, stats, is_overdue);
+    (context, time_top, time_bottom, color)
+}
+
+fn build_context_lines(
+    label: &str,
+    stats: &crate::db::Stats,
+    is_overdue: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        label.to_string(),
+        Style::default().fg(Color::DarkGray),
+    ))];
+
+    let overdue = stats.files_overdue;
+    let warning = stats.files_within_warning;
+
+    let mut summary_spans = Vec::new();
+    if overdue > 0 || is_overdue {
+        let count = overdue.max(1);
+        summary_spans.push(Span::styled(
+            format!("{count} file{} overdue", if count == 1 { "" } else { "s" }),
+            Style::default().fg(palette::RED),
+        ));
+    }
+    if warning > 0 {
+        if !summary_spans.is_empty() {
+            summary_spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        summary_spans.push(Span::styled(
+            format!(
+                "{warning} file{} due soon",
+                if warning == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(palette::YELLOW),
+        ));
+    }
+    if summary_spans.is_empty() {
+        summary_spans.push(Span::styled(
+            "all clear",
+            Style::default().fg(palette::GREEN),
+        ));
+    }
+    lines.push(Line::from(summary_spans));
+
+    #[allow(clippy::cast_sign_loss)]
+    let total_bytes = stats.total_size_bytes.max(0) as u64;
+    lines.push(Line::from(Span::styled(
+        format!(
+            "tracking {} files ({})",
+            stats.total_files,
+            format_bytes(total_bytes)
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    lines
+}
+
+fn build_idle_display(stats: &crate::db::Stats) -> Vec<Line<'static>> {
+    if stats.total_files == 0 {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "no directories tracked",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    } else {
+        #[allow(clippy::cast_sign_loss)]
+        let total_bytes = stats.total_size_bytes.max(0) as u64;
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "all clear",
+                Style::default().fg(palette::GREEN),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "tracking {} files ({})",
+                    stats.total_files,
+                    format_bytes(total_bytes)
+                ),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    }
+}
+
+fn render_timer_dial(
+    frame: &mut Frame,
+    area: Rect,
+    time_top: &str,
+    time_bottom: &str,
+    color: Color,
+) {
+    if area.height < 3 || area.width < 12 {
+        return;
+    }
+
+    let border_style = Style::default().fg(color);
+    let time_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+
+    let combined = format!("{time_top} {time_bottom}");
+    let width = area
+        .width
+        .min(u16::try_from(combined.len() + 4).unwrap_or(20));
+    let x = area.right().saturating_sub(width);
+    let y = area.top();
+
+    let buffer = frame.buffer_mut();
+
+    // Top arc
+    buffer[(x, y)].set_symbol("╭").set_style(border_style);
+    for dx in 1..width.saturating_sub(1) {
+        buffer[(x + dx, y)].set_symbol("─").set_style(border_style);
+    }
+    buffer[(x + width - 1, y)]
+        .set_symbol("╮")
+        .set_style(border_style);
+
+    // Middle row with combined time
+    buffer[(x, y + 1)].set_symbol("│").set_style(border_style);
+    buffer[(x + width - 1, y + 1)]
+        .set_symbol("│")
+        .set_style(border_style);
+    let padded = format!(
+        "{combined:^width$}",
+        width = usize::from(width).saturating_sub(2)
+    );
+    write_dial_text(buffer, x, y + 1, width, &padded, time_style);
+
+    // Bottom arc
+    buffer[(x, y + 2)].set_symbol("╰").set_style(border_style);
+    for dx in 1..width.saturating_sub(1) {
+        buffer[(x + dx, y + 2)]
+            .set_symbol("─")
+            .set_style(border_style);
+    }
+    buffer[(x + width - 1, y + 2)]
+        .set_symbol("╯")
+        .set_style(border_style);
+}
+
+fn write_dial_text(
+    buffer: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    style: Style,
+) {
+    for (i, ch) in text.chars().enumerate() {
+        if let Ok(dx) = u16::try_from(i + 1)
+            && dx < width - 1
+        {
+            buffer[(x + dx, y)]
+                .set_symbol(&ch.to_string())
+                .set_style(style);
+        }
     }
 }
 
