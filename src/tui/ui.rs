@@ -977,6 +977,25 @@ fn render_expiration_timeline(
         }
     }
 
+    // Debug: log non-zero buckets so we can verify deferred entries land correctly.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let non_zero: Vec<_> = future_buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(day, count)| format!("d{day}={count}"))
+            .collect();
+        if !non_zero.is_empty() {
+            tracing::debug!(
+                target: "stagecrew::timeline",
+                buckets = %non_zero.join(" "),
+                overdue_count,
+                future_count,
+                "Timeline bucket distribution"
+            );
+        }
+    }
+
     // If nothing is overdue or expiring soon, show a calm message.
     if overdue_count == 0 && future_count == 0 {
         let msg = Paragraph::new("No files expiring in the next 30 days")
@@ -985,7 +1004,7 @@ fn render_expiration_timeline(
         return;
     }
 
-    // Layout: labels, compact chart, metric row, and summary.
+    // Layout: labels, chart with axes, metric row, and summary.
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1002,6 +1021,7 @@ fn render_expiration_timeline(
     let summary_area = v_chunks[3];
 
     let overdue_width = 22;
+    let y_label_width: u16 = 6; // "files│"
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1019,7 +1039,8 @@ fn render_expiration_timeline(
         .constraints([
             Constraint::Length(overdue_width),
             Constraint::Length(2),
-            Constraint::Min(10),
+            Constraint::Length(y_label_width),
+            Constraint::Min(5),
         ])
         .split(labels_area);
 
@@ -1031,9 +1052,9 @@ fn render_expiration_timeline(
         label_chunks[0],
     );
     frame.render_widget(
-        Paragraph::new(build_future_axis_labels(future_area.width))
+        Paragraph::new(build_future_axis_labels(label_chunks[3].width))
             .style(Style::default().fg(Color::DarkGray)),
-        label_chunks[2],
+        label_chunks[3],
     );
 
     render_overdue_block(
@@ -1044,17 +1065,54 @@ fn render_expiration_timeline(
         overdue_count + future_count,
     );
 
-    let sparkline = build_future_sparkline(&future_buckets, future_area.width, config.warning_days);
-    frame.render_widget(Paragraph::new(sparkline), future_area);
+    // Split future area: "files│" label + y-axis line on left, sparkline on right.
+    let future_h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(y_label_width), Constraint::Min(5)])
+        .split(future_area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("files", Style::default().fg(Color::DarkGray)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+        ]))
+        .alignment(Alignment::Right),
+        future_h[0],
+    );
+
+    let sparkline = build_future_sparkline(&future_buckets, future_h[1].width, config.warning_days);
+    frame.render_widget(Paragraph::new(sparkline), future_h[1]);
 
     let metric_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(overdue_width),
             Constraint::Length(2),
-            Constraint::Min(10),
+            Constraint::Length(y_label_width),
+            Constraint::Min(5),
         ])
         .split(metrics_area);
+
+    // Baseline corner aligned with y-axis │ above it.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "└",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Right),
+        metric_chunks[2],
+    );
+
+    // Baseline line under sparkline: ───────
+    let baseline_width = usize::from(metric_chunks[3].width);
+    let baseline: String = "─".repeat(baseline_width);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            baseline,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        metric_chunks[3],
+    );
 
     let overdue_metric = if overdue_count == 0 {
         String::new()
@@ -1072,20 +1130,19 @@ fn render_expiration_timeline(
             format_bytes(future_bytes.max(0).cast_unsigned())
         )
     };
+    let combined_metric = if overdue_metric.is_empty() {
+        future_metric
+    } else if future_metric.is_empty() || future_metric == "nothing due soon" {
+        overdue_metric
+    } else {
+        format!("{overdue_metric} · {future_metric}")
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            overdue_metric,
+            combined_metric,
             Style::default().fg(Color::DarkGray),
         ))),
         metric_chunks[0],
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            future_metric,
-            Style::default().fg(Color::DarkGray),
-        )))
-        .alignment(Alignment::Left),
-        metric_chunks[2],
     );
 
     let summary_text = match (overdue_count, future_count) {
@@ -1203,14 +1260,23 @@ fn build_future_sparkline(buckets: &[u64], width: u16, warning_days: u32) -> Lin
     let spans: Vec<Span<'static>> = samples
         .into_iter()
         .map(|(count, day)| {
-            let idx = usize::try_from(
-                count
-                    .saturating_mul(u64::try_from(BLOCKS.len()).unwrap_or(8))
-                    .saturating_sub(1)
-                    / max_value,
-            )
-            .unwrap_or(0)
-            .min(BLOCKS.len().saturating_sub(1));
+            // Ensure non-zero buckets are always visible (at least ▂).
+            let idx = if count == 0 {
+                0
+            } else {
+                usize::try_from(
+                    count
+                        .saturating_mul(u64::try_from(BLOCKS.len()).unwrap_or(8))
+                        .saturating_sub(1)
+                        / max_value,
+                )
+                .unwrap_or(0)
+                .min(BLOCKS.len().saturating_sub(1))
+                .max(1)
+            };
+            if count == 0 {
+                return Span::styled(" ", Style::default());
+            }
             let color = if day == 0 {
                 palette::RED
             } else if day <= usize::try_from(warning_days).unwrap_or(0) {
@@ -1918,11 +1984,13 @@ fn render_main_entry_panel(
 
             // Row-level styling for selection and cursor
             let mut row_style = if is_selected && is_cursor {
-                // Cursor on a selected row: combine both indicators
-                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else if is_selected {
-                // Selected entries get underline to distinguish from cursor
-                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
             } else if is_cursor {
                 // Currently focused entry
                 Style::default().add_modifier(Modifier::REVERSED)
