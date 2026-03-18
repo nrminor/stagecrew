@@ -184,7 +184,8 @@ impl Daemon {
             "continuous"
         };
 
-        eprintln!("stagecrew daemon starting");
+        eprintln!("{}", crate::cli::INFO);
+        eprintln!();
         eprintln!("  mode:            {mode}");
         eprintln!("  database:        {}", db_path.display());
         eprintln!("  scan interval:   {interval_hours}h");
@@ -302,67 +303,75 @@ impl Daemon {
         scanner: &Scanner,
         scan_only: bool,
     ) {
-        // Step 1: Refresh (scan + transition expired files using per-root configs)
-        tracing::info!("Starting refresh cycle");
-        tracing::debug!(
-            tracked_path_count = app_config.global.tracked_paths.len(),
-            auto_remove = app_config.global.auto_remove,
-            expiration_days = app_config.global.expiration_days,
-            warning_days = app_config.global.warning_days,
-            "Daemon cycle config snapshot"
-        );
+        let cycle_start = std::time::Instant::now();
+
+        // Accumulate context for the wide event emitted at cycle end.
+        let mut scan_directories: u64 = 0;
+        let mut scan_files: u64 = 0;
+        let mut scan_bytes: u64 = 0;
+        let mut expired_to_pending: u64 = 0;
+        let mut expired_to_approved: u64 = 0;
+        let mut deferred_reset: u64 = 0;
+        let mut scan_outcome = "success";
+        let mut removed_count: usize = 0;
+        let mut blocked_count: usize = 0;
+        let mut bytes_freed: i64 = 0;
+        let mut removal_outcome = if scan_only { "skipped" } else { "success" };
+
+        // Step 1: Refresh (scan + transition expired files)
         match refresh(db, scanner, app_config).await {
             Ok(summary) => {
-                tracing::info!(
-                    total_directories = summary.scan.total_directories,
-                    total_files = summary.scan.total_files,
-                    total_size_bytes = summary.scan.total_size_bytes,
-                    "Scan completed successfully"
-                );
-                if summary.transitions.expired_to_pending > 0
-                    || summary.transitions.expired_to_approved > 0
-                    || summary.transitions.deferred_reset > 0
-                {
-                    tracing::info!(
-                        expired_to_pending = summary.transitions.expired_to_pending,
-                        expired_to_approved = summary.transitions.expired_to_approved,
-                        deferred_reset = summary.transitions.deferred_reset,
-                        "State transitions completed"
-                    );
-                }
-                tracing::debug!(
-                    expired_to_pending = summary.transitions.expired_to_pending,
-                    expired_to_approved = summary.transitions.expired_to_approved,
-                    deferred_reset = summary.transitions.deferred_reset,
-                    "Transition summary (debug detail)"
-                );
+                scan_directories = summary.scan.total_directories;
+                scan_files = summary.scan.total_files;
+                scan_bytes = summary.scan.total_size_bytes;
+                expired_to_pending = summary.transitions.expired_to_pending;
+                expired_to_approved = summary.transitions.expired_to_approved;
+                deferred_reset = summary.transitions.deferred_reset;
             }
             Err(e) => {
+                scan_outcome = "failed";
                 tracing::warn!(error = ?e, "Refresh failed, continuing to removal step");
             }
         }
 
         // Step 2: Remove approved paths
-        if scan_only {
-            tracing::info!("Scan-only mode, skipping removal step");
-            return;
-        }
-        tracing::info!("Removing approved paths");
-        match remove_approved(db) {
-            Ok(summary) => {
-                if summary.removed_count() > 0 || summary.blocked_count() > 0 {
-                    tracing::info!(
-                        removed_count = summary.removed_count(),
-                        blocked_count = summary.blocked_count(),
-                        total_bytes_freed = summary.total_bytes_freed(),
-                        "Removal completed"
-                    );
+        if !scan_only {
+            match remove_approved(db) {
+                Ok(summary) => {
+                    removed_count = summary.removed_count();
+                    blocked_count = summary.blocked_count();
+                    bytes_freed = summary.total_bytes_freed();
+                }
+                Err(e) => {
+                    removal_outcome = "failed";
+                    tracing::warn!(error = ?e, "Removal failed");
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = ?e, "Removal failed");
-            }
         }
+
+        let cycle_duration_ms = cycle_start.elapsed().as_millis();
+
+        // Wide event: one emission per cycle with full context.
+        tracing::info!(
+            target: "stagecrew::daemon",
+            cycle_duration_ms,
+            scan.outcome = scan_outcome,
+            scan.directories = scan_directories,
+            scan.files = scan_files,
+            scan.bytes = scan_bytes,
+            transitions.expired_to_pending = expired_to_pending,
+            transitions.expired_to_approved = expired_to_approved,
+            transitions.deferred_reset = deferred_reset,
+            removal.outcome = removal_outcome,
+            removal.removed = removed_count,
+            removal.blocked = blocked_count,
+            removal.bytes_freed = bytes_freed,
+            config.expiration_days = app_config.global.expiration_days,
+            config.warning_days = app_config.global.warning_days,
+            config.auto_remove = app_config.global.auto_remove,
+            config.tracked_paths = app_config.global.tracked_paths.len(),
+            "daemon_cycle"
+        );
     }
 }
 

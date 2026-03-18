@@ -36,6 +36,9 @@ const STYLES: Styles = Styles::styled()
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    #[command(flatten)]
+    pub verbose: clap_verbosity_flag::Verbosity,
 }
 
 #[derive(Debug, Default, Subcommand)]

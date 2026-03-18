@@ -31,22 +31,32 @@ async fn main() -> Result<()> {
     // Initialize paths (needed early for log file location)
     let paths = AppPaths::new();
 
+    let cli = Cli::parse();
+    let command = cli.command.unwrap_or_default();
+
     // Initialize tracing to an append-only log file so it never interferes
-    // with the TUI's terminal output. Defaults to warn; set RUST_LOG for more.
+    // with the TUI's terminal output. The verbosity flag sets a baseline level
+    // (-v for info, -vv for debug, -vvv for trace, -q for error-only).
+    // RUST_LOG overrides the flag when set, giving power users precise control.
     let log_path = paths.log_file().context("Failed to create log directory")?;
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .context("Failed to open log file")?;
+
+    let env_filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else {
+        let level = cli.verbose.tracing_level().unwrap_or(tracing::Level::WARN);
+        EnvFilter::new(level.to_string())
+    };
+
     tracing_subscriber::fmt()
         .with_writer(log_file)
         .with_ansi(false)
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(env_filter)
         .init();
-
-    let cli = Cli::parse();
-    let command = cli.command.unwrap_or_default();
 
     // Handle init separately since it may need to create config before loading it
     if matches!(command, Command::Init) {
