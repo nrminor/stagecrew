@@ -11,7 +11,7 @@ use super::{
 use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditExportFormat, AuditService};
 use crate::config::Config;
 use crate::db::Database;
-use crate::removal::{RemovalMethod, dry_run_approved};
+use crate::removal::{RemovalMethod, dry_run_approved, remove};
 use crate::scanner::calculate_expiration;
 
 /// Handles keyboard input with vim-style bindings.
@@ -285,6 +285,18 @@ impl InputHandler {
             // Dry run preflight check on approved entries for the current root
             KeyCode::Char('Y') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::run_dry_run(app, db);
+            }
+
+            // Execute approved removals for the current root
+            KeyCode::Char('F') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::execute_approved_removals(app, ctx);
+            }
+
+            // Reset countdown timer for the current root
+            KeyCode::Char('T')
+                if matches!(app.focus_panel, FocusPanel::Sidebar | FocusPanel::MainPanel) =>
+            {
+                Self::reset_root_timer(app, ctx);
             }
 
             // Enter a root from the sidebar
@@ -1212,6 +1224,159 @@ impl InputHandler {
             }
             Err(e) => {
                 app.status_message = Some(format!("Dry run failed: {e}"));
+                app.status_message_time = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Execute approved removals for the current root.
+    ///
+    /// Finds all approved entries under the current root and permanently deletes
+    /// them, updating status and recording audit events for each.
+    fn execute_approved_removals(app: &mut App, ctx: &TuiContext) {
+        let Some(root_id) = app.current_root_id else {
+            app.status_message = Some("No root selected".to_string());
+            app.status_message_time = Some(std::time::Instant::now());
+            return;
+        };
+
+        let entries = match ctx.db.list_entries_by_root_and_status(root_id, "approved") {
+            Ok(entries) => entries,
+            Err(e) => {
+                app.status_message = Some(format!("Failed to query approved entries: {e}"));
+                app.status_message_time = Some(std::time::Instant::now());
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            app.status_message = Some("No approved entries to remove".to_string());
+            app.status_message_time = Some(std::time::Instant::now());
+            return;
+        }
+
+        let audit = AuditService::new(ctx.db);
+        let user = AuditService::current_user();
+        let mut removed = 0u64;
+        let mut blocked = 0u64;
+        let mut bytes_freed = 0i64;
+
+        for entry in &entries {
+            match remove(&entry.path, RemovalMethod::PermanentDelete) {
+                Ok(_) => {
+                    if let Err(e) = ctx.db.update_entry_status(entry.id, "removed") {
+                        tracing::warn!("Failed to update status after removal: {e}");
+                    }
+                    removed += 1;
+                    bytes_freed += entry.size_bytes;
+
+                    let details = format!("Permanently deleted {} bytes", entry.size_bytes);
+                    if let Err(e) = audit.record_event(&AuditEvent {
+                        user: &user,
+                        actor_source: AuditActorSource::Tui,
+                        action: AuditAction::Remove,
+                        target_path: Some(entry.path.as_path()),
+                        details: Some(&details),
+                        entry_id: Some(entry.id),
+                        root_id: Some(root_id),
+                        status_before: Some("approved"),
+                        status_after: Some("removed"),
+                        outcome: Some("removed"),
+                    }) {
+                        tracing::warn!("Failed to record removal audit: {e}");
+                    }
+                }
+                Err(e) => {
+                    if let Err(db_err) = ctx.db.update_entry_status(entry.id, "blocked") {
+                        tracing::warn!("Failed to update status to blocked: {db_err}");
+                    }
+                    blocked += 1;
+
+                    let details = format!("Blocked: {e}");
+                    if let Err(audit_err) = audit.record_event(&AuditEvent {
+                        user: &user,
+                        actor_source: AuditActorSource::Tui,
+                        action: AuditAction::Remove,
+                        target_path: Some(entry.path.as_path()),
+                        details: Some(&details),
+                        entry_id: Some(entry.id),
+                        root_id: Some(root_id),
+                        status_before: Some("approved"),
+                        status_after: Some("blocked"),
+                        outcome: Some("blocked"),
+                    }) {
+                        tracing::warn!("Failed to record blocked removal audit: {audit_err}");
+                    }
+                }
+            }
+        }
+
+        app.refresh_stats(ctx);
+
+        #[allow(clippy::cast_sign_loss)]
+        let bytes_display = super::super::format_bytes(bytes_freed.max(0) as u64);
+        app.status_message = Some(format!(
+            "Removed {removed} file{}, freed {bytes_display}{}",
+            if removed == 1 { "" } else { "s" },
+            if blocked > 0 {
+                format!(" ({blocked} blocked)")
+            } else {
+                String::new()
+            }
+        ));
+        app.status_message_time = Some(std::time::Instant::now());
+    }
+
+    /// Reset the countdown timer for all entries under the current root.
+    ///
+    /// Sets `countdown_start` to now for all non-ignored, non-removed entries,
+    /// effectively granting a full new expiration period. Also resets
+    /// pending/approved/deferred entries back to tracked status.
+    fn reset_root_timer(app: &mut App, ctx: &TuiContext) {
+        let Some(root_id) = app.current_root_id else {
+            app.status_message = Some("No root selected".to_string());
+            app.status_message_time = Some(std::time::Instant::now());
+            return;
+        };
+
+        let root_path = ctx
+            .db
+            .get_root(root_id)
+            .ok()
+            .flatten()
+            .map(|r| r.path)
+            .unwrap_or_default();
+
+        match ctx.db.reset_root_countdowns(root_id) {
+            Ok(count) => {
+                let audit = AuditService::new(ctx.db);
+                let user = AuditService::current_user();
+                if let Err(e) = audit.record_event(&AuditEvent {
+                    user: &user,
+                    actor_source: AuditActorSource::Tui,
+                    action: AuditAction::Defer,
+                    target_path: Some(root_path.as_path()),
+                    details: Some(&format!("Reset countdown for {count} entries under root")),
+                    entry_id: None,
+                    root_id: Some(root_id),
+                    status_before: None,
+                    status_after: Some("tracked"),
+                    outcome: Some("reset"),
+                }) {
+                    tracing::warn!("Failed to record timer reset audit: {e}");
+                }
+
+                app.refresh_stats(ctx);
+
+                app.status_message = Some(format!(
+                    "Reset timer for {count} entr{} in {}",
+                    if count == 1 { "y" } else { "ies" },
+                    root_path.display()
+                ));
+                app.status_message_time = Some(std::time::Instant::now());
+            }
+            Err(e) => {
+                app.status_message = Some(format!("Timer reset failed: {e}"));
                 app.status_message_time = Some(std::time::Instant::now());
             }
         }
@@ -3687,6 +3852,96 @@ mod tests {
             app.pending_dry_run.is_none(),
             "Modal should be dismissed after keypress"
         );
+    }
+
+    #[test]
+    fn f_key_shows_message_when_no_approved_entries() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        let (root_id, _file_ids) = setup_with_files(&db);
+        app.current_root_id = Some(root_id);
+        app.current_path = PathBuf::from("/test/dir");
+        app.focus_panel = FocusPanel::MainPanel;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('F')));
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("No approved entries to remove")
+        );
+    }
+
+    #[test]
+    fn f_key_ignored_in_sidebar() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        app.focus_panel = FocusPanel::Sidebar;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('F')));
+
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn t_key_resets_root_timer() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        let (root_id, file_ids) = setup_with_files(&db);
+
+        // Approve an entry so we can verify it gets reset to tracked
+        db.update_entry_status(file_ids[0], "approved")
+            .expect("Failed to approve entry");
+
+        app.current_root_id = Some(root_id);
+        app.current_path = PathBuf::from("/test/dir");
+        app.focus_panel = FocusPanel::MainPanel;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('T')));
+
+        // Status message should confirm reset
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("Reset timer")),
+            "Should show timer reset confirmation"
+        );
+
+        // Previously approved entry should be back to tracked
+        let entries = db
+            .list_entries_by_parent(std::path::Path::new("/test/dir"))
+            .expect("Failed to list entries");
+        let entry = entries
+            .iter()
+            .find(|e| e.id == file_ids[0])
+            .expect("Entry should exist");
+        assert_eq!(
+            entry.status, "tracked",
+            "Approved entry should be reset to tracked"
+        );
+    }
+
+    #[test]
+    fn t_key_with_no_root_shows_message() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        app.current_root_id = None;
+        app.focus_panel = FocusPanel::MainPanel;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('T')));
+
+        assert_eq!(app.status_message.as_deref(), Some("No root selected"));
     }
 
     #[test]

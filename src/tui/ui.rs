@@ -2492,7 +2492,9 @@ Sorting:
 
 Other:
   E           Export audit log (from Audit Log view)
+  F           Execute approved removals for current root
   R           Refresh tracked paths (rescan filesystem)
+  T           Reset countdown timer for current root
   Y           Dry run: check if approved entries can be removed
   q           Quit application (or return from audit log)
   Ctrl+C      Quit application";
@@ -2697,6 +2699,8 @@ fn context_hints(app: &App) -> (Vec<Hint>, Vec<Hint>) {
                         ("r", "Defer"),
                         ("i", "Ignore"),
                         ("x", "Approve"),
+                        ("F", "Remove approved"),
+                        ("T", "Reset timer"),
                         ("Y", "Dry run"),
                         ("Space", "Select"),
                         ("v", "Visual"),
