@@ -1030,7 +1030,7 @@ fn render_expiration_timeline(
         .split(metrics_area);
 
     let overdue_metric = if overdue_count == 0 {
-        "none overdue".to_string()
+        String::new()
     } else {
         format!(
             "{} overdue",
@@ -1138,11 +1138,17 @@ fn render_overdue_block(
     .max(if overdue_count > 0 { 4 } else { 0 })
     .min(inner_width);
     let bar = "█".repeat(usize::from(blocks));
-    let count_text = if overdue_count == 0 {
-        "none".to_string()
-    } else {
-        pluralize_files(overdue_count)
-    };
+    if overdue_count == 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "✓ all clear",
+                Style::default().fg(palette::GREEN),
+            ))),
+            area,
+        );
+        return;
+    }
+    let count_text = pluralize_files(overdue_count);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(bar, Style::default().fg(palette::RED)),

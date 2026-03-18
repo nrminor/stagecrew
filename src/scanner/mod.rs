@@ -400,6 +400,8 @@ pub async fn scan_and_persist(
             total_directories += 1;
         }
 
+        cleanup_missing_entries(db, root_id)?;
+
         // On first scan of a root, reset all countdowns to give files a fresh start.
         // This prevents old files from immediately appearing overdue when first tracked.
         if is_first_scan {
@@ -454,6 +456,35 @@ pub async fn scan_and_persist(
         total_files,
         total_size_bytes,
     })
+}
+
+/// Mark entries that no longer exist on disk as removed.
+///
+/// After a scan upserts all currently-existing entries, this pass finds any
+/// active entries under the root whose paths are no longer on the filesystem
+/// and sets their status to `removed`. This prevents ghost entries from
+/// persisting indefinitely when files are deleted outside of stagecrew.
+fn cleanup_missing_entries(db: &Database, root_id: i64) -> Result<()> {
+    let existing_entries = db.list_entries_by_root(root_id)?;
+    let mut cleaned = 0u64;
+    for entry in &existing_entries {
+        if entry.status != "removed" && !entry.path.exists() {
+            tracing::debug!(
+                path = ?entry.path,
+                entry_id = entry.id,
+                "Entry no longer exists on disk, marking as removed"
+            );
+            if let Err(e) = db.update_entry_status(entry.id, "removed") {
+                tracing::warn!("Failed to mark missing entry as removed: {e}");
+            } else {
+                cleaned += 1;
+            }
+        }
+    }
+    if cleaned > 0 {
+        tracing::info!(root_id, cleaned, "Cleaned up missing entries");
+    }
+    Ok(())
 }
 
 fn record_transition_audit(
