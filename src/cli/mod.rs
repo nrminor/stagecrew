@@ -95,6 +95,14 @@ pub enum Command {
         path: Option<PathBuf>,
     },
 
+    /// View and manage stagecrew configuration.
+    ///
+    /// Without a subcommand, prints the current effective configuration
+    /// as TOML. Use subcommands to inspect file paths or open the config
+    /// in your editor.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+
     /// Initialize or update configuration
     Init,
 
@@ -110,4 +118,22 @@ pub enum Command {
         #[arg(short, long)]
         scan: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the current effective configuration as TOML.
+    Show,
+
+    /// Print the path to the configuration file.
+    Path,
+
+    /// Print the path to the database file.
+    DbPath,
+
+    /// Print the path to the log file.
+    LogPath,
+
+    /// Open the configuration file in $VISUAL or $EDITOR.
+    Edit,
 }

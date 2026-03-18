@@ -17,7 +17,7 @@ use clap::Parser;
 use color_eyre::eyre::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, ConfigCommand};
 use config::{AppConfig, AppPaths, Config};
 use db::Database;
 use error::Error;
@@ -58,10 +58,15 @@ async fn main() -> Result<()> {
         .with_env_filter(env_filter)
         .init();
 
-    // Handle init separately since it may need to create config before loading it
+    // Handle init and config subcommands before loading the full config/database,
+    // since they may need to create config or only inspect paths.
     if matches!(command, Command::Init) {
         handle_init(&paths)?;
         return Ok(());
+    }
+
+    if let Command::Config(ref config_cmd) = command {
+        return handle_config_command(config_cmd, &paths);
     }
 
     // For all other commands, load config and open database
@@ -112,7 +117,7 @@ async fn main() -> Result<()> {
             handle_add(&app_config, &db, path, scan).await?;
         }
 
-        Command::Init => unreachable!("Init handled above"),
+        Command::Init | Command::Config(_) => unreachable!("handled above"),
     }
 
     Ok(())
@@ -158,6 +163,47 @@ fn handle_init(paths: &AppPaths) -> Result<()> {
         println!("Database initialized at: {}", db_path.display());
     }
 
+    Ok(())
+}
+
+/// Handle config subcommands for inspecting and managing configuration.
+fn handle_config_command(cmd: &ConfigCommand, paths: &AppPaths) -> Result<()> {
+    match cmd {
+        ConfigCommand::Show => {
+            let config = Config::load(paths).context("Failed to load configuration")?;
+            let toml_str =
+                toml::to_string_pretty(&config).context("Failed to serialize configuration")?;
+            println!("{toml_str}");
+        }
+        ConfigCommand::Path => {
+            let config_path = paths.config_file()?;
+            println!("{}", config_path.display());
+        }
+        ConfigCommand::DbPath => {
+            let config = Config::load(paths).context("Failed to load configuration")?;
+            let db_path = paths.database_file(&config)?;
+            println!("{}", db_path.display());
+        }
+        ConfigCommand::LogPath => {
+            let log_path = paths.log_file()?;
+            println!("{}", log_path.display());
+        }
+        ConfigCommand::Edit => {
+            let config_path = paths.config_file()?;
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| "vi".to_string());
+
+            let status = std::process::Command::new(&editor)
+                .arg(&config_path)
+                .status()
+                .context(format!("Failed to launch editor: {editor}"))?;
+
+            if !status.success() {
+                eprintln!("Editor exited with non-zero status");
+            }
+        }
+    }
     Ok(())
 }
 
