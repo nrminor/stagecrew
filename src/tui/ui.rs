@@ -588,27 +588,32 @@ fn render_expiration_timeline(
         .title("REMOVAL TIMELINE");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let content = inner.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
 
     // Get the selected root
     let Some(root_id) = app.current_root_id else {
         let msg = Paragraph::new("Select a root from the sidebar")
             .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(msg, inner);
+        frame.render_widget(msg, content);
         return;
     };
 
     // Get entries for this root
     let Ok(entries) = db.list_entries_by_root(root_id) else {
         let msg = Paragraph::new("Error loading entries").style(Style::default().fg(palette::RED));
-        frame.render_widget(msg, inner);
+        frame.render_widget(msg, content);
         return;
     };
 
-    // Bucket entries by days until expiration (0-30 days)
-    // Index 0 = expires today, index 30 = expires in 30 days
-    let mut buckets: [u64; TIMELINE_DAYS + 1] = [0; TIMELINE_DAYS + 1];
-    let mut total_expiring: u64 = 0;
-    let mut total_bytes: i64 = 0;
+    // Separate overdue backlog from the upcoming 30-day distribution.
+    let mut future_buckets: [u64; TIMELINE_DAYS + 1] = [0; TIMELINE_DAYS + 1];
+    let mut overdue_count: u64 = 0;
+    let mut overdue_bytes: i64 = 0;
+    let mut future_count: u64 = 0;
+    let mut future_bytes: i64 = 0;
 
     for entry in entries
         .iter()
@@ -636,98 +641,172 @@ fn render_expiration_timeline(
         };
 
         if let Some(days) = days_remaining {
-            // Only count files expiring within our timeline window
-            if days <= i64::try_from(TIMELINE_DAYS).unwrap_or(i64::MAX) {
+            if days < 0 {
+                overdue_count += 1;
+                overdue_bytes += entry.size_bytes;
+            } else if days <= i64::try_from(TIMELINE_DAYS).unwrap_or(i64::MAX) {
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                let bucket_idx = days.max(0) as usize;
-                buckets[bucket_idx] += 1;
-                total_expiring += 1;
-                total_bytes += entry.size_bytes;
+                let bucket_idx = days as usize;
+                future_buckets[bucket_idx] += 1;
+                future_count += 1;
+                future_bytes += entry.size_bytes;
             }
         }
     }
 
-    // If nothing is expiring, show a calm message
-    if total_expiring == 0 {
+    // If nothing is overdue or expiring soon, show a calm message.
+    if overdue_count == 0 && future_count == 0 {
         let msg = Paragraph::new("No files expiring in the next 30 days")
             .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(msg, inner);
+        frame.render_widget(msg, content);
         return;
     }
 
-    // Layout: split vertically into timeline rows + summary, then split top horizontally for legend
+    // Layout: labels, compact chart, metric row, and summary.
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Timeline area (axis labels + axis + markers)
-            Constraint::Min(1),    // Summary text
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
         ])
-        .split(inner);
+        .split(content);
 
-    let timeline_block = v_chunks[0];
-    let summary_area = v_chunks[1];
+    let labels_area = v_chunks[0];
+    let chart_area = v_chunks[1];
+    let metrics_area = v_chunks[2];
+    let summary_area = v_chunks[3];
 
-    // Split timeline block horizontally: timeline on left, legend on right
-    let legend_width: u16 = 7; // " · <3" etc
+    let overdue_width = 22;
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(10), Constraint::Length(legend_width)])
-        .split(timeline_block);
-
-    let timeline_area_full = h_chunks[0];
-    let legend_area = h_chunks[1];
-
-    // Split timeline area into rows
-    let timeline_rows = Layout::default()
-        .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Axis labels
-            Constraint::Length(1), // Timeline axis
-            Constraint::Length(1), // Markers
+            Constraint::Length(overdue_width),
+            Constraint::Length(2),
+            Constraint::Min(10),
         ])
-        .split(timeline_area_full);
+        .split(chart_area);
 
-    let axis_label_area = timeline_rows[0];
-    let timeline_area = timeline_rows[1];
-    let marker_area = timeline_rows[2];
+    let overdue_area = h_chunks[0];
+    let future_area = h_chunks[2];
 
-    // Split legend area into rows (aligned with timeline rows)
-    let legend_rows = Layout::default()
-        .direction(Direction::Vertical)
+    let label_chunks = Layout::default()
+        .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(overdue_width),
+            Constraint::Length(2),
+            Constraint::Min(10),
         ])
-        .split(legend_area);
+        .split(labels_area);
 
-    // Render legend (right-aligned in each row)
-    // Pad with spaces so dots align vertically
     frame.render_widget(
-        Paragraph::new("·  <3").alignment(ratatui::layout::Alignment::Right),
-        legend_rows[0],
+        Paragraph::new(Line::from(Span::styled(
+            "overdue backlog",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        label_chunks[0],
     );
     frame.render_widget(
-        Paragraph::new("• <10").alignment(ratatui::layout::Alignment::Right),
-        legend_rows[1],
-    );
-    frame.render_widget(
-        Paragraph::new("● 10+").alignment(ratatui::layout::Alignment::Right),
-        legend_rows[2],
+        Paragraph::new(build_future_axis_labels(future_area.width))
+            .style(Style::default().fg(Color::DarkGray)),
+        label_chunks[2],
     );
 
-    // Build axis labels: "Today", "+15d", "+30d"
-    let axis_width = usize::from(axis_label_area.width);
+    render_overdue_block(
+        overdue_area,
+        frame,
+        overdue_count,
+        overdue_bytes,
+        overdue_count + future_count,
+    );
+
+    let sparkline = build_future_sparkline(&future_buckets, future_area.width, config.warning_days);
+    frame.render_widget(Paragraph::new(sparkline), future_area);
+
+    let metric_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(overdue_width),
+            Constraint::Length(2),
+            Constraint::Min(10),
+        ])
+        .split(metrics_area);
+
+    let overdue_metric = if overdue_count == 0 {
+        "none overdue".to_string()
+    } else {
+        format!(
+            "{} overdue",
+            format_bytes(overdue_bytes.max(0).cast_unsigned())
+        )
+    };
+    let future_metric = if future_count == 0 {
+        "nothing due soon".to_string()
+    } else {
+        format!(
+            "{} due soon",
+            format_bytes(future_bytes.max(0).cast_unsigned())
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            overdue_metric,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        metric_chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            future_metric,
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Left),
+        metric_chunks[2],
+    );
+
+    let summary_text = match (overdue_count, future_count) {
+        (0, upcoming) => format!(
+            "{} due in next 30 days ({})",
+            pluralize_files(upcoming),
+            format_bytes(future_bytes.max(0).cast_unsigned())
+        ),
+        (overdue, 0) => format!(
+            "{} overdue ({})",
+            pluralize_files(overdue),
+            format_bytes(overdue_bytes.max(0).cast_unsigned())
+        ),
+        (overdue, upcoming) => format!(
+            "{} overdue | {} due in next 30 days",
+            pluralize_files(overdue),
+            pluralize_files(upcoming)
+        ),
+    };
+
+    let summary_paragraph = Paragraph::new(Line::from(Span::styled(
+        summary_text,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .alignment(Alignment::Center);
+    let summary_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(summary_area);
+    frame.render_widget(summary_paragraph, summary_rows[1]);
+}
+
+fn build_future_axis_labels(width: u16) -> Line<'static> {
+    let axis_width = usize::from(width);
     let mut axis_label = String::with_capacity(axis_width);
-    axis_label.push_str("Today");
+    axis_label.push_str("today");
     let mid_label = "+15d";
     let end_label = "+30d";
 
-    // Calculate positions for labels
     let mid_pos = axis_width / 2;
     let end_pos = axis_width.saturating_sub(end_label.len());
 
-    // Pad to mid position
     let padding_to_mid = mid_pos
         .saturating_sub(axis_label.len())
         .saturating_sub(mid_label.len() / 2);
@@ -736,128 +815,108 @@ fn render_expiration_timeline(
     }
     axis_label.push_str(mid_label);
 
-    // Pad to end position
     let padding_to_end = end_pos.saturating_sub(axis_label.len());
     for _ in 0..padding_to_end {
         axis_label.push(' ');
     }
     axis_label.push_str(end_label);
 
-    let axis_label_line = Line::from(Span::styled(
-        axis_label,
-        Style::default().fg(Color::DarkGray),
-    ));
-    frame.render_widget(Paragraph::new(axis_label_line), axis_label_area);
+    Line::from(axis_label)
+}
 
-    // Build timeline axis (simple line without ticks)
-    let timeline_width = usize::from(timeline_area.width);
-    let mut timeline = String::with_capacity(timeline_width);
-    timeline.push('├');
-    for _ in 1..timeline_width.saturating_sub(1) {
-        timeline.push('─');
-    }
-    if timeline_width > 1 {
-        timeline.push('┤');
-    }
+fn render_overdue_block(
+    area: Rect,
+    frame: &mut Frame,
+    overdue_count: u64,
+    _overdue_bytes: i64,
+    total_count: u64,
+) {
+    let inner_width = area.width.saturating_sub(1);
+    let blocks = u16::try_from(
+        overdue_count
+            .saturating_mul(u64::from(inner_width))
+            .saturating_add(total_count.saturating_sub(1))
+            / total_count.max(1),
+    )
+    .unwrap_or(inner_width)
+    .max(if overdue_count > 0 { 4 } else { 0 })
+    .min(inner_width);
+    let bar = "█".repeat(usize::from(blocks));
+    let count_text = if overdue_count == 0 {
+        "none".to_string()
+    } else {
+        pluralize_files(overdue_count)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(bar, Style::default().fg(palette::RED)),
+            Span::raw(" "),
+            Span::styled(count_text, Style::default().fg(Color::White)),
+        ])),
+        area,
+    );
+}
 
-    let timeline_line = Line::from(Span::styled(timeline, Style::default().fg(Color::DarkGray)));
-    frame.render_widget(Paragraph::new(timeline_line), timeline_area);
+fn build_future_sparkline(buckets: &[u64], width: u16, warning_days: u32) -> Line<'static> {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-    // Build markers showing where files expire, with dot size indicating count
-    let marker_width = usize::from(marker_area.width);
-
-    if marker_width == 0 {
-        return;
-    }
-
-    // Scale factor: marker_width positions for TIMELINE_DAYS+1 buckets
-    #[allow(clippy::cast_precision_loss)]
-    let scale = marker_width as f64 / (TIMELINE_DAYS + 1) as f64;
-
-    // Build marker line: each position holds (char, color) or space
-    let mut marker_chars: Vec<(char, Color)> = vec![(' ', Color::Reset); marker_width];
-
-    for (day, &count) in buckets.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
-
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let x = ((day as f64 * scale) as usize).min(marker_width.saturating_sub(1));
-
-        // Color by urgency: red for overdue, yellow for warning period, green for safe
-        let warning_days = config.warning_days as usize;
-        let color = if day == 0 {
-            palette::RED
-        } else if day <= warning_days {
-            palette::YELLOW
-        } else {
-            palette::GREEN
-        };
-
-        // Use dot size to indicate magnitude
-        // ·  (U+00B7 middle dot) for 1-2 files
-        // •  (U+2022 bullet) for 3-9 files
-        // ●  (U+25CF black circle) for 10+ files
-        let symbol = if count >= 10 {
-            '●'
-        } else if count >= 3 {
-            '•'
-        } else {
-            '·'
-        };
-
-        marker_chars[x] = (symbol, color);
+    if width == 0 || buckets.is_empty() {
+        return Line::from(String::new());
     }
 
-    // Convert to spans, grouping consecutive same-color characters
-    let mut spans: Vec<Span> = Vec::new();
-    let mut current_color = Color::Reset;
-    let mut current_text = String::new();
-
-    for (ch, color) in marker_chars {
-        if color != current_color {
-            if !current_text.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut current_text),
-                    Style::default().fg(current_color),
-                ));
-            }
-            current_color = color;
-        }
-        current_text.push(ch);
-    }
-    if !current_text.is_empty() {
-        spans.push(Span::styled(
-            current_text,
-            Style::default().fg(current_color),
+    let samples = sample_future_buckets(buckets, usize::from(width));
+    let max_value = samples.iter().map(|(count, _)| *count).max().unwrap_or(0);
+    if max_value == 0 {
+        return Line::from(Span::styled(
+            "·".repeat(usize::from(width)),
+            Style::default().fg(Color::DarkGray),
         ));
     }
 
-    let marker_line = Line::from(spans);
-    frame.render_widget(Paragraph::new(marker_line), marker_area);
+    let spans: Vec<Span<'static>> = samples
+        .into_iter()
+        .map(|(count, day)| {
+            let idx = usize::try_from(
+                count
+                    .saturating_mul(u64::try_from(BLOCKS.len()).unwrap_or(8))
+                    .saturating_sub(1)
+                    / max_value,
+            )
+            .unwrap_or(0)
+            .min(BLOCKS.len().saturating_sub(1));
+            let color = if day == 0 {
+                palette::RED
+            } else if day <= usize::try_from(warning_days).unwrap_or(0) {
+                palette::YELLOW
+            } else {
+                palette::GREEN
+            };
+            Span::styled(BLOCKS[idx].to_string(), Style::default().fg(color))
+        })
+        .collect();
 
-    // Build summary line (centered, with blank line above for spacing)
-    #[allow(clippy::cast_sign_loss)]
-    let total_bytes_u64 = total_bytes.max(0) as u64;
-    let summary_text = format!(
-        "{} files ({}) expire in next 30 days",
-        total_expiring,
-        format_bytes(total_bytes_u64)
-    );
-    let summary_paragraph = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            summary_text,
-            Style::default().fg(Color::White),
-        )),
-    ])
-    .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(summary_paragraph, summary_area);
+    Line::from(spans)
+}
+
+fn sample_future_buckets(buckets: &[u64], width: usize) -> Vec<(u64, usize)> {
+    (0..width)
+        .map(|column| {
+            let start = column.saturating_mul(buckets.len()) / width;
+            let end = ((column + 1).saturating_mul(buckets.len()) / width).max(start + 1);
+            let slice = &buckets[start..end.min(buckets.len())];
+            let count = slice.iter().copied().sum::<u64>();
+            let day = slice
+                .iter()
+                .enumerate()
+                .find(|(_, count)| **count > 0)
+                .map_or(start, |(offset, _)| start + offset);
+            (count, day.min(buckets.len().saturating_sub(1)))
+        })
+        .collect()
+}
+
+fn pluralize_files(count: u64) -> String {
+    format!("{count} file{}", if count == 1 { "" } else { "s" })
 }
 
 /// Render the quota target widget (pie chart with text above, or placeholder message).
