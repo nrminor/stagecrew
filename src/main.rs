@@ -74,8 +74,19 @@ async fn main() -> Result<()> {
             app.run(&app_config, &db, &db_path, &paths).await?;
         }
 
-        Command::Daemon => {
-            let daemon = daemon::Daemon::new(app_config);
+        Command::Daemon {
+            interval,
+            once,
+            scan_only,
+            dry_run,
+        } => {
+            let opts = daemon::DaemonOptions {
+                interval_hours: interval,
+                once: once || dry_run,
+                scan_only: scan_only || dry_run,
+                dry_run,
+            };
+            let daemon = daemon::Daemon::new(app_config, opts);
             daemon.run().await?;
         }
 

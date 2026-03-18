@@ -44,8 +44,37 @@ pub enum Command {
     #[default]
     Tui,
 
-    /// Run the background scanner and removal daemon
-    Daemon,
+    /// Run the background scanner and removal daemon.
+    ///
+    /// The daemon periodically scans all tracked directories, transitions
+    /// expired files to pending or approved status based on configuration,
+    /// and executes approved removals. It runs with the current user's
+    /// permissions and never uses sudo or elevated privileges.
+    ///
+    /// Files are never removed without explicit approval (unless `auto_remove`
+    /// is enabled in configuration). The daemon logs all actions to the audit
+    /// trail for accountability.
+    ///
+    /// Stop the daemon gracefully with Ctrl+C or SIGTERM.
+    Daemon {
+        /// Override the scan interval (in hours) from configuration.
+        #[arg(long, value_name = "HOURS")]
+        interval: Option<u32>,
+
+        /// Run one scan/removal cycle and exit instead of looping.
+        #[arg(long)]
+        once: bool,
+
+        /// Scan and transition files but skip the removal step.
+        /// Useful for observing what would happen without deleting anything.
+        #[arg(long)]
+        scan_only: bool,
+
+        /// Scan and report what would be removed, but do not modify any files
+        /// or database state. Implies --once.
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// Show current status (used by shell hook)
     ///
