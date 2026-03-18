@@ -197,7 +197,7 @@ impl Database {
                 timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 user TEXT NOT NULL,
                 action TEXT NOT NULL
-                    CHECK (action IN ('approve', 'unapprove', 'defer', 'ignore', 'unignore', 'remove', 'scan', 'config_change')),
+                    CHECK (action IN ('approve', 'unapprove', 'defer', 'ignore', 'unignore', 'remove', 'scan', 'undo', 'config_change')),
                 target_path TEXT,
                 details TEXT,
                 entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL,
@@ -758,6 +758,38 @@ impl Database {
             return Err(Error::Config(format!("Entry with id {entry_id} not found")));
         }
 
+        Ok(())
+    }
+
+    /// Restore an entry to a previous state for undo operations.
+    ///
+    /// Sets the status, `countdown_start`, and `deferred_until` back to the
+    /// values captured before the original action was applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry doesn't exist or the operation fails.
+    pub fn restore_entry_state(
+        &self,
+        entry_id: i64,
+        status: &str,
+        countdown_start: Option<i64>,
+        deferred_until: Option<i64>,
+    ) -> Result<()> {
+        let rows = self.conn.execute(
+            "UPDATE entries
+             SET status = ?1,
+                 countdown_start = ?2,
+                 deferred_until = ?3,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = ?4",
+            rusqlite::params![status, countdown_start, deferred_until, entry_id],
+        )?;
+        if rows == 0 {
+            return Err(crate::error::Error::Config(format!(
+                "Entry {entry_id} not found for undo"
+            )));
+        }
         Ok(())
     }
 

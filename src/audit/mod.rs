@@ -20,6 +20,7 @@ pub enum AuditAction {
     Unignore,
     Remove,
     Scan,
+    Undo,
     // Allow: ConfigChange variant is part of the public API for future config audit logging.
     // Not yet implemented but reserved for tracking configuration changes.
     #[allow(dead_code)]
@@ -36,6 +37,7 @@ impl AuditAction {
             Self::Unignore => "unignore",
             Self::Remove => "remove",
             Self::Scan => "scan",
+            Self::Undo => "undo",
             Self::ConfigChange => "config_change",
         }
     }
@@ -564,6 +566,7 @@ mod tests {
             (AuditAction::Ignore, "ignore"),
             (AuditAction::Remove, "remove"),
             (AuditAction::Scan, "scan"),
+            (AuditAction::Undo, "undo"),
             (AuditAction::ConfigChange, "config_change"),
         ];
 
@@ -849,6 +852,7 @@ mod tests {
         assert_eq!(AuditAction::Unignore.as_str(), "unignore");
         assert_eq!(AuditAction::Remove.as_str(), "remove");
         assert_eq!(AuditAction::Scan.as_str(), "scan");
+        assert_eq!(AuditAction::Undo.as_str(), "undo");
         assert_eq!(AuditAction::ConfigChange.as_str(), "config_change");
     }
 

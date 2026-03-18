@@ -101,6 +101,28 @@ impl TuiContext<'_> {
     }
 }
 
+/// A single reversible status change that can be undone.
+#[derive(Debug, Clone)]
+pub(crate) struct UndoEntry {
+    /// Database entry ID.
+    pub entry_id: i64,
+    /// Status before the action was applied.
+    pub status_before: String,
+    /// The `deferred_until` value before the action, if any.
+    pub deferred_until_before: Option<i64>,
+    /// The `countdown_start` value before the action, if any.
+    pub countdown_start_before: Option<i64>,
+}
+
+/// A reversible action that can be undone as a single unit.
+#[derive(Debug, Clone)]
+pub(crate) struct UndoAction {
+    /// Human-readable description of what was done.
+    pub description: String,
+    /// The individual entry changes to reverse.
+    pub entries: Vec<UndoEntry>,
+}
+
 /// An entry awaiting user confirmation for a pending action (delete, ignore, approve, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingEntry {
@@ -389,6 +411,9 @@ pub struct App {
     /// Cached nearest expiration unix timestamp for the countdown widget.
     /// Refreshed on scan completion and status changes.
     pub(crate) nearest_expiration: Option<i64>,
+
+    /// In-memory stack of reversible actions for undo.
+    pub(crate) undo_stack: Vec<UndoAction>,
 }
 
 impl App {
@@ -802,6 +827,7 @@ impl App {
             ensure_cursor_visible: false,
             external_open_request: None,
             nearest_expiration: None,
+            undo_stack: Vec::new(),
         }
     }
 

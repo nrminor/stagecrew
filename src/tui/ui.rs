@@ -2309,7 +2309,7 @@ fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratat
                     "remove" => &gradient.red,
                     "defer" => &gradient.green,
                     "ignore" => &gradient.yellow,
-                    "approve" | "unapprove" | "unignore" => &gradient.text,
+                    "approve" | "unapprove" | "unignore" | "undo" => &gradient.text,
                     _ => &gradient.gray,
                 };
                 let color = if should_fade { base[fade_pct] } else { base[0] };
@@ -2474,6 +2474,8 @@ Actions (on focused file or all selected files):
   r           Defer file(s) expiration (reset clock, prompt for days)
   i           Permanently ignore file(s)
   x           Approve file(s) for daemon removal
+  I           Unignore file(s) (restore from ignored)
+  u           Undo last reversible action
   e           Open in $VISUAL/$EDITOR (suspends TUI)
   o           Open with system viewer (fire-and-forget)";
 
@@ -2699,6 +2701,8 @@ fn context_hints(app: &App) -> (Vec<Hint>, Vec<Hint>) {
                         ("r", "Defer"),
                         ("i", "Ignore"),
                         ("x", "Approve"),
+                        ("I", "Unignore"),
+                        ("u", "Undo"),
                         ("F", "Remove approved"),
                         ("T", "Reset timer"),
                         ("Y", "Dry run"),

@@ -6,7 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::ui::sort_entry_rows;
 use super::{
-    App, FocusPanel, PendingAuditExport, PendingDeletion, PendingEntry, SortMode, TuiContext, View,
+    App, FocusPanel, PendingAuditExport, PendingDeletion, PendingEntry, SortMode, TuiContext,
+    UndoAction, UndoEntry, View,
 };
 use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditExportFormat, AuditService};
 use crate::config::Config;
@@ -244,8 +245,11 @@ impl InputHandler {
             KeyCode::Char('x') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::toggle_entry_approval(app, ctx);
             }
-            KeyCode::Char('u') if app.focus_panel == FocusPanel::MainPanel => {
+            KeyCode::Char('I') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::unignore_entry(app, ctx);
+            }
+            KeyCode::Char('u') if app.focus_panel == FocusPanel::MainPanel => {
+                Self::undo_last_action(app, ctx);
             }
 
             // Open in external application
@@ -870,7 +874,15 @@ impl InputHandler {
                     let details = Some(format!("Deferred for {days} days"));
                     let root_id = app.current_root_id;
 
+                    let mut undo_entries = Vec::new();
+
                     for entry in &deferral.entries {
+                        undo_entries.push(UndoEntry {
+                            entry_id: entry.id,
+                            status_before: "tracked".to_string(),
+                            deferred_until_before: None,
+                            countdown_start_before: None,
+                        });
                         if let Err(e) = ctx.db.defer_entry(entry.id, deferred_until) {
                             tracing::warn!("Failed to defer entry {}: {}", entry.path.display(), e);
                         } else {
@@ -901,6 +913,17 @@ impl InputHandler {
                                 tracing::warn!("Failed to record audit entry for deferral: {}", e);
                             }
                         }
+                    }
+
+                    if !undo_entries.is_empty() {
+                        let count = undo_entries.len();
+                        app.undo_stack.push(UndoAction {
+                            description: format!(
+                                "Deferred {count} entr{} for {days} days",
+                                if count == 1 { "y" } else { "ies" }
+                            ),
+                            entries: undo_entries,
+                        });
                     }
                 }
                 // Clear pending deferral, visual mode, and selection
@@ -995,8 +1018,15 @@ impl InputHandler {
                     let audit = AuditService::new(ctx.db);
                     let user = AuditService::current_user();
                     let root_id = app.current_root_id;
+                    let mut undo_entries = Vec::new();
 
                     for entry in entries {
+                        undo_entries.push(UndoEntry {
+                            entry_id: entry.id,
+                            status_before: "tracked".to_string(),
+                            deferred_until_before: None,
+                            countdown_start_before: None,
+                        });
                         if let Err(e) = ctx.db.update_entry_status(entry.id, "ignored") {
                             tracing::warn!(
                                 "Failed to ignore entry {}: {}",
@@ -1031,6 +1061,17 @@ impl InputHandler {
                             }
                         }
                     }
+
+                    if !undo_entries.is_empty() {
+                        let count = undo_entries.len();
+                        app.undo_stack.push(UndoAction {
+                            description: format!(
+                                "Ignored {count} entr{}",
+                                if count == 1 { "y" } else { "ies" }
+                            ),
+                            entries: undo_entries,
+                        });
+                    }
                 }
                 // Clear pending ignore, visual mode, and selection
                 app.pending_entry_ignore = None;
@@ -1054,6 +1095,9 @@ impl InputHandler {
     /// Pressing `x` on other entries approves them.
     ///
     /// If entries are multi-selected, toggles each selected entry.
+    // Allow: undo capture adds lines but keeping the logic together is clearer
+    // than splitting into sub-functions that would need the same parameters.
+    #[allow(clippy::too_many_lines)]
     fn toggle_entry_approval(app: &mut App, ctx: &TuiContext) {
         // Get entries for current path
         if app.current_path.as_os_str().is_empty() {
@@ -1083,8 +1127,15 @@ impl InputHandler {
 
         let mut approved_count = 0;
         let mut unapproved_count = 0;
+        let mut undo_entries = Vec::new();
 
         for (entry, current_status) in &entries_to_toggle {
+            undo_entries.push(UndoEntry {
+                entry_id: entry.id,
+                status_before: current_status.clone(),
+                deferred_until_before: None,
+                countdown_start_before: None,
+            });
             let (next_status, details) = if current_status == "approved" {
                 unapproved_count += 1;
                 ("tracked", Some("Unapproved (set status to tracked)"))
@@ -1139,6 +1190,21 @@ impl InputHandler {
             }) {
                 tracing::warn!("Failed to record audit entry for approval toggle: {}", e);
             }
+        }
+
+        // Record undo action.
+        if !undo_entries.is_empty() {
+            let desc = match (approved_count, unapproved_count) {
+                (a, 0) => format!("Approved {a} entr{}", if a == 1 { "y" } else { "ies" }),
+                (0, u) => {
+                    format!("Unapproved {u} entr{}", if u == 1 { "y" } else { "ies" })
+                }
+                (a, u) => format!("Toggled approval for {} entries", a + u),
+            };
+            app.undo_stack.push(UndoAction {
+                description: desc.clone(),
+                entries: undo_entries,
+            });
         }
 
         // Clear interaction state and refresh.
@@ -1327,6 +1393,61 @@ impl InputHandler {
         app.status_message_time = Some(std::time::Instant::now());
     }
 
+    /// Undo the most recent reversible action.
+    ///
+    /// Pops the last action from the in-memory undo stack and restores each
+    /// affected entry to its previous state. Records an audit event for the
+    /// undo operation.
+    fn undo_last_action(app: &mut App, ctx: &TuiContext) {
+        let Some(action) = app.undo_stack.pop() else {
+            app.status_message = Some("Nothing to undo".to_string());
+            app.status_message_time = Some(std::time::Instant::now());
+            return;
+        };
+
+        let audit = AuditService::new(ctx.db);
+        let user = AuditService::current_user();
+        let root_id = app.current_root_id;
+        let mut restored = 0u64;
+
+        for undo_entry in &action.entries {
+            if let Err(e) = ctx.db.restore_entry_state(
+                undo_entry.entry_id,
+                &undo_entry.status_before,
+                undo_entry.countdown_start_before,
+                undo_entry.deferred_until_before,
+            ) {
+                tracing::warn!("Failed to undo entry {}: {e}", undo_entry.entry_id);
+                continue;
+            }
+            restored += 1;
+        }
+
+        let details = format!("Undid: {}", action.description);
+        if let Err(e) = audit.record_event(&AuditEvent {
+            user: &user,
+            actor_source: AuditActorSource::Tui,
+            action: AuditAction::Undo,
+            target_path: None,
+            details: Some(&details),
+            entry_id: None,
+            root_id,
+            status_before: None,
+            status_after: None,
+            outcome: Some("undone"),
+        }) {
+            tracing::warn!("Failed to record undo audit: {e}");
+        }
+
+        app.refresh_stats(ctx);
+        app.status_message = Some(format!(
+            "Undid: {} ({restored} entr{} restored)",
+            action.description,
+            if restored == 1 { "y" } else { "ies" }
+        ));
+        app.status_message_time = Some(std::time::Instant::now());
+    }
+
     /// Reset the countdown timer for all entries under the current root.
     ///
     /// Sets `countdown_start` to now for all non-ignored, non-removed entries,
@@ -1386,6 +1507,8 @@ impl InputHandler {
     ///
     /// This is a direct action without confirmation since it's non-destructive.
     /// Works on selected entries if any, otherwise the currently focused entry.
+    // Allow: undo capture adds lines but keeping the logic together is clearer.
+    #[allow(clippy::too_many_lines)]
     fn unignore_entry(app: &mut App, ctx: &TuiContext) {
         // Get entries for current path
         if app.current_path.as_os_str().is_empty() {
@@ -1459,6 +1582,7 @@ impl InputHandler {
         let audit = AuditService::new(ctx.db);
         let user = AuditService::current_user();
         let root_id = app.current_root_id;
+        let mut undo_entries = Vec::new();
 
         let mut success_count = 0;
         for entry in &entries_to_unignore {
@@ -1468,6 +1592,12 @@ impl InputHandler {
                 app.status_message_time = Some(std::time::Instant::now());
             } else {
                 success_count += 1;
+                undo_entries.push(UndoEntry {
+                    entry_id: entry.id,
+                    status_before: "ignored".to_string(),
+                    deferred_until_before: None,
+                    countdown_start_before: None,
+                });
                 // Propagate to children if this is a directory
                 if entry.is_dir
                     && let Err(e) = ctx.db.update_entries_by_path_prefix(&entry.path, "tracked")
@@ -1496,6 +1626,15 @@ impl InputHandler {
         }
 
         if success_count > 0 {
+            if !undo_entries.is_empty() {
+                app.undo_stack.push(UndoAction {
+                    description: format!(
+                        "Unignored {success_count} entr{}",
+                        if success_count == 1 { "y" } else { "ies" }
+                    ),
+                    entries: undo_entries,
+                });
+            }
             app.status_message = Some(format!("Unignored {success_count} entry/entries"));
             app.status_message_time = Some(std::time::Instant::now());
             app.refresh_stats(ctx);
@@ -3960,5 +4099,86 @@ mod tests {
 
         // Should remain empty since we're in sidebar
         assert!(app.selected_entries.is_empty());
+    }
+
+    #[test]
+    fn u_key_undoes_approval() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        let (root_id, file_ids) = setup_with_files(&db);
+        app.current_root_id = Some(root_id);
+        app.current_path = PathBuf::from("/test/dir");
+        app.focus_panel = FocusPanel::MainPanel;
+        app.entry_selected_index = 0;
+
+        // Approve an entry
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
+        let entry = db
+            .list_entries_by_parent(std::path::Path::new("/test/dir"))
+            .expect("should list entries")
+            .into_iter()
+            .find(|e| e.id == file_ids[0])
+            .expect("entry should exist");
+        assert_eq!(entry.status, "approved");
+        assert!(!app.undo_stack.is_empty());
+
+        // Undo
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('u')));
+        let entry = db
+            .list_entries_by_parent(std::path::Path::new("/test/dir"))
+            .expect("should list entries")
+            .into_iter()
+            .find(|e| e.id == file_ids[0])
+            .expect("entry should exist");
+        assert_eq!(
+            entry.status, "tracked",
+            "Undo should restore tracked status"
+        );
+        assert!(app.undo_stack.is_empty());
+    }
+
+    #[test]
+    fn u_key_with_empty_stack_shows_message() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        app.focus_panel = FocusPanel::MainPanel;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('u')));
+
+        assert_eq!(app.status_message.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn capital_i_unignores_entry() {
+        let (db, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let ctx = test_context(&db, &app_config);
+
+        let (root_id, file_ids) = setup_with_files(&db);
+        db.update_entry_status(file_ids[0], "ignored")
+            .expect("Failed to ignore entry");
+
+        app.current_root_id = Some(root_id);
+        app.current_path = PathBuf::from("/test/dir");
+        app.focus_panel = FocusPanel::MainPanel;
+        // Use multi-select to target the specific entry by ID
+        app.selected_entries.insert(file_ids[0]);
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('I')));
+
+        let entry = db
+            .list_entries_by_parent(std::path::Path::new("/test/dir"))
+            .expect("should list entries")
+            .into_iter()
+            .find(|e| e.id == file_ids[0])
+            .expect("entry should exist");
+        assert_eq!(entry.status, "tracked", "I should unignore the entry");
     }
 }
