@@ -395,6 +395,7 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use tempfile::TempDir;
+    use tracing_test::traced_test;
 
     /// Helper to create a temporary database for testing.
     fn temp_database() -> (Database, TempDir) {
@@ -809,5 +810,357 @@ mod tests {
         assert_eq!(AuditAction::Remove.as_str(), "remove");
         assert_eq!(AuditAction::Scan.as_str(), "scan");
         assert_eq!(AuditAction::ConfigChange.as_str(), "config_change");
+    }
+
+    fn seed_audit_entries(audit: &AuditService<'_>) {
+        let root_path = Path::new("/data/project");
+        audit
+            .record("alice", AuditAction::Approve, Some(root_path), None, None)
+            .expect("failed to seed approve entry");
+        audit
+            .record(
+                "bob",
+                AuditAction::Defer,
+                Some(Path::new("/data/project/file with spaces.txt")),
+                Some("Deferred for 30 days"),
+                None,
+            )
+            .expect("failed to seed defer entry");
+        audit
+            .record("charlie", AuditAction::Remove, None, None, None)
+            .expect("failed to seed remove entry");
+    }
+
+    #[test]
+    fn export_jsonl_produces_valid_json_lines() {
+        let (db, temp_dir) = temp_database();
+        let audit = AuditService::new(&db);
+        seed_audit_entries(&audit);
+
+        let export_path = temp_dir.path().join("audit.jsonl");
+        let count = audit
+            .export_recent_to_path(100, AuditExportFormat::Jsonl, &export_path)
+            .expect("JSONL export should succeed");
+        assert_eq!(count, 3);
+
+        let contents = std::fs::read_to_string(&export_path).expect("should read export file");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 3, "should have one JSON line per entry");
+
+        for line in &lines {
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).expect("each line should be valid JSON");
+            assert!(parsed.get("id").is_some(), "should have id field");
+            assert!(parsed.get("timestamp").is_some(), "should have timestamp");
+            assert!(parsed.get("user").is_some(), "should have user field");
+            assert!(parsed.get("action").is_some(), "should have action field");
+        }
+
+        let first: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("first line should parse");
+        assert_eq!(
+            first["action"], "remove",
+            "most recent entry should be first"
+        );
+        assert!(first["target_path"].is_null(), "remove entry had no path");
+    }
+
+    #[test]
+    fn export_csv_produces_valid_csv_with_header() {
+        let (db, temp_dir) = temp_database();
+        let audit = AuditService::new(&db);
+        seed_audit_entries(&audit);
+
+        let export_path = temp_dir.path().join("audit.csv");
+        let count = audit
+            .export_recent_to_path(100, AuditExportFormat::Csv, &export_path)
+            .expect("CSV export should succeed");
+        assert_eq!(count, 3);
+
+        let contents = std::fs::read_to_string(&export_path).expect("should read export file");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 4, "should have header + 3 data rows");
+        assert_eq!(
+            lines[0], "id,timestamp,user,action,target_path,details,entry_id",
+            "first line should be CSV header"
+        );
+    }
+
+    #[test]
+    fn export_csv_handles_special_characters_in_fields() {
+        let (db, temp_dir) = temp_database();
+        let audit = AuditService::new(&db);
+
+        audit
+            .record(
+                "user",
+                AuditAction::Defer,
+                Some(Path::new("/data/file,with\"quotes.txt")),
+                Some("details with, commas and \"quotes\""),
+                None,
+            )
+            .expect("should record entry with special chars");
+
+        let export_path = temp_dir.path().join("special.csv");
+        audit
+            .export_recent_to_path(100, AuditExportFormat::Csv, &export_path)
+            .expect("CSV export with special chars should succeed");
+
+        let mut reader = csv::Reader::from_path(&export_path).expect("should open CSV");
+        let records: Vec<csv::StringRecord> = reader
+            .records()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("should parse all CSV records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(&records[0][3], "defer");
+        assert!(
+            records[0][4].contains("quotes"),
+            "path with special chars should round-trip through CSV"
+        );
+    }
+
+    #[test]
+    fn export_empty_audit_log_produces_valid_output() {
+        let (db, temp_dir) = temp_database();
+        let audit = AuditService::new(&db);
+
+        let jsonl_path = temp_dir.path().join("empty.jsonl");
+        let count = audit
+            .export_recent_to_path(100, AuditExportFormat::Jsonl, &jsonl_path)
+            .expect("empty JSONL export should succeed");
+        assert_eq!(count, 0);
+        let contents = std::fs::read_to_string(&jsonl_path).expect("should read file");
+        assert!(contents.is_empty(), "empty JSONL should produce empty file");
+
+        let csv_path = temp_dir.path().join("empty.csv");
+        let count = audit
+            .export_recent_to_path(100, AuditExportFormat::Csv, &csv_path)
+            .expect("empty CSV export should succeed");
+        assert_eq!(count, 0);
+        let contents = std::fs::read_to_string(&csv_path).expect("should read file");
+        assert!(
+            contents.lines().count() <= 1,
+            "empty CSV should have at most a header row"
+        );
+    }
+
+    #[test]
+    fn export_jsonl_preserves_null_optional_fields() {
+        let (db, temp_dir) = temp_database();
+        let audit = AuditService::new(&db);
+
+        audit
+            .record("user", AuditAction::Scan, None, None, None)
+            .expect("should record entry with null optionals");
+
+        let export_path = temp_dir.path().join("nulls.jsonl");
+        audit
+            .export_recent_to_path(100, AuditExportFormat::Jsonl, &export_path)
+            .expect("JSONL export should succeed");
+
+        let contents = std::fs::read_to_string(&export_path).expect("should read file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(contents.trim()).expect("should parse JSON");
+        assert!(parsed["target_path"].is_null());
+        assert!(parsed["details"].is_null());
+        assert!(parsed["entry_id"].is_null());
+    }
+
+    #[test]
+    fn export_format_next_cycles_correctly() {
+        assert_eq!(AuditExportFormat::Jsonl.next(), AuditExportFormat::Csv);
+        assert_eq!(AuditExportFormat::Csv.next(), AuditExportFormat::Jsonl);
+    }
+
+    /// Helper to create a root and entry for tests that need valid foreign keys.
+    fn seed_root_and_entry(db: &Database) -> (i64, i64) {
+        let root_id = db
+            .insert_root(Path::new("/data"))
+            .expect("failed to insert root");
+        let entry_id = db
+            .upsert_entry(
+                root_id,
+                Path::new("/data/file.txt"),
+                Path::new("/data"),
+                false,
+                1024,
+                Some(1_700_000_000),
+            )
+            .expect("failed to insert entry");
+        (root_id, entry_id)
+    }
+
+    #[test]
+    #[traced_test]
+    fn record_event_writes_db_row_and_emits_tracing_event() {
+        let (db, _temp_dir) = temp_database();
+        let (root_id, entry_id) = seed_root_and_entry(&db);
+        let audit = AuditService::new(&db);
+
+        audit
+            .record_event(&AuditEvent {
+                user: "testuser",
+                actor_source: AuditActorSource::Tui,
+                action: AuditAction::Approve,
+                target_path: Some(Path::new("/data/file.txt")),
+                details: Some("approved for removal"),
+                entry_id: Some(entry_id),
+                root_id: Some(root_id),
+                status_before: Some("tracked"),
+                status_after: Some("approved"),
+                outcome: Some("approved"),
+            })
+            .expect("record_event should succeed");
+
+        // Verify DB row
+        let entries = audit.list_recent(10).expect("should list entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].user, "testuser");
+        assert_eq!(entries[0].action, "approve");
+        assert_eq!(entries[0].target_path, Some("/data/file.txt".to_string()));
+        assert_eq!(entries[0].details, Some("approved for removal".to_string()));
+        assert_eq!(entries[0].entry_id, Some(entry_id));
+
+        // Verify structured tracing event was emitted with matching fields.
+        // tracing-test captures the formatted output which quotes string values.
+        assert!(logs_contain("audit_event"));
+        assert!(logs_contain("audit_action=\"approve\""));
+        assert!(logs_contain("audit_user=\"testuser\""));
+        assert!(logs_contain("audit_actor_source=\"tui\""));
+        assert!(logs_contain("audit_status_before=\"tracked\""));
+        assert!(logs_contain("audit_status_after=\"approved\""));
+        assert!(logs_contain("audit_outcome=\"approved\""));
+    }
+
+    #[test]
+    #[traced_test]
+    fn record_event_blocked_outcome_emits_warn_level() {
+        let (db, _temp_dir) = temp_database();
+        let (root_id, entry_id) = seed_root_and_entry(&db);
+        let audit = AuditService::new(&db);
+
+        audit
+            .record_event(&AuditEvent {
+                user: "daemon",
+                actor_source: AuditActorSource::Daemon,
+                action: AuditAction::Remove,
+                target_path: Some(Path::new("/data/file.txt")),
+                details: Some("Blocked: permission denied"),
+                entry_id: Some(entry_id),
+                root_id: Some(root_id),
+                status_before: Some("approved"),
+                status_after: Some("blocked"),
+                outcome: Some("blocked"),
+            })
+            .expect("record_event with blocked outcome should succeed");
+
+        // Verify DB row
+        let entries = audit.list_recent(10).expect("should list entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "remove");
+        assert_eq!(
+            entries[0].details,
+            Some("Blocked: permission denied".to_string())
+        );
+
+        // Verify tracing event was emitted at WARN level with correct fields
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain("audit_event"));
+        assert!(logs_contain("audit_action=\"remove\""));
+        assert!(logs_contain("audit_actor_source=\"daemon\""));
+        assert!(logs_contain("audit_outcome=\"blocked\""));
+    }
+
+    #[test]
+    #[traced_test]
+    fn record_event_scanner_transition_emits_tracing_event() {
+        let (db, _temp_dir) = temp_database();
+        let (_root_id, entry_id) = seed_root_and_entry(&db);
+        let audit = AuditService::new(&db);
+
+        audit
+            .record_event(&AuditEvent {
+                user: "scanner",
+                actor_source: AuditActorSource::Scanner,
+                action: AuditAction::Scan,
+                target_path: Some(Path::new("/data/file.txt")),
+                details: Some("Expired, pending approval for removal"),
+                entry_id: Some(entry_id),
+                root_id: None,
+                status_before: Some("tracked"),
+                status_after: Some("pending"),
+                outcome: Some("pending"),
+            })
+            .expect("record_event for scanner transition should succeed");
+
+        // Verify DB row
+        let entries = audit.list_recent(10).expect("should list entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "scan");
+        assert_eq!(entries[0].target_path, Some("/data/file.txt".to_string()));
+
+        // Verify tracing event was emitted with scanner source
+        assert!(logs_contain("audit_event"));
+        assert!(logs_contain("audit_action=\"scan\""));
+        assert!(logs_contain("audit_actor_source=\"scanner\""));
+        assert!(logs_contain("audit_status_before=\"tracked\""));
+        assert!(logs_contain("audit_status_after=\"pending\""));
+    }
+
+    #[test]
+    fn record_event_blocked_outcome_writes_db_row() {
+        let (db, _temp_dir) = temp_database();
+        let (root_id, entry_id) = seed_root_and_entry(&db);
+        let audit = AuditService::new(&db);
+
+        audit
+            .record_event(&AuditEvent {
+                user: "daemon",
+                actor_source: AuditActorSource::Daemon,
+                action: AuditAction::Remove,
+                target_path: Some(Path::new("/data/file.txt")),
+                details: Some("Blocked: permission denied"),
+                entry_id: Some(entry_id),
+                root_id: Some(root_id),
+                status_before: Some("approved"),
+                status_after: Some("blocked"),
+                outcome: Some("blocked"),
+            })
+            .expect("record_event with blocked outcome should succeed");
+
+        let entries = audit.list_recent(10).expect("should list entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "remove");
+        assert_eq!(
+            entries[0].details,
+            Some("Blocked: permission denied".to_string())
+        );
+    }
+
+    #[test]
+    fn record_event_scanner_transition_writes_db_row() {
+        let (db, _temp_dir) = temp_database();
+        let (_root_id, entry_id) = seed_root_and_entry(&db);
+        let audit = AuditService::new(&db);
+
+        audit
+            .record_event(&AuditEvent {
+                user: "scanner",
+                actor_source: AuditActorSource::Scanner,
+                action: AuditAction::Scan,
+                target_path: Some(Path::new("/data/file.txt")),
+                details: Some("Expired, pending approval for removal"),
+                entry_id: Some(entry_id),
+                root_id: None,
+                status_before: Some("tracked"),
+                status_after: Some("pending"),
+                outcome: Some("pending"),
+            })
+            .expect("record_event for scanner transition should succeed");
+
+        let entries = audit.list_recent(10).expect("should list entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "scan");
+        assert_eq!(entries[0].target_path, Some("/data/file.txt".to_string()));
     }
 }
