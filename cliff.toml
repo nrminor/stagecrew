@@ -1,0 +1,32 @@
+[changelog]
+header = ""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }}\
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = false
+filter_unconventional = false
+split_commits = false
+commit_parsers = [
+    { message = "^[Ff]ix", group = "Bug Fixes" },
+    { message = "^[Aa]dd", group = "Features" },
+    { message = "^[Ii]mprove", group = "Improvements" },
+    { message = "^[Ee]xpand", group = "Improvements" },
+    { message = "^[Mm]ake", group = "Improvements" },
+    { message = "^[Aa]dapt", group = "Improvements" },
+    { message = "^[Aa]lign", group = "Improvements" },
+    { message = "^[Pp]olish", group = "Improvements" },
+    { message = "^[Rr]efine", group = "Improvements" },
+    { message = "^[Ss]tart", group = "Features" },
+    { message = "^[Bb]uild", group = "Features" },
+    { message = "^[Pp]repare", group = "Release" },
+    { message = "^[Ii]ntroduce", group = "Features" },
+    { body = ".*", group = "Other" },
+]

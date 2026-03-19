@@ -13,30 +13,50 @@ jobs:
 
   create-release:
     name: Create Release
-    needs: [ci-stable]  # Only create release if all tests pass
+    needs: [ci-stable]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Generate changelog
+        run: git-cliff --config cliff.toml --latest --strip header -o CHANGES.md
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Generate JSON schema
+        run: just generate-schema
+
       - name: Create Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Check if this is a pre-release (contains hyphen after version number)
+          PRERELEASE_FLAG=""
           if [[ "${{ github.ref_name }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
-            echo "Creating pre-release for ${{ github.ref_name }}"
-            gh release create "${{ github.ref_name }}" \
-              --title "Release ${{ github.ref_name }}" \
-              --notes "## Pre-Release ${{ github.ref_name }}" \
-              --prerelease
-          else
-            echo "Creating stable release for ${{ github.ref_name }}"
-            gh release create "${{ github.ref_name }}" \
-              --title "Release ${{ github.ref_name }}" \
-              --notes "## Release ${{ github.ref_name }}"
+            PRERELEASE_FLAG="--prerelease"
           fi
+          gh release create "${{ github.ref_name }}" \
+            --title "Release ${{ github.ref_name }}" \
+            --notes-file CHANGES.md \
+            $PRERELEASE_FLAG
+
+      - name: Upload schema asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" stagecrew.schema.json --clobber
 
   build-release:
     name: Build ${{ matrix.target }}
@@ -64,19 +84,11 @@ jobs:
             use_cross: true
           
           # Native macOS builds
-          - os: macos-13  # Intel
+          - os: macos-14  # Intel
             target: x86_64-apple-darwin
             use_cross: false
           - os: macos-latest  # ARM
             target: aarch64-apple-darwin
-            use_cross: false
-          
-          # Native Windows builds
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            use_cross: false
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
             use_cross: false
 
     steps:
@@ -110,22 +122,12 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }}
       
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../stagecrew-${{ matrix.target }}.tar.gz stagecrew
           cd ../../../
           echo "ASSET_PATH=stagecrew-${{ matrix.target }}.tar.gz" >> $GITHUB_ENV
-      
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cd target/${{ matrix.target }}/release
-          Compress-Archive -Path stagecrew.exe -DestinationPath ../../../stagecrew-${{ matrix.target }}.zip
-          cd ../../../
-          echo "ASSET_PATH=stagecrew-${{ matrix.target }}.zip" >> $env:GITHUB_ENV
       
       - name: Upload Release Asset
         env:

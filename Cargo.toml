@@ -2,6 +2,14 @@
 name = "stagecrew"
 version = "0.1.0"
 edition = "2024"
+description = "Disk usage management for shared or staging filesystems with automatic cleanup policies"
+license = "MIT"
+repository = "https://github.com/nrminor/stagecrew"
+homepage = "https://github.com/nrminor/stagecrew"
+documentation = "https://docs.rs/stagecrew"
+readme = "README.md"
+keywords = ["hpc", "disk-usage", "tui", "filesystem", "cleanup"]
+categories = ["command-line-utilities", "filesystem"]
 
 [profile.dev]
 incremental = true
@@ -44,7 +52,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 trash = "5.2.5"
 tui-piechart = "=0.2.8"
-unicode-plot = { git = "https://github.com/nrminor/youplot-rs", version = "0.1.0" }
+unicode-plot = "0.1.0"
 xdg = "3.0.0"
 
 [dev-dependencies]
