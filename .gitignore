@@ -16,6 +16,10 @@
 !/INSTALL.sh
 !/cliff.toml
 
+# === Allowed: static assets ===
+!/assets
+!/assets/demo.png
+
 # === Allowed: Agent configuration ===
 !/.agents
 !/.agents/prd.json

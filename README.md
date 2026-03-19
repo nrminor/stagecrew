@@ -6,6 +6,8 @@ Stagecrew is a disk usage management tool designed for shared HPC staging filesy
 
 Stagecrew enforces a removal-by-default policy. Files that haven't been modified within a configurable expiration period (default 90 days) are flagged for removal. Users can review pending removals through an interactive terminal interface, approve them, defer them to reset the clock, or permanently ignore specific paths. All actions are logged with timestamps and user identity for accountability.
 
+![Stagecrew TUI](assets/demo.png)
+
 ## Installation
 
 The easiest way to install stagecrew is with the install script:
