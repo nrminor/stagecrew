@@ -782,7 +782,12 @@ fn render_lifecycle_widget(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
-    let block = Block::default().borders(Borders::ALL).title("LIFECYCLE");
+    let title = if app.loading.root_entries {
+        "LIFECYCLE ..."
+    } else {
+        "LIFECYCLE"
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -894,9 +899,12 @@ fn render_expiration_timeline(
 ) {
     const TIMELINE_DAYS: usize = 30;
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("REMOVAL TIMELINE");
+    let title = if app.loading.root_entries {
+        "REMOVAL TIMELINE ..."
+    } else {
+        "REMOVAL TIMELINE"
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let content = inner.inner(Margin {
@@ -1672,9 +1680,14 @@ fn render_roots_list(app: &mut App, frame: &mut Frame, area: ratatui::layout::Re
         })
         .collect();
 
-    // Empty state
+    // Empty state (or loading)
     if rows.is_empty() {
-        let empty_text = Paragraph::new("No tracked paths.\n\nRun 'stagecrew add PATH'")
+        let msg = if app.loading.roots {
+            "Loading..."
+        } else {
+            "No tracked paths.\n\nRun 'stagecrew add PATH'"
+        };
+        let empty_text = Paragraph::new(msg)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -1712,20 +1725,28 @@ fn render_main_entry_panel(
     // Get the current path for browsing
     let current_path = app.current_path();
 
-    // If current_path is empty, show a message to select a root
+    // If current_path is empty, show a message to select a root (or loading)
     if current_path.as_os_str().is_empty() {
-        let message = Paragraph::new(
-            "Select a root from the sidebar\n\n(Use j/k to navigate, Tab to switch panels)",
-        )
-        .block(Block::default().borders(Borders::ALL).title("ENTRIES"))
-        .style(Style::default().fg(Color::DarkGray));
+        let msg = if app.loading.roots {
+            "Loading..."
+        } else {
+            "Select a root from the sidebar\n\n(Use j/k to navigate, Tab to switch panels)"
+        };
+        let message = Paragraph::new(msg)
+            .block(Block::default().borders(Borders::ALL).title("ENTRIES"))
+            .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(message, area);
         return;
     }
 
-    // Empty state
+    // Empty state (or loading)
     if app.dir_entries.is_empty() {
-        let empty_text = Paragraph::new("No entries in this directory")
+        let msg = if app.loading.dir_entries {
+            "Loading..."
+        } else {
+            "No entries in this directory"
+        };
+        let empty_text = Paragraph::new(msg)
             .block(Block::default().borders(Borders::ALL).title("ENTRIES"))
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty_text, area);
@@ -2262,9 +2283,14 @@ fn render_audit_log(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rec
             .min(app.audit_entries.len() - 1)
     };
 
-    // Handle empty state
+    // Handle empty state (or loading)
     if app.audit_entries.is_empty() {
-        let empty_text = Paragraph::new("No audit entries found.\n\nPress 'q' or Esc to go back")
+        let msg = if app.loading.audit_entries {
+            "Loading..."
+        } else {
+            "No audit entries found.\n\nPress 'q' or Esc to go back"
+        };
+        let empty_text = Paragraph::new(msg)
             .block(Block::default().borders(Borders::ALL).title("AUDIT LOG"))
             .style(Style::default());
         frame.render_widget(empty_text, area);
