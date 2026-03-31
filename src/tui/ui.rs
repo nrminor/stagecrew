@@ -1307,7 +1307,12 @@ fn pluralize_files(count: u64) -> String {
 #[allow(clippy::too_many_lines)]
 fn render_quota_widget(app: &App, config: &Config, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Render a bordered block for the quota widget
-    let block = Block::default().borders(Borders::ALL).title("QUOTA");
+    let title = if app.loading.root_entries {
+        "QUOTA ..."
+    } else {
+        "QUOTA"
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1335,6 +1340,14 @@ fn render_quota_widget(app: &App, config: &Config, frame: &mut Frame, area: rata
         frame.render_widget(msg, inner);
         return;
     };
+
+    if app.loading.root_entries {
+        let msg = Paragraph::new("Loading...")
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, inner);
+        return;
+    }
 
     // Categorize bytes using exactly the same lifecycle logic as the top widget.
     // This keeps the quota pie and lifecycle bars semantically aligned.
@@ -1630,11 +1643,8 @@ fn render_sidebar(app: &mut App, config: &Config, frame: &mut Frame, area: ratat
 }
 
 /// Render the roots list in the sidebar.
-fn render_roots_list(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+fn render_roots_list(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let roots = &app.roots;
-
-    // Update sidebar list length for navigation
-    app.sidebar_len = roots.len();
 
     // Clamp selected index
     let selected_idx = if roots.is_empty() {
@@ -1642,11 +1652,6 @@ fn render_roots_list(app: &mut App, frame: &mut Frame, area: ratatui::layout::Re
     } else {
         app.sidebar_selected_index().min(roots.len() - 1)
     };
-
-    // Set current root ID based on selection
-    if let Some(root) = roots.get(selected_idx) {
-        app.current_root_id = Some(root.id);
-    }
 
     // Build sidebar rows
     let rows: Vec<Row> = roots

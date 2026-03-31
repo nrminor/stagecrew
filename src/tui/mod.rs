@@ -858,6 +858,7 @@ impl App {
             dispatcher::DbResult::Roots(roots) => {
                 self.loading.roots = false;
                 self.roots = roots;
+                self.sidebar_len = self.roots.len();
                 self.auto_enter_first_root();
             }
             dispatcher::DbResult::RootEntries(entries) => {
@@ -937,6 +938,7 @@ impl App {
         // This is the only synchronous DB read remaining in the event loop.
         if let Ok(roots) = db.list_roots() {
             self.roots = roots;
+            self.sidebar_len = self.roots.len();
         }
         self.auto_enter_first_root();
 
