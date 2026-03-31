@@ -347,74 +347,11 @@ pub async fn scan_and_persist(
         let is_first_scan = root.last_scanned.is_none();
         tracing::info!(?path, is_first_scan, "Scanning path");
 
-        let root_id = root.id;
-
         let scan_result = scanner.scan(&path).await?;
 
-        // Upsert directory entries and file entries
-        for dir_info in &scan_result.directories_found {
-            // Determine parent_path for this directory
-            let parent_path = dir_info
-                .path
-                .parent()
-                .map_or_else(|| root.path.clone(), Path::to_path_buf);
-
-            // Insert directory entry with oldest child mtime so directories
-            // sort meaningfully by expiration alongside files.
-            let dir_mtime = dir_info.oldest_mtime.map(jiff::Timestamp::as_second);
-            db.upsert_entry(root_id, &dir_info.path, &parent_path, true, 0, dir_mtime)?;
-
-            // Insert file entries for this directory
-            for entry in jwalk::WalkDir::new(&dir_info.path)
-                .skip_hidden(false)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(std::result::Result::ok)
-            {
-                let file_path = entry.path();
-
-                // Only process files in this directory (not subdirectories)
-                if file_path.parent() != Some(&dir_info.path) {
-                    continue;
-                }
-
-                // Get metadata for the file
-                if let Ok(metadata) = get_metadata(&file_path)
-                    && metadata.is_file
-                {
-                    let mtime_unix = metadata.mtime.map(jiff::Timestamp::as_second);
-
-                    // Allow: size_bytes is a realistic file size that won't exceed i64::MAX.
-                    #[allow(clippy::cast_possible_wrap)]
-                    db.upsert_entry(
-                        root_id,
-                        &file_path,
-                        &dir_info.path,
-                        false,
-                        metadata.size_bytes as i64,
-                        mtime_unix,
-                    )?;
-                }
-            }
-
-            total_directories += 1;
-        }
-
-        cleanup_missing_entries(db, root_id)?;
-
-        // On first scan of a root, reset all countdowns to give files a fresh start.
-        // This prevents old files from immediately appearing overdue when first tracked.
-        if is_first_scan {
-            let reset_count = db.reset_root_countdowns(root_id)?;
-            tracing::info!(
-                root_id,
-                reset_count,
-                "Reset countdowns for newly tracked root"
-            );
-        }
-
-        // Update root's last_scanned timestamp
-        db.update_root_last_scanned(root_id, scan_timestamp)?;
+        let persisted_directories =
+            persist_scan_result_for_root(db, root, &scan_result, scan_timestamp)?;
+        total_directories += persisted_directories;
 
         total_files += scan_result.total_files;
         total_size_bytes += scan_result.total_size_bytes;
@@ -485,6 +422,107 @@ fn cleanup_missing_entries(db: &Database, root_id: i64) -> Result<()> {
         tracing::info!(root_id, cleaned, "Cleaned up missing entries");
     }
     Ok(())
+}
+
+fn persist_scan_result_for_root(
+    db: &Database,
+    root: &Root,
+    scan_result: &ScanResult,
+    scan_timestamp: i64,
+) -> Result<u64> {
+    let root_id = root.id;
+
+    // Batch per-root upserts in one transaction to reduce round-trips.
+    with_scan_write_transaction(db, || {
+        // Upsert directory entries and file entries
+        for dir_info in &scan_result.directories_found {
+            // Determine parent_path for this directory
+            let parent_path = dir_info
+                .path
+                .parent()
+                .map_or_else(|| root.path.clone(), Path::to_path_buf);
+
+            // Insert directory entry with oldest child mtime so directories
+            // sort meaningfully by expiration alongside files.
+            let dir_mtime = dir_info.oldest_mtime.map(jiff::Timestamp::as_second);
+            db.upsert_entry_no_return(root_id, &dir_info.path, &parent_path, true, 0, dir_mtime)?;
+
+            // Insert file entries for this directory
+            for entry in jwalk::WalkDir::new(&dir_info.path)
+                .skip_hidden(false)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(std::result::Result::ok)
+            {
+                let file_path = entry.path();
+
+                // Only process files in this directory (not subdirectories)
+                if file_path.parent() != Some(&dir_info.path) {
+                    continue;
+                }
+
+                // Get metadata for the file
+                if let Ok(metadata) = get_metadata(&file_path)
+                    && metadata.is_file
+                {
+                    let mtime_unix = metadata.mtime.map(jiff::Timestamp::as_second);
+
+                    // Allow: size_bytes is a realistic file size that won't exceed i64::MAX.
+                    #[allow(clippy::cast_possible_wrap)]
+                    db.upsert_entry_no_return(
+                        root_id,
+                        &file_path,
+                        &dir_info.path,
+                        false,
+                        metadata.size_bytes as i64,
+                        mtime_unix,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    cleanup_missing_entries(db, root_id)?;
+
+    // On first scan of a root, reset all countdowns to give files a fresh start.
+    // This prevents old files from immediately appearing overdue when first tracked.
+    if root.last_scanned.is_none() {
+        let reset_count = db.reset_root_countdowns(root_id)?;
+        tracing::info!(
+            root_id,
+            reset_count,
+            "Reset countdowns for newly tracked root"
+        );
+    }
+
+    // Update root's last_scanned timestamp
+    db.update_root_last_scanned(root_id, scan_timestamp)?;
+
+    u64::try_from(scan_result.directories_found.len()).map_err(|_| {
+        Error::Config("directory count overflow while persisting scan result".to_string())
+    })
+}
+
+fn with_scan_write_transaction<T>(db: &Database, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    db.conn().execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+
+    let result = f();
+    match result {
+        Ok(value) => {
+            db.conn().execute_batch("COMMIT")?;
+            Ok(value)
+        }
+        Err(err) => {
+            if let Err(rollback_err) = db.conn().execute_batch("ROLLBACK") {
+                tracing::warn!(
+                    error = %rollback_err,
+                    "Rollback failed after scan write transaction error"
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 fn record_transition_audit(

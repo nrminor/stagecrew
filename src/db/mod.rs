@@ -446,6 +446,9 @@ impl Database {
     /// Returns an error if:
     /// - The `root_id` does not exist (foreign key constraint)
     /// - The database operation fails
+    // TODO(cleanup): Remove allow once production code paths need returned entry IDs again.
+    // This remains used heavily in tests to create fixture rows with stable IDs.
+    #[allow(dead_code)]
     pub fn upsert_entry(
         &self,
         root_id: i64,
@@ -455,6 +458,46 @@ impl Database {
         size_bytes: i64,
         mtime: Option<i64>,
     ) -> Result<i64> {
+        self.upsert_entry_internal(root_id, path, parent_path, is_dir, size_bytes, mtime)?;
+
+        let path_str = path.to_string_lossy();
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM entries WHERE path = ?1",
+            [&*path_str],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Insert or update an entry in the database without reading the row ID.
+    ///
+    /// This is useful in scan paths that do not need the entry ID, avoiding an
+    /// extra read query per upsert.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upsert fails.
+    pub fn upsert_entry_no_return(
+        &self,
+        root_id: i64,
+        path: &Path,
+        parent_path: &Path,
+        is_dir: bool,
+        size_bytes: i64,
+        mtime: Option<i64>,
+    ) -> Result<()> {
+        self.upsert_entry_internal(root_id, path, parent_path, is_dir, size_bytes, mtime)
+    }
+
+    fn upsert_entry_internal(
+        &self,
+        root_id: i64,
+        path: &Path,
+        parent_path: &Path,
+        is_dir: bool,
+        size_bytes: i64,
+        mtime: Option<i64>,
+    ) -> Result<()> {
         let path_str = path.to_string_lossy();
         let parent_path_str = parent_path.to_string_lossy();
         self.conn.execute(
@@ -469,13 +512,7 @@ impl Database {
                  updated_at = strftime('%s', 'now')",
             (root_id, &*path_str, &*parent_path_str, is_dir, size_bytes, mtime),
         )?;
-
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM entries WHERE path = ?1",
-            [&*path_str],
-            |row| row.get(0),
-        )?;
-        Ok(id)
+        Ok(())
     }
 
     /// Get an entry by its path.
@@ -1543,6 +1580,30 @@ mod tests {
             .expect("entry should exist");
         assert_eq!(entry.size_bytes, 1024);
         assert_eq!(entry.mtime, Some(1_700_050_000));
+    }
+
+    #[test]
+    fn upsert_entry_no_return_writes_entry() {
+        let (_temp, db) = temp_database();
+
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
+        db.upsert_entry_no_return(
+            root_id,
+            Path::new("/data/file.txt"),
+            Path::new("/data"),
+            false,
+            512,
+            Some(1_700_000_000),
+        )
+        .expect("upsert without ID return should succeed");
+
+        let entry = db
+            .get_entry_by_path(Path::new("/data/file.txt"))
+            .expect("query")
+            .expect("entry should exist");
+        assert_eq!(entry.root_id, root_id);
+        assert_eq!(entry.size_bytes, 512);
+        assert_eq!(entry.mtime, Some(1_700_000_000));
     }
 
     #[test]
