@@ -43,7 +43,10 @@ pub struct Entry {
     pub parent_path: PathBuf,
     /// True if this entry is a directory, false if it's a file.
     pub is_dir: bool,
-    /// Size in bytes (0 for directories).
+    /// Size in bytes.
+    ///
+    /// For files this is the file size. For directories this stores the
+    /// recursive byte total of all descendant files captured during scan.
     pub size_bytes: i64,
     /// Unix timestamp of the file's modification time, or None for directories.
     pub mtime: Option<i64>,
@@ -426,7 +429,8 @@ impl Database {
     ///
     /// Uses UPSERT to either create a new entry or update an existing one
     /// based on the path. On first insert, sets `tracked_since` and `countdown_start`
-    /// to the current timestamp. On update, preserves the existing values for both.
+    /// to the current timestamp. On update, preserves those values unless the existing
+    /// row is `removed`, in which case the path is revived as newly `tracked`.
     ///
     /// # Arguments
     ///
@@ -509,6 +513,22 @@ impl Database {
                  is_dir = excluded.is_dir,
                  size_bytes = excluded.size_bytes,
                  mtime = excluded.mtime,
+                 status = CASE
+                     WHEN entries.status = 'removed' THEN 'tracked'
+                     ELSE entries.status
+                 END,
+                 tracked_since = CASE
+                     WHEN entries.status = 'removed' THEN strftime('%s', 'now')
+                     ELSE entries.tracked_since
+                 END,
+                 countdown_start = CASE
+                     WHEN entries.status = 'removed' THEN strftime('%s', 'now')
+                     ELSE entries.countdown_start
+                 END,
+                 deferred_until = CASE
+                     WHEN entries.status = 'removed' THEN NULL
+                     ELSE entries.deferred_until
+                 END,
                  updated_at = strftime('%s', 'now')",
             (root_id, &*path_str, &*parent_path_str, is_dir, size_bytes, mtime),
         )?;
@@ -1648,6 +1668,53 @@ mod tests {
             entry_after.tracked_since, tracked_since,
             "tracked_since should be preserved"
         );
+    }
+
+    #[test]
+    fn upsert_entry_revives_removed_path_as_tracked() {
+        let (_temp, db) = temp_database();
+
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
+
+        let entry_id = db
+            .upsert_entry(
+                root_id,
+                Path::new("/data/test"),
+                Path::new("/data"),
+                true,
+                0,
+                None,
+            )
+            .expect("first insert");
+        db.update_entry_status(entry_id, "removed")
+            .expect("mark removed");
+
+        let removed_entry = db
+            .get_entry_by_path(Path::new("/data/test"))
+            .expect("query")
+            .expect("entry should exist");
+        let removed_tracked_since = removed_entry.tracked_since;
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/test"),
+            Path::new("/data"),
+            true,
+            0,
+            None,
+        )
+        .expect("upsert should revive removed entry");
+
+        let revived_entry = db
+            .get_entry_by_path(Path::new("/data/test"))
+            .expect("query")
+            .expect("entry should exist");
+        assert_eq!(revived_entry.status, "tracked");
+        assert_ne!(revived_entry.tracked_since, removed_tracked_since);
+        assert!(revived_entry.countdown_start.is_some());
+        assert_eq!(revived_entry.deferred_until, None);
     }
 
     #[test]

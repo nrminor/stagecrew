@@ -279,6 +279,12 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 
     let now = jiff::Timestamp::now().as_second();
     let has_countdown = app.nearest_expiration.is_some();
+    let is_debug_build = cfg!(debug_assertions);
+    let logo_style = if is_debug_build {
+        Style::default().fg(palette::YELLOW)
+    } else {
+        Style::default()
+    };
 
     if has_countdown {
         let dial_width: u16 = 16;
@@ -293,13 +299,13 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
             ])
             .split(inner);
 
-        let logo = Paragraph::new(LOGO);
+        let logo = Paragraph::new(LOGO).style(logo_style);
         frame.render_widget(logo, h_chunks[0]);
 
         let expiration_ts = app.nearest_expiration.unwrap_or(now);
         let remaining = expiration_ts - now;
         let (context_lines, time_top, time_bottom, color) =
-            build_countdown_display(remaining, &app.cached_stats);
+            build_countdown_display(remaining, &app.cached_stats, is_debug_build);
 
         let context = Paragraph::new(context_lines).alignment(Alignment::Right);
         frame.render_widget(context, h_chunks[2]);
@@ -315,10 +321,10 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
             ])
             .split(inner);
 
-        let logo = Paragraph::new(LOGO);
+        let logo = Paragraph::new(LOGO).style(logo_style);
         frame.render_widget(logo, h_chunks[0]);
 
-        let status_lines = build_idle_display(&app.cached_stats);
+        let status_lines = build_idle_display(&app.cached_stats, is_debug_build);
         let status = Paragraph::new(status_lines).alignment(Alignment::Right);
         frame.render_widget(status, h_chunks[2]);
     }
@@ -327,6 +333,7 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 fn build_countdown_display(
     remaining_seconds: i64,
     stats: &crate::db::Stats,
+    is_debug_build: bool,
 ) -> (Vec<Line<'static>>, String, String, Color) {
     let (label, time_top, time_bottom, color) = if remaining_seconds <= 0 {
         let overdue = remaining_seconds.unsigned_abs();
@@ -393,7 +400,7 @@ fn build_countdown_display(
     };
 
     let is_overdue = remaining_seconds <= 0;
-    let context = build_context_lines(&label, stats, is_overdue);
+    let context = build_context_lines(&label, stats, is_overdue, is_debug_build);
     (context, time_top, time_bottom, color)
 }
 
@@ -401,11 +408,19 @@ fn build_context_lines(
     label: &str,
     stats: &crate::db::Stats,
     is_overdue: bool,
+    is_debug_build: bool,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(Span::styled(
-        label.to_string(),
-        Style::default().fg(Color::DarkGray),
-    ))];
+    let mut lines = vec![if is_debug_build {
+        Line::from(Span::styled(
+            "DEBUG BUILD — reduced performance",
+            Style::default().fg(palette::YELLOW),
+        ))
+    } else {
+        Line::from(Span::styled(
+            label.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    }];
 
     let overdue = stats.files_overdue;
     let warning = stats.files_within_warning;
@@ -452,10 +467,17 @@ fn build_context_lines(
     lines
 }
 
-fn build_idle_display(stats: &crate::db::Stats) -> Vec<Line<'static>> {
+fn build_idle_display(stats: &crate::db::Stats, is_debug_build: bool) -> Vec<Line<'static>> {
     if stats.total_files == 0 {
         vec![
-            Line::from(""),
+            if is_debug_build {
+                Line::from(Span::styled(
+                    "DEBUG BUILD — reduced performance",
+                    Style::default().fg(palette::YELLOW),
+                ))
+            } else {
+                Line::from("")
+            },
             Line::from(Span::styled(
                 "no directories tracked",
                 Style::default().fg(Color::DarkGray),
@@ -465,7 +487,14 @@ fn build_idle_display(stats: &crate::db::Stats) -> Vec<Line<'static>> {
         #[allow(clippy::cast_sign_loss)]
         let total_bytes = stats.total_size_bytes.max(0) as u64;
         vec![
-            Line::from(""),
+            if is_debug_build {
+                Line::from(Span::styled(
+                    "DEBUG BUILD — reduced performance",
+                    Style::default().fg(palette::YELLOW),
+                ))
+            } else {
+                Line::from("")
+            },
             Line::from(Span::styled(
                 "all clear",
                 Style::default().fg(palette::GREEN),
@@ -1826,14 +1855,11 @@ fn render_main_entry_panel(
             } else {
                 filename.to_string()
             };
-            // Format size (directories show as "-")
-            let size_str = if entry.is_dir {
-                "-".to_string()
-            } else {
-                // Allow: size_bytes is guaranteed non-negative by schema, but stored as i64 for SQLite compatibility
-                #[allow(clippy::cast_sign_loss)]
-                format_bytes(entry.size_bytes as u64)
-            };
+            // Format size for both files and directories.
+            // Directory sizes are recursively aggregated during scan persistence.
+            // Allow: size_bytes is guaranteed non-negative by schema, but stored as i64 for SQLite compatibility.
+            #[allow(clippy::cast_sign_loss)]
+            let size_str = format_bytes(entry.size_bytes as u64);
 
             // Calculate effective days for the Due column
             // For deferred entries, use the deferral end date instead of mtime-based expiration
@@ -2074,14 +2100,11 @@ pub(super) fn sort_entry_rows(rows: &mut [(crate::db::Entry, i64)], sort_mode: S
             });
         }
         SortMode::Size => {
-            // Descending (largest first), directories sort to end
+            // Descending (largest first), files and directories interspersed by size.
             rows.sort_by(|a, b| {
-                // Directories go to end
-                match (a.0.is_dir, b.0.is_dir) {
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (false, true) => std::cmp::Ordering::Less,
-                    _ => b.0.size_bytes.cmp(&a.0.size_bytes),
-                }
+                b.0.size_bytes
+                    .cmp(&a.0.size_bytes)
+                    .then_with(|| a.0.path.cmp(&b.0.path))
             });
         }
         SortMode::Name => {

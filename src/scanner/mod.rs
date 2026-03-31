@@ -461,7 +461,15 @@ fn persist_scan_result_for_root(
             // Insert directory entry with oldest child mtime so directories
             // sort meaningfully by expiration alongside files.
             let dir_mtime = dir_info.oldest_mtime.map(jiff::Timestamp::as_second);
-            db.upsert_entry_no_return(root_id, &dir_info.path, &parent_path, true, 0, dir_mtime)?;
+            #[allow(clippy::cast_possible_wrap)]
+            db.upsert_entry_no_return(
+                root_id,
+                &dir_info.path,
+                &parent_path,
+                true,
+                dir_info.size_bytes as i64,
+                dir_mtime,
+            )?;
         }
 
         for file_info in &scan_result.files_found {
@@ -807,7 +815,20 @@ fn scan_directory_tree(root: &Path) -> ScanResult {
             }
         };
 
-        // Only process files (not directories)
+        if metadata.is_dir {
+            discovered_paths.insert(path.clone());
+            dir_map
+                .entry(path.clone())
+                .or_insert_with(|| DirectoryAggregator {
+                    path: path.clone(),
+                    size_bytes: 0,
+                    file_count: 0,
+                    oldest_mtime: None,
+                });
+            continue;
+        }
+
+        // Only process regular files for size and file-count aggregation.
         if !metadata.is_file {
             continue;
         }
@@ -821,7 +842,6 @@ fn scan_directory_tree(root: &Path) -> ScanResult {
             .map_or_else(|| root.to_path_buf(), std::path::Path::to_path_buf);
 
         discovered_paths.insert(path.clone());
-        discovered_paths.insert(parent_dir.clone());
 
         files_found.push(ScannedFile {
             path: path.clone(),
@@ -830,27 +850,25 @@ fn scan_directory_tree(root: &Path) -> ScanResult {
             mtime: metadata.mtime,
         });
 
-        // Aggregate into parent directory
-        let aggregator = dir_map
+        // Track direct file count for the immediate parent directory.
+        let parent_agg = dir_map
             .entry(parent_dir.clone())
             .or_insert_with(|| DirectoryAggregator {
-                path: parent_dir,
+                path: parent_dir.clone(),
                 size_bytes: 0,
                 file_count: 0,
                 oldest_mtime: None,
             });
+        parent_agg.file_count += 1;
 
-        aggregator.size_bytes += metadata.size_bytes;
-        aggregator.file_count += 1;
-
-        // Track oldest mtime
-        if let Some(mtime) = metadata.mtime {
-            aggregator.oldest_mtime = Some(match aggregator.oldest_mtime {
-                Some(existing) if mtime < existing => mtime,
-                Some(existing) => existing,
-                None => mtime,
-            });
-        }
+        accumulate_recursive_dir_stats(
+            &mut dir_map,
+            &mut discovered_paths,
+            parent_dir.as_path(),
+            root,
+            metadata.size_bytes,
+            metadata.mtime,
+        );
     }
 
     // Convert aggregators to DirectoryInfo
@@ -873,11 +891,51 @@ fn scan_directory_tree(root: &Path) -> ScanResult {
     }
 }
 
+fn accumulate_recursive_dir_stats(
+    dir_map: &mut HashMap<PathBuf, DirectoryAggregator>,
+    discovered_paths: &mut HashSet<PathBuf>,
+    parent_dir: &Path,
+    root: &Path,
+    size_bytes: u64,
+    mtime: Option<jiff::Timestamp>,
+) {
+    let mut current = Some(parent_dir);
+    while let Some(dir) = current {
+        if !dir.starts_with(root) {
+            break;
+        }
+        discovered_paths.insert(dir.to_path_buf());
+
+        let agg = dir_map
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| DirectoryAggregator {
+                path: dir.to_path_buf(),
+                size_bytes: 0,
+                file_count: 0,
+                oldest_mtime: None,
+            });
+        agg.size_bytes += size_bytes;
+        if let Some(ts) = mtime {
+            agg.oldest_mtime = Some(match agg.oldest_mtime {
+                Some(existing) if ts < existing => ts,
+                Some(existing) => existing,
+                None => ts,
+            });
+        }
+
+        if dir == root {
+            break;
+        }
+        current = dir.parent();
+    }
+}
+
 /// File metadata collected during scan.
 struct FileMetadata {
     size_bytes: u64,
     mtime: Option<jiff::Timestamp>,
     is_file: bool,
+    is_dir: bool,
 }
 
 /// Get metadata for a file, resolving symlinks.
@@ -890,6 +948,7 @@ fn get_metadata(path: &Path) -> Result<FileMetadata> {
     let metadata = fs::metadata(path)?;
 
     let is_file = metadata.is_file();
+    let is_dir = metadata.is_dir();
     let size_bytes = metadata.len();
 
     // Get modification time
@@ -902,6 +961,7 @@ fn get_metadata(path: &Path) -> Result<FileMetadata> {
         size_bytes,
         mtime,
         is_file,
+        is_dir,
     })
 }
 
@@ -943,9 +1003,6 @@ pub struct ScannedFile {
 /// Represents aggregated metadata for all files within a directory. The `oldest_mtime`
 /// field tracks the oldest modification time of any file in the directory, which is used
 /// for expiration calculations.
-// TODO(cleanup): DirectoryInfo is prepared for future directory-level summary views.
-// Currently only `path` is used; other fields will be used when implementing
-// directory-level aggregation in the TUI.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 #[allow(dead_code)]
@@ -962,6 +1019,7 @@ mod tests {
     // Using expect() instead of unwrap() in tests adds noise without value.
     use super::*;
     use crate::config::{AppConfig, Config};
+    use crate::db::Database;
     use filetime::{FileTime, set_file_mtime};
     use std::collections::HashSet;
     use std::fs::File;
@@ -969,7 +1027,7 @@ mod tests {
     use tempfile::{NamedTempFile, TempDir};
 
     /// Creates a temporary database for testing.
-    fn temp_database() -> (NamedTempFile, crate::db::Database) {
+    fn temp_database() -> (NamedTempFile, Database) {
         let temp_file = NamedTempFile::new().expect("failed to create temp file");
         let db = crate::db::Database::open(temp_file.path()).expect("failed to open database");
         (temp_file, db)
@@ -1092,8 +1150,11 @@ mod tests {
             .find(|d| d.path == root)
             .expect("Root directory should be in results");
 
-        assert_eq!(root_agg.file_count, 1, "Root should have 1 file");
-        assert_eq!(root_agg.size_bytes, 100, "Root file should be 100 bytes");
+        assert_eq!(root_agg.file_count, 1, "Root should have 1 direct file");
+        assert_eq!(
+            root_agg.size_bytes, 600,
+            "Root should include recursive bytes from subdirectories"
+        );
 
         // Find the subdir aggregation
         let subdir = root.join("subdir");
@@ -1108,6 +1169,29 @@ mod tests {
             subdir_agg.size_bytes, 500,
             "Subdir files should total 500 bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn scanner_includes_empty_directories() {
+        let temp_dir = create_test_tree();
+        let root = temp_dir.path();
+        let empty_dir = root.join("empty");
+        fs::create_dir(&empty_dir)
+            .expect("failed to create empty test directory - check permissions and disk space");
+
+        let scanner = Scanner::new();
+        let result = scanner.scan(root).await.expect(
+            "scanner should successfully scan test directory - check permissions and disk space",
+        );
+
+        let empty_agg = result
+            .directories_found
+            .iter()
+            .find(|d| d.path == empty_dir)
+            .expect("empty directory should be included in scan results");
+        assert_eq!(empty_agg.file_count, 0);
+        assert_eq!(empty_agg.size_bytes, 0);
+        assert!(empty_agg.oldest_mtime.is_none());
     }
 
     #[tokio::test]
@@ -1178,9 +1262,17 @@ mod tests {
         assert_eq!(result.total_size_bytes, 0, "Expected zero size");
         assert_eq!(
             result.directories_found.len(),
-            0,
-            "Expected no directory aggregations"
+            1,
+            "Expected root directory to be included"
         );
+
+        let root_dir = result
+            .directories_found
+            .iter()
+            .find(|d| d.path == temp_dir.path())
+            .expect("Expected root directory aggregation");
+        assert_eq!(root_dir.size_bytes, 0);
+        assert_eq!(root_dir.file_count, 0);
     }
 
     #[tokio::test]
@@ -2060,8 +2152,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_and_persist_creates_root_and_entries() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2109,6 +2199,7 @@ mod tests {
             .expect("failed to query entry from database - connection may be lost")
             .expect("expected directory entry to exist after scan");
         assert!(dir_entry.is_dir);
+        assert_eq!(dir_entry.size_bytes, 100);
         assert_eq!(dir_entry.status, "tracked");
 
         // Verify file entry was created
@@ -2126,8 +2217,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_and_persist_creates_file_entries() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2172,9 +2261,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_and_persist_updates_stats_table() {
-        use crate::db::Database;
+    async fn scan_and_persist_sets_recursive_directory_sizes() {
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
+        let root = temp_dir.path();
 
+        // Create a tree where the root directory has no direct files.
+        let project_dir = root.join("project");
+        let nested_dir = project_dir.join("nested");
+        fs::create_dir(&project_dir)
+            .expect("failed to create project directory - check disk space and permissions");
+        fs::create_dir(&nested_dir)
+            .expect("failed to create nested directory - check disk space and permissions");
+
+        File::create(nested_dir.join("a.txt"))
+            .expect("failed to create nested file - check disk space and permissions")
+            .write_all(&[0u8; 10])
+            .expect("failed to write test data to nested file - disk may be full");
+        File::create(nested_dir.join("b.txt"))
+            .expect("failed to create nested file - check disk space and permissions")
+            .write_all(&[0u8; 20])
+            .expect("failed to write test data to nested file - disk may be full");
+
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
+        let scanner = Scanner::new();
+        let app_config = test_app_config_with_paths(vec![project_dir.clone()], 90, 14);
+
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to scan and persist - check permissions and database connection");
+
+        let project_entry = db
+            .get_entry_by_path(&project_dir)
+            .expect("failed to query project entry")
+            .expect("project directory should be persisted");
+        let nested_entry = db
+            .get_entry_by_path(&nested_dir)
+            .expect("failed to query nested entry")
+            .expect("nested directory should be persisted");
+
+        assert!(project_entry.is_dir);
+        assert!(nested_entry.is_dir);
+        assert_eq!(project_entry.size_bytes, 30);
+        assert_eq!(nested_entry.size_bytes, 30);
+    }
+
+    #[tokio::test]
+    async fn scan_and_persist_persists_empty_subdirectories() {
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
+        let root = temp_dir.path();
+
+        let project_dir = root.join("project");
+        let empty_dir = project_dir.join("empty");
+        fs::create_dir(&project_dir)
+            .expect("failed to create project directory - check disk space and permissions");
+        fs::create_dir(&empty_dir)
+            .expect("failed to create empty directory - check disk space and permissions");
+
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
+        let scanner = Scanner::new();
+        let app_config = test_app_config_with_paths(vec![project_dir.clone()], 90, 14);
+
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to scan and persist - check permissions and database connection");
+
+        let empty_entry = db
+            .get_entry_by_path(&empty_dir)
+            .expect("failed to query empty directory entry")
+            .expect("empty directory should be persisted");
+        assert!(empty_entry.is_dir);
+        assert_eq!(empty_entry.size_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn scan_and_persist_updates_stats_table() {
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2215,7 +2383,6 @@ mod tests {
     #[tokio::test]
     async fn scan_and_persist_records_audit_entry() {
         use crate::audit::AuditService;
-        use crate::db::Database;
 
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
@@ -2262,8 +2429,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_and_persist_handles_multiple_paths() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2320,8 +2485,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_and_persist_upserts_existing_entries() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2383,8 +2546,6 @@ mod tests {
 
     #[tokio::test]
     async fn stats_update_calculates_files_within_warning() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2443,8 +2604,6 @@ mod tests {
 
     #[tokio::test]
     async fn stats_update_calculates_files_pending_approval() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2492,8 +2651,6 @@ mod tests {
 
     #[tokio::test]
     async fn stats_update_calculates_files_overdue() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2551,8 +2708,6 @@ mod tests {
 
     #[tokio::test]
     async fn stats_update_handles_mixed_scenarios() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2661,8 +2816,6 @@ mod tests {
 
     #[tokio::test]
     async fn stats_update_excludes_ignored_from_overdue_count() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
         );
@@ -2724,8 +2877,6 @@ mod tests {
 
     #[tokio::test]
     async fn stats_update_custom_expiration_warning_periods() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect("failed to create temp directory for test - check disk space and system temp directory permissions");
         let root = temp_dir.path();
 
@@ -2780,8 +2931,6 @@ mod tests {
 
     #[tokio::test]
     async fn stats_update_handles_entries_without_mtime() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect("failed to create temp directory for test - check disk space and system temp directory permissions");
         let root = temp_dir.path();
 
@@ -2813,8 +2962,6 @@ mod tests {
 
     #[tokio::test]
     async fn stats_update_sets_last_scan_completed_timestamp() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new().expect("failed to create temp directory for test - check disk space and system temp directory permissions");
         let root = temp_dir.path();
 
@@ -2862,8 +3009,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_sets_tracked_since_on_first_insert() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new()
             .expect("failed to create temp directory - check disk space and permissions");
         let root = temp_dir.path();
@@ -2886,10 +3031,9 @@ mod tests {
             .expect("timestamp arithmetic failed");
         #[cfg(unix)]
         {
-            use filetime::FileTime;
             filetime::set_file_mtime(
                 &file_path,
-                FileTime::from_unix_time(hundred_days_ago.as_second(), 0),
+                filetime::FileTime::from_unix_time(hundred_days_ago.as_second(), 0),
             )
             .expect("failed to set file mtime - check permissions");
         }
@@ -2935,8 +3079,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_preserves_tracked_since_on_update() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new()
             .expect("failed to create temp directory - check disk space and permissions");
         let root = temp_dir.path();
@@ -3014,8 +3156,6 @@ mod tests {
 
     #[tokio::test]
     async fn expiration_uses_effective_timestamp() {
-        use crate::db::Database;
-
         let temp_dir = TempDir::new()
             .expect("failed to create temp directory - check disk space and permissions");
         let root = temp_dir.path();
@@ -3038,10 +3178,9 @@ mod tests {
             .expect("timestamp arithmetic failed");
         #[cfg(unix)]
         {
-            use filetime::FileTime;
             filetime::set_file_mtime(
                 &file_path,
-                FileTime::from_unix_time(two_hundred_days_ago.as_second(), 0),
+                filetime::FileTime::from_unix_time(two_hundred_days_ago.as_second(), 0),
             )
             .expect("failed to set file mtime - check permissions");
         }
