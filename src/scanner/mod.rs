@@ -1,6 +1,6 @@
 //! Filesystem scanning logic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -401,17 +401,33 @@ pub async fn scan_and_persist(
 /// active entries under the root whose paths are no longer on the filesystem
 /// and sets their status to `removed`. This prevents ghost entries from
 /// persisting indefinitely when files are deleted outside of stagecrew.
-fn cleanup_missing_entries(db: &Database, root_id: i64) -> Result<()> {
+fn cleanup_missing_entries(
+    db: &Database,
+    root_id: i64,
+    discovered_paths: &HashSet<PathBuf>,
+) -> Result<()> {
     let existing_entries = db.list_entries_by_root(root_id)?;
-    let mut cleaned = 0u64;
+    let mut missing_candidates: Vec<(i64, PathBuf)> = Vec::new();
+
     for entry in &existing_entries {
-        if entry.status != "removed" && !entry.path.exists() {
+        if entry.status == "removed" {
+            continue;
+        }
+        if discovered_paths.contains(&entry.path) {
+            continue;
+        }
+        missing_candidates.push((entry.id, entry.path.clone()));
+    }
+
+    let mut cleaned = 0u64;
+    for (entry_id, path) in &missing_candidates {
+        if !path.exists() {
             tracing::debug!(
-                path = ?entry.path,
-                entry_id = entry.id,
+                path = ?path,
+                entry_id,
                 "Entry no longer exists on disk, marking as removed"
             );
-            if let Err(e) = db.update_entry_status(entry.id, "removed") {
+            if let Err(e) = db.update_entry_status(*entry_id, "removed") {
                 tracing::warn!("Failed to mark missing entry as removed: {e}");
             } else {
                 cleaned += 1;
@@ -434,7 +450,7 @@ fn persist_scan_result_for_root(
 
     // Batch per-root upserts in one transaction to reduce round-trips.
     with_scan_write_transaction(db, || {
-        // Upsert directory entries and file entries
+        // Upsert directory entries and file entries captured during scan.
         for dir_info in &scan_result.directories_found {
             // Determine parent_path for this directory
             let parent_path = dir_info
@@ -446,44 +462,26 @@ fn persist_scan_result_for_root(
             // sort meaningfully by expiration alongside files.
             let dir_mtime = dir_info.oldest_mtime.map(jiff::Timestamp::as_second);
             db.upsert_entry_no_return(root_id, &dir_info.path, &parent_path, true, 0, dir_mtime)?;
+        }
 
-            // Insert file entries for this directory
-            for entry in jwalk::WalkDir::new(&dir_info.path)
-                .skip_hidden(false)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(std::result::Result::ok)
-            {
-                let file_path = entry.path();
+        for file_info in &scan_result.files_found {
+            let mtime_unix = file_info.mtime.map(jiff::Timestamp::as_second);
 
-                // Only process files in this directory (not subdirectories)
-                if file_path.parent() != Some(&dir_info.path) {
-                    continue;
-                }
-
-                // Get metadata for the file
-                if let Ok(metadata) = get_metadata(&file_path)
-                    && metadata.is_file
-                {
-                    let mtime_unix = metadata.mtime.map(jiff::Timestamp::as_second);
-
-                    // Allow: size_bytes is a realistic file size that won't exceed i64::MAX.
-                    #[allow(clippy::cast_possible_wrap)]
-                    db.upsert_entry_no_return(
-                        root_id,
-                        &file_path,
-                        &dir_info.path,
-                        false,
-                        metadata.size_bytes as i64,
-                        mtime_unix,
-                    )?;
-                }
-            }
+            // Allow: size_bytes is a realistic file size that won't exceed i64::MAX.
+            #[allow(clippy::cast_possible_wrap)]
+            db.upsert_entry_no_return(
+                root_id,
+                &file_info.path,
+                &file_info.parent_path,
+                false,
+                file_info.size_bytes as i64,
+                mtime_unix,
+            )?;
         }
         Ok(())
     })?;
 
-    cleanup_missing_entries(db, root_id)?;
+    cleanup_missing_entries(db, root_id, &scan_result.discovered_paths)?;
 
     // On first scan of a root, reset all countdowns to give files a fresh start.
     // This prevents old files from immediately appearing overdue when first tracked.
@@ -781,6 +779,8 @@ fn scan_directory_tree(root: &Path) -> ScanResult {
     let mut total_files = 0u64;
     let mut total_size_bytes = 0u64;
     let mut dir_map: HashMap<PathBuf, DirectoryAggregator> = HashMap::new();
+    let mut files_found: Vec<ScannedFile> = Vec::new();
+    let mut discovered_paths: HashSet<PathBuf> = HashSet::new();
 
     // Walk the tree in parallel
     for entry in WalkDir::new(root)
@@ -820,6 +820,16 @@ fn scan_directory_tree(root: &Path) -> ScanResult {
             .parent()
             .map_or_else(|| root.to_path_buf(), std::path::Path::to_path_buf);
 
+        discovered_paths.insert(path.clone());
+        discovered_paths.insert(parent_dir.clone());
+
+        files_found.push(ScannedFile {
+            path: path.clone(),
+            parent_path: parent_dir.clone(),
+            size_bytes: metadata.size_bytes,
+            mtime: metadata.mtime,
+        });
+
         // Aggregate into parent directory
         let aggregator = dir_map
             .entry(parent_dir.clone())
@@ -858,6 +868,8 @@ fn scan_directory_tree(root: &Path) -> ScanResult {
         total_files,
         total_size_bytes,
         directories_found,
+        files_found,
+        discovered_paths,
     }
 }
 
@@ -904,7 +916,7 @@ struct DirectoryAggregator {
 /// Result of a filesystem scan.
 ///
 /// Contains aggregated statistics about the scanned tree, including total file counts,
-/// total size, and per-directory information.
+/// total size, per-directory rollups, per-file records, and discovered paths.
 #[derive(Debug, Default, Clone)]
 #[must_use = "scan results should be processed"]
 #[non_exhaustive]
@@ -912,6 +924,18 @@ pub struct ScanResult {
     pub total_files: u64,
     pub total_size_bytes: u64,
     pub directories_found: Vec<DirectoryInfo>,
+    pub files_found: Vec<ScannedFile>,
+    pub discovered_paths: HashSet<PathBuf>,
+}
+
+/// Information about a single scanned file.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ScannedFile {
+    pub path: PathBuf,
+    pub parent_path: PathBuf,
+    pub size_bytes: u64,
+    pub mtime: Option<jiff::Timestamp>,
 }
 
 /// Information about a scanned directory.
@@ -939,6 +963,7 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, Config};
     use filetime::{FileTime, set_file_mtime};
+    use std::collections::HashSet;
     use std::fs::File;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
@@ -1033,6 +1058,11 @@ mod tests {
         );
 
         assert_eq!(result.total_files, 3, "Expected 3 files to be found");
+        assert_eq!(
+            result.files_found.len(),
+            3,
+            "Expected file records to match total files"
+        );
         assert_eq!(
             result.total_size_bytes, 600,
             "Expected total size of 600 bytes"
@@ -1197,6 +1227,55 @@ mod tests {
             assert_eq!(result.total_files, 1);
             assert_eq!(result.total_size_bytes, 150);
         }
+    }
+
+    #[test]
+    fn cleanup_missing_entries_keeps_undiscovered_paths_if_they_still_exist() {
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
+        let root = temp_dir.path();
+
+        let file_path = root.join("existing.txt");
+        File::create(&file_path)
+            .expect("failed to create test file - check disk space and permissions");
+
+        let (_temp, db) = temp_database();
+        let root_id = db.insert_root(root).expect("insert root");
+        db.upsert_entry_no_return(root_id, &file_path, root, false, 1, Some(1_700_000_000))
+            .expect("upsert entry");
+
+        let discovered_paths = HashSet::new();
+        cleanup_missing_entries(&db, root_id, &discovered_paths).expect("cleanup should succeed");
+
+        let entry = db
+            .get_entry_by_path(&file_path)
+            .expect("query should succeed")
+            .expect("entry should exist");
+        assert_eq!(entry.status, "tracked");
+    }
+
+    #[test]
+    fn cleanup_missing_entries_marks_nonexistent_paths_as_removed() {
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
+        let root = temp_dir.path();
+        let missing_path = root.join("missing.txt");
+
+        let (_temp, db) = temp_database();
+        let root_id = db.insert_root(root).expect("insert root");
+        db.upsert_entry_no_return(root_id, &missing_path, root, false, 1, Some(1_700_000_000))
+            .expect("upsert entry");
+
+        let discovered_paths = HashSet::new();
+        cleanup_missing_entries(&db, root_id, &discovered_paths).expect("cleanup should succeed");
+
+        let entry = db
+            .get_entry_by_path(&missing_path)
+            .expect("query should succeed")
+            .expect("entry should exist");
+        assert_eq!(entry.status, "removed");
     }
 
     #[tokio::test]
