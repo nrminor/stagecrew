@@ -883,6 +883,39 @@ impl Database {
         Ok(rows_affected)
     }
 
+    /// Enforce ignored-directory inheritance for all entries under a root.
+    ///
+    /// Any non-removed entry whose path is equal to, or a descendant of, an
+    /// ignored directory under the same root is set to `ignored`.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries updated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub fn enforce_ignored_directory_inheritance(&self, root_id: i64) -> Result<usize> {
+        let rows_affected = self.conn.execute(
+            "UPDATE entries AS e
+             SET status = 'ignored',
+                 updated_at = strftime('%s', 'now')
+             WHERE e.root_id = ?1
+               AND e.status != 'removed'
+               AND EXISTS (
+                   SELECT 1
+                   FROM entries AS d
+                   WHERE d.root_id = e.root_id
+                     AND d.is_dir = 1
+                     AND d.status = 'ignored'
+                     AND (e.path = d.path OR e.path LIKE d.path || '/%')
+               )",
+            [root_id],
+        )?;
+
+        Ok(rows_affected)
+    }
+
     /// Defer an entry until a specified timestamp.
     ///
     /// Sets the entry's status to 'deferred' and records when the deferral expires.
@@ -2071,6 +2104,90 @@ mod tests {
             keep.status, "tracked",
             "unrelated entry should not be affected"
         );
+    }
+
+    #[test]
+    fn enforce_ignored_directory_inheritance_ignores_descendants() {
+        let (_temp, db) = temp_database();
+
+        let root_id = db.insert_root(Path::new("/data")).expect("insert root");
+
+        // Ignored directory
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/archive"),
+            Path::new("/data"),
+            true,
+            0,
+            None,
+        )
+        .expect("insert ignored dir");
+        let ignored_dir_id = db
+            .get_entry_by_path(Path::new("/data/archive"))
+            .expect("query ignored dir")
+            .expect("ignored dir should exist")
+            .id;
+        db.update_entry_status(ignored_dir_id, "ignored")
+            .expect("mark dir ignored");
+
+        // Descendant file starts tracked.
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/archive/new.txt"),
+            Path::new("/data/archive"),
+            false,
+            100,
+            Some(1000),
+        )
+        .expect("insert descendant file");
+
+        // Unrelated file remains tracked.
+        db.upsert_entry(
+            root_id,
+            Path::new("/data/keep.txt"),
+            Path::new("/data"),
+            false,
+            200,
+            Some(1000),
+        )
+        .expect("insert unrelated file");
+
+        // Removed descendant should remain removed.
+        let removed_id = db
+            .upsert_entry(
+                root_id,
+                Path::new("/data/archive/removed.txt"),
+                Path::new("/data/archive"),
+                false,
+                50,
+                Some(1000),
+            )
+            .expect("insert removable file");
+        db.update_entry_status(removed_id, "removed")
+            .expect("mark removed");
+
+        let updated = db
+            .enforce_ignored_directory_inheritance(root_id)
+            .expect("enforce inheritance");
+        assert!(updated >= 2, "directory and descendant should be ignored");
+
+        let descendant = db
+            .get_entry_by_path(Path::new("/data/archive/new.txt"))
+            .expect("query descendant")
+            .expect("descendant should exist");
+        assert_eq!(descendant.status, "ignored");
+
+        let unrelated = db
+            .get_entry_by_path(Path::new("/data/keep.txt"))
+            .expect("query unrelated")
+            .expect("unrelated should exist");
+        assert_eq!(unrelated.status, "tracked");
+
+        let removed = db
+            .get_entry_by_path(Path::new("/data/archive/removed.txt"))
+            .expect("query removed")
+            .expect("removed should exist");
+        assert_eq!(removed.status, "removed");
     }
 
     #[test]

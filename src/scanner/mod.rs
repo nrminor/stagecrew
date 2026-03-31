@@ -486,6 +486,14 @@ fn persist_scan_result_for_root(
                 mtime_unix,
             )?;
         }
+
+        let ignored_updates = db.enforce_ignored_directory_inheritance(root_id)?;
+        tracing::debug!(
+            root_id,
+            ignored_updates,
+            "Applied ignored-directory inheritance during scan persistence"
+        );
+
         Ok(())
     })?;
 
@@ -2339,6 +2347,55 @@ mod tests {
             .expect("empty directory should be persisted");
         assert!(empty_entry.is_dir);
         assert_eq!(empty_entry.size_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn scan_and_persist_new_files_in_ignored_directory_stay_ignored() {
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
+        let root = temp_dir.path();
+
+        let project_dir = root.join("project");
+        fs::create_dir(&project_dir)
+            .expect("failed to create project directory - check disk space and permissions");
+
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
+        let scanner = Scanner::new();
+        let app_config = test_app_config_with_paths(vec![project_dir.clone()], 90, 14);
+
+        // Initial scan persists the directory.
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to scan and persist - check permissions and database connection");
+
+        // Mark the directory ignored.
+        let project_entry = db
+            .get_entry_by_path(&project_dir)
+            .expect("failed to query project directory entry")
+            .expect("project directory should be persisted");
+        db.update_entry_status(project_entry.id, "ignored")
+            .expect("failed to mark directory ignored");
+
+        // Add a new file after directory ignore.
+        let child_path = project_dir.join("new.txt");
+        File::create(&child_path)
+            .expect("failed to create child file - check permissions and disk space")
+            .write_all(&[0u8; 10])
+            .expect("failed to write child file - disk may be full");
+
+        // Rescan should keep new child ignored due to ignored-directory inheritance.
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to rescan and persist - check permissions and database connection");
+
+        let child_entry = db
+            .get_entry_by_path(&child_path)
+            .expect("failed to query child entry")
+            .expect("child file should be persisted");
+        assert_eq!(child_entry.status, "ignored");
     }
 
     #[tokio::test]
