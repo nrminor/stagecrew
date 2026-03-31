@@ -12,9 +12,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Table, Tabs, Wrap,
 };
 
-use crate::audit::AuditService;
 use crate::config::Config;
-use crate::db::Database;
 use crate::removal::{DryRunResult, RemovalMethod};
 use crate::scanner::calculate_expiration;
 
@@ -179,13 +177,14 @@ pub(crate) fn render(app: &mut App, ctx: &TuiContext, frame: &mut Frame) {
     // Render tabs.
     render_view_tabs(app, frame, chunks[1]);
 
-    // Render the current view in the main area
+    // Render the current view in the main area.
+    // All view data comes from cached App fields — no DB queries here.
     match app.view() {
         View::FileList => {
             let config = ctx.config(app);
-            render_file_list_view(app, config, ctx.db, frame, chunks[2]);
+            render_file_list_view(app, config, frame, chunks[2]);
         }
-        View::AuditLog => render_audit_log(app, ctx.db, frame, chunks[2]),
+        View::AuditLog => render_audit_log(app, frame, chunks[2]),
         View::Help => render_help(app, frame, chunks[2]),
     }
 
@@ -608,7 +607,6 @@ fn render_view_tabs(app: &App, frame: &mut Frame, area: Rect) {
 fn render_file_list_view(
     app: &mut App,
     config: &Config,
-    db: &Database,
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
@@ -628,8 +626,8 @@ fn render_file_list_view(
         .split(v_chunks[0]);
 
     // Render both top widgets
-    render_lifecycle_widget(app, config, db, frame, top_chunks[0]);
-    render_expiration_timeline(app, config, db, frame, top_chunks[1]);
+    render_lifecycle_widget(app, config, frame, top_chunks[0]);
+    render_expiration_timeline(app, config, frame, top_chunks[1]);
 
     let content_area = v_chunks[1];
 
@@ -644,13 +642,13 @@ fn render_file_list_view(
             .split(content_area);
 
         // Render sidebar with tracked directories
-        render_sidebar(app, config, db, frame, h_chunks[0]);
+        render_sidebar(app, config, frame, h_chunks[0]);
 
         // Render main panel with entries from current path
-        render_main_entry_panel(app, config, db, frame, h_chunks[1]);
+        render_main_entry_panel(app, config, frame, h_chunks[1]);
     } else {
         // Sidebar hidden - main panel takes full width
-        render_main_entry_panel(app, config, db, frame, content_area);
+        render_main_entry_panel(app, config, frame, content_area);
     }
 }
 
@@ -781,7 +779,6 @@ impl LifecycleView {
 fn render_lifecycle_widget(
     app: &App,
     config: &Config,
-    db: &Database,
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
@@ -789,22 +786,14 @@ fn render_lifecycle_widget(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Get the selected root
-    let Some(root_id) = app.current_root_id else {
+    if app.current_root_id.is_none() {
         let msg = Paragraph::new("Select a root from the sidebar")
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(msg, inner);
         return;
-    };
+    }
 
-    // Get entries for this root
-    let Ok(entries) = db.list_entries_by_root(root_id) else {
-        let msg = Paragraph::new("Error loading entries").style(Style::default().fg(palette::RED));
-        frame.render_widget(msg, inner);
-        return;
-    };
-
-    let view = LifecycleView::from_entries(&entries, config);
+    let view = LifecycleView::from_entries(&app.root_entries, config);
 
     // Split inner area: summary + divider on top (2 rows), bars below (3 rows)
     let v_chunks = Layout::default()
@@ -900,7 +889,6 @@ fn render_lifecycle_widget(
 fn render_expiration_timeline(
     app: &App,
     config: &Config,
-    db: &Database,
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
@@ -916,20 +904,12 @@ fn render_expiration_timeline(
         vertical: 0,
     });
 
-    // Get the selected root
-    let Some(root_id) = app.current_root_id else {
+    if app.current_root_id.is_none() {
         let msg = Paragraph::new("Select a root from the sidebar")
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(msg, content);
         return;
-    };
-
-    // Get entries for this root
-    let Ok(entries) = db.list_entries_by_root(root_id) else {
-        let msg = Paragraph::new("Error loading entries").style(Style::default().fg(palette::RED));
-        frame.render_widget(msg, content);
-        return;
-    };
+    }
 
     // Separate overdue backlog from the upcoming 30-day distribution.
     let mut future_buckets: [u64; TIMELINE_DAYS + 1] = [0; TIMELINE_DAYS + 1];
@@ -938,7 +918,8 @@ fn render_expiration_timeline(
     let mut future_count: u64 = 0;
     let mut future_bytes: i64 = 0;
 
-    for entry in entries
+    for entry in app
+        .root_entries
         .iter()
         .filter(|e| !e.is_dir && e.status != "removed" && e.status != "ignored")
     {
@@ -1316,13 +1297,7 @@ fn pluralize_files(count: u64) -> String {
 // Allow: This function handles multiple early-return cases for different states (no root,
 // error, no target) before the main rendering logic. Breaking it up would obscure the flow.
 #[allow(clippy::too_many_lines)]
-fn render_quota_widget(
-    app: &App,
-    config: &Config,
-    db: &Database,
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-) {
+fn render_quota_widget(app: &App, config: &Config, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Render a bordered block for the quota widget
     let block = Block::default().borders(Borders::ALL).title("QUOTA");
     let inner = block.inner(area);
@@ -1337,16 +1312,7 @@ fn render_quota_widget(
         return;
     };
 
-    // Get the root from the database to check for target
-    let Ok(roots) = db.list_roots() else {
-        let msg = Paragraph::new("Error")
-            .alignment(ratatui::layout::Alignment::Center)
-            .style(Style::default().fg(palette::RED));
-        frame.render_widget(msg, inner);
-        return;
-    };
-
-    let Some(root) = roots.iter().find(|r| r.id == root_id) else {
+    let Some(root) = app.roots.iter().find(|r| r.id == root_id) else {
         let msg = Paragraph::new("Not found")
             .alignment(ratatui::layout::Alignment::Center)
             .style(Style::default().fg(palette::RED));
@@ -1364,18 +1330,13 @@ fn render_quota_widget(
 
     // Categorize bytes using exactly the same lifecycle logic as the top widget.
     // This keeps the quota pie and lifecycle bars semantically aligned.
-    let (healthy_bytes, warning_bytes, overdue_bytes) = match db.list_entries_by_root(root_id) {
-        Ok(entries) => {
-            let view = LifecycleView::from_entries(&entries, config);
-            let clamp_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-            (
-                clamp_i64(view.healthy.bytes),
-                clamp_i64(view.warning.bytes),
-                clamp_i64(view.overdue.bytes),
-            )
-        }
-        Err(_) => (0, 0, 0),
-    };
+    let view = LifecycleView::from_entries(&app.root_entries, config);
+    let clamp_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let (healthy_bytes, warning_bytes, overdue_bytes) = (
+        clamp_i64(view.healthy.bytes),
+        clamp_i64(view.warning.bytes),
+        clamp_i64(view.overdue.bytes),
+    );
 
     let used_bytes = healthy_bytes + warning_bytes + overdue_bytes;
 
@@ -1643,13 +1604,7 @@ fn proportional_widths(values: &[u64], total: u64, width: usize) -> Vec<usize> {
 }
 
 /// Render the sidebar showing tracked roots and quota widget.
-fn render_sidebar(
-    app: &mut App,
-    config: &Config,
-    db: &Database,
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-) {
+fn render_sidebar(app: &mut App, config: &Config, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Split sidebar: roots list on top, quota widget on bottom (fixed 14 rows)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1660,26 +1615,15 @@ fn render_sidebar(
     let quota_area = chunks[1];
 
     // Render roots list
-    render_roots_list(app, db, frame, roots_area);
+    render_roots_list(app, frame, roots_area);
 
     // Render quota widget
-    render_quota_widget(app, config, db, frame, quota_area);
+    render_quota_widget(app, config, frame, quota_area);
 }
 
 /// Render the roots list in the sidebar.
-fn render_roots_list(app: &mut App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
-    // Fetch roots from database
-    let Ok(roots) = db.list_roots() else {
-        let error_text = Paragraph::new("Error loading roots")
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("TRACKED DIRECTORIES"),
-            )
-            .style(Style::default().fg(palette::RED));
-        frame.render_widget(error_text, area);
-        return;
-    };
+fn render_roots_list(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let roots = &app.roots;
 
     // Update sidebar list length for navigation
     app.sidebar_len = roots.len();
@@ -1762,7 +1706,6 @@ fn render_roots_list(app: &mut App, db: &Database, frame: &mut Frame, area: rata
 fn render_main_entry_panel(
     app: &mut App,
     config: &Config,
-    db: &Database,
     frame: &mut Frame,
     area: ratatui::layout::Rect,
 ) {
@@ -1780,17 +1723,8 @@ fn render_main_entry_panel(
         return;
     }
 
-    // Fetch entries for this path
-    let Ok(entries) = db.list_entries_by_parent(current_path) else {
-        let error_text = Paragraph::new("Error loading entries from database")
-            .block(Block::default().borders(Borders::ALL).title("ENTRIES"))
-            .style(Style::default().fg(palette::RED));
-        frame.render_widget(error_text, area);
-        return;
-    };
-
     // Empty state
-    if entries.is_empty() {
+    if app.dir_entries.is_empty() {
         let empty_text = Paragraph::new("No entries in this directory")
             .block(Block::default().borders(Borders::ALL).title("ENTRIES"))
             .style(Style::default().fg(Color::DarkGray));
@@ -1798,30 +1732,14 @@ fn render_main_entry_panel(
         return;
     }
 
-    // Sort entries by expiration (most urgent first) by default
-    // For directories (no countdown_start), use a large positive value so they sort to end
-    let mut entry_rows: Vec<_> = entries
-        .into_iter()
-        .map(|entry| {
-            // Directories have no countdown_start
-            let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                calculate_expiration(cs, config.expiration_days)
-            });
-            (entry, days_remaining)
-        })
-        .collect();
-
-    // Sort based on current sort mode
-    sort_entry_rows(&mut entry_rows, app.sort_mode());
-
     // Update entry list length for navigation
-    app.entry_list_len = entry_rows.len();
+    app.entry_list_len = app.dir_entries.len();
 
     // Clamp selected index
-    let selected_idx = if entry_rows.is_empty() {
+    let selected_idx = if app.dir_entries.is_empty() {
         0
     } else {
-        app.entry_selected_index().min(entry_rows.len() - 1)
+        app.entry_selected_index().min(app.dir_entries.len() - 1)
     };
 
     // Compute search matches for highlighting
@@ -1829,11 +1747,13 @@ fn render_main_entry_panel(
         .search_query
         .as_ref()
         .map(|q| {
-            super::input::find_search_matches(&entry_rows, q)
+            super::input::find_search_matches(&app.dir_entries, q)
                 .into_iter()
                 .collect()
         })
         .unwrap_or_default();
+
+    let entry_rows = &app.dir_entries;
 
     // Calculate viewport height for gradient fade effect
     // This determines how aggressively rows fade based on distance from cursor
@@ -2330,36 +2250,28 @@ fn format_bytes(bytes: u64) -> String {
 // scrollbar rendering in one place for readability, similar to the main table
 // renderer pattern.
 #[allow(clippy::too_many_lines)]
-fn render_audit_log(app: &mut App, db: &Database, frame: &mut Frame, area: ratatui::layout::Rect) {
-    // Fetch recent audit entries (limit to 1000 for now)
-    let audit = AuditService::new(db);
-    let Ok(entries) = audit.list_recent(1000) else {
-        // Error handling: show error message
-        let error_text = Paragraph::new("Error loading audit log from database")
-            .block(Block::default().borders(Borders::ALL).title("Error"))
-            .style(Style::default().fg(palette::RED));
-        frame.render_widget(error_text, area);
-        return;
-    };
-
+fn render_audit_log(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Update list length for navigation
-    app.sidebar_len = entries.len();
+    app.sidebar_len = app.audit_entries.len();
 
     // Clamp selected index to valid range
-    let selected_idx = if entries.is_empty() {
+    let selected_idx = if app.audit_entries.is_empty() {
         0
     } else {
-        app.sidebar_selected_index().min(entries.len() - 1)
+        app.sidebar_selected_index()
+            .min(app.audit_entries.len() - 1)
     };
 
     // Handle empty state
-    if entries.is_empty() {
+    if app.audit_entries.is_empty() {
         let empty_text = Paragraph::new("No audit entries found.\n\nPress 'q' or Esc to go back")
             .block(Block::default().borders(Borders::ALL).title("AUDIT LOG"))
             .style(Style::default());
         frame.render_widget(empty_text, area);
         return;
     }
+
+    let entries = &app.audit_entries;
 
     // Build table rows with distance-based fade similar to the main panel.
     let gradient = fade_gradient();

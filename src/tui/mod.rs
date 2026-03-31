@@ -20,12 +20,12 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::widgets::{ScrollbarState, TableState};
 
-use crate::audit::AuditExportFormat;
+use crate::audit::{AuditEntry, AuditExportFormat, AuditService};
 use crate::config::{AppConfig, AppPaths};
-use crate::db::Database;
+use crate::db::{Database, Entry, Root};
 use crate::error::Result;
 use crate::removal::{DryRunResult, RemovalMethod};
-use crate::scanner::{Scanner, refresh};
+use crate::scanner::{self, Scanner, refresh};
 
 use input::InputHandler;
 
@@ -411,6 +411,24 @@ pub struct App {
     /// Cached nearest expiration unix timestamp for the countdown widget.
     /// Refreshed on scan completion and status changes.
     pub(crate) nearest_expiration: Option<i64>,
+
+    /// Cached list of tracked roots. Updated on startup, add/remove root,
+    /// and scan completion. Render reads this instead of querying the DB.
+    pub(crate) roots: Vec<Root>,
+
+    /// Cached entries for the currently selected root. Feeds lifecycle widget,
+    /// expiration timeline, and quota pie chart. Updated on root selection
+    /// change, user action, and scan completion.
+    pub(crate) root_entries: Vec<Entry>,
+
+    /// Cached + sorted entries for the current directory. Feeds the main entry
+    /// panel. Updated on navigation, user action, scan completion, and sort
+    /// change. Each element is `(entry, days_remaining)`.
+    pub(crate) dir_entries: Vec<(Entry, i64)>,
+
+    /// Cached audit log entries for the audit log view. Updated on view
+    /// switch to audit log and after user actions that write audit records.
+    pub(crate) audit_entries: Vec<AuditEntry>,
 
     /// In-memory stack of reversible actions for undo.
     pub(crate) undo_stack: Vec<UndoAction>,
@@ -827,31 +845,78 @@ impl App {
             ensure_cursor_visible: false,
             external_open_request: None,
             nearest_expiration: None,
+            roots: Vec::new(),
+            root_entries: Vec::new(),
+            dir_entries: Vec::new(),
+            audit_entries: Vec::new(),
             undo_stack: Vec::new(),
         }
     }
 
-    /// Refresh cached header stats from the entries table.
+    /// Refresh all cached view data from the database.
     ///
-    /// Call this after any action that changes entry status (ignore, approve,
-    /// defer, unignore, delete) and after refresh completion.
-    pub(crate) fn refresh_stats(&mut self, ctx: &TuiContext) {
+    /// Populates `roots`, `root_entries`, `dir_entries`, `audit_entries`,
+    /// `cached_stats`, and `nearest_expiration` from the database in a single
+    /// pass. Call this instead of (or in addition to) `refresh_stats` at
+    /// event boundaries: startup, navigation, user actions, scan completion.
+    ///
+    /// This replaces the per-frame DB queries that previously lived in the
+    /// render path. Render functions now read from these cached fields.
+    pub(crate) fn refresh_view_data(&mut self, ctx: &TuiContext) {
         let config = ctx.config(self);
+
+        // Roots (feeds sidebar + quota widget)
+        match ctx.db.list_roots() {
+            Ok(roots) => self.roots = roots,
+            Err(e) => tracing::warn!("Failed to refresh roots: {e}"),
+        }
+
+        // Entries for the selected root (feeds lifecycle, timeline, quota)
+        if let Some(root_id) = self.current_root_id {
+            match ctx.db.list_entries_by_root(root_id) {
+                Ok(entries) => self.root_entries = entries,
+                Err(e) => tracing::warn!("Failed to refresh root entries: {e}"),
+            }
+        } else {
+            self.root_entries.clear();
+        }
+
+        // Entries for the current directory (feeds main entry panel)
+        if self.current_path.as_os_str().is_empty() {
+            self.dir_entries.clear();
+        } else {
+            match ctx.db.list_entries_by_parent(self.current_path()) {
+                Ok(entries) => {
+                    let mut rows: Vec<_> = entries
+                        .into_iter()
+                        .map(|entry| {
+                            let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+                                scanner::calculate_expiration(cs, config.expiration_days)
+                            });
+                            (entry, days_remaining)
+                        })
+                        .collect();
+                    ui::sort_entry_rows(&mut rows, self.sort_mode());
+                    self.dir_entries = rows;
+                }
+                Err(e) => tracing::warn!("Failed to refresh dir entries: {e}"),
+            }
+        }
+
+        // Audit log entries (feeds audit view)
+        match AuditService::new(ctx.db).list_recent(1000) {
+            Ok(entries) => self.audit_entries = entries,
+            Err(e) => tracing::warn!("Failed to refresh audit entries: {e}"),
+        }
+
+        // Stats + nearest expiration (feeds header)
         match ctx
             .db
             .compute_live_stats(config.expiration_days, config.warning_days)
         {
-            Ok(stats) => {
-                tracing::debug!(
-                    total_files = stats.total_files,
-                    total_size = stats.total_size_bytes,
-                    "Refreshed live stats"
-                );
-                self.cached_stats = stats;
-            }
+            Ok(stats) => self.cached_stats = stats,
             Err(e) => tracing::warn!("Failed to refresh stats: {e}"),
         }
-
         match ctx.db.nearest_expiration(config.expiration_days) {
             Ok(ts) => self.nearest_expiration = ts,
             Err(e) => tracing::warn!("Failed to query nearest expiration: {e}"),
@@ -897,8 +962,8 @@ impl App {
 
         let ctx = TuiContext { db, app_config };
 
-        // Load initial stats from the entries table
-        self.refresh_stats(&ctx);
+        // Load initial view data from the database
+        self.refresh_view_data(&ctx);
 
         // Main event loop
         loop {
@@ -982,8 +1047,8 @@ impl App {
                     match result {
                         Ok(()) => {
                             self.status_message = Some("Refresh complete".to_string());
-                            self.refresh_stats(&ctx);
                             self.auto_enter_first_root(ctx.db);
+                            self.refresh_view_data(&ctx);
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Refresh failed: {e}"));
@@ -991,12 +1056,9 @@ impl App {
                     }
                 }
 
-                // Timeout to ensure we re-render periodically even without events
-                // This clears status messages after a delay and keeps UI responsive
-                () = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                    // Clear status message after showing it for a bit
-                    // (A more sophisticated approach would track message age)
-                }
+                // Tick once per second for the countdown timer and status message clearing.
+                // No DB queries happen here — render reads from cached App state.
+                () = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
             }
         }
 

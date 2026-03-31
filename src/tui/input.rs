@@ -747,7 +747,7 @@ impl InputHandler {
                 app.pending_entry_delete = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_stats(ctx);
+                app.refresh_view_data(ctx);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel deletion
@@ -930,7 +930,7 @@ impl InputHandler {
                 app.pending_entry_deferral = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_stats(ctx);
+                app.refresh_view_data(ctx);
             }
             KeyCode::Esc => {
                 // Cancel deferral input
@@ -1077,7 +1077,7 @@ impl InputHandler {
                 app.pending_entry_ignore = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_stats(ctx);
+                app.refresh_view_data(ctx);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel ignore
@@ -1210,7 +1210,7 @@ impl InputHandler {
         // Clear interaction state and refresh.
         app.exit_visual_mode();
         app.clear_selection();
-        app.refresh_stats(ctx);
+        app.refresh_view_data(ctx);
 
         app.status_message = Some(match (approved_count, unapproved_count) {
             (a, 0) => format!("Approved {a} entr{}", if a == 1 { "y" } else { "ies" }),
@@ -1377,7 +1377,7 @@ impl InputHandler {
             }
         }
 
-        app.refresh_stats(ctx);
+        app.refresh_view_data(ctx);
 
         #[allow(clippy::cast_sign_loss)]
         let bytes_display = super::super::format_bytes(bytes_freed.max(0) as u64);
@@ -1439,7 +1439,7 @@ impl InputHandler {
             tracing::warn!("Failed to record undo audit: {e}");
         }
 
-        app.refresh_stats(ctx);
+        app.refresh_view_data(ctx);
         app.status_message = Some(format!(
             "Undid: {} ({restored} entr{} restored)",
             action.description,
@@ -1487,7 +1487,7 @@ impl InputHandler {
                     tracing::warn!("Failed to record timer reset audit: {e}");
                 }
 
-                app.refresh_stats(ctx);
+                app.refresh_view_data(ctx);
 
                 app.status_message = Some(format!(
                     "Reset timer for {count} entr{} in {}",
@@ -1637,7 +1637,7 @@ impl InputHandler {
             }
             app.status_message = Some(format!("Unignored {success_count} entry/entries"));
             app.status_message_time = Some(std::time::Instant::now());
-            app.refresh_stats(ctx);
+            app.refresh_view_data(ctx);
         }
         app.exit_visual_mode();
         app.clear_selection();
