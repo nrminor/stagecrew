@@ -17,15 +17,6 @@ pub enum RemovalMethod {
 }
 
 impl RemovalMethod {
-    /// Human-readable description for UI display.
-    #[must_use]
-    pub const fn description(self) -> &'static str {
-        match self {
-            Self::Trash => "move to trash",
-            Self::PermanentDelete => "permanently delete",
-        }
-    }
-
     /// Past tense for status messages.
     #[must_use]
     pub const fn past_tense(self) -> &'static str {

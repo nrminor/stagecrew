@@ -9,10 +9,10 @@ use super::{
     App, FocusPanel, PendingAuditExport, PendingDeletion, PendingEntry, SortMode, TuiContext,
     UndoAction, UndoEntry, View,
 };
-use crate::audit::{AuditAction, AuditActorSource, AuditEvent, AuditExportFormat, AuditService};
+use crate::audit::{AuditExportFormat, AuditService};
 use crate::config::Config;
 use crate::db::Database;
-use crate::removal::{RemovalMethod, dry_run_approved, remove};
+use crate::removal::{RemovalMethod, dry_run_approved};
 use crate::scanner::calculate_expiration;
 
 /// Handles keyboard input with vim-style bindings.
@@ -76,7 +76,7 @@ impl InputHandler {
             return;
         }
         if app.pending_remove_path.is_some() {
-            Self::handle_remove_path_confirmation(app, db, key);
+            Self::handle_remove_path_confirmation(app, ctx, key);
             return;
         }
         if app.pending_entry_delete.is_some() {
@@ -92,7 +92,7 @@ impl InputHandler {
             return;
         }
         if app.pending_quota_target.is_some() {
-            Self::handle_quota_target_input(app, db, key);
+            Self::handle_quota_target_input(app, ctx, key);
             return;
         }
         if app.pending_dry_run.is_some() {
@@ -665,85 +665,34 @@ impl InputHandler {
     fn handle_entry_delete_confirmation(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
-                // User confirmed - perform the deletion for all pending entries
-                if let Some(deletion) = &app.pending_entry_delete {
-                    let audit = AuditService::new(ctx.db);
-                    let user = AuditService::current_user();
-                    let root_id = app.current_root_id;
+                if let Some(deletion) = app.pending_entry_delete.take() {
                     let method = deletion.method;
-                    let action_past = method.past_tense();
+                    let write_entries: Vec<_> = deletion
+                        .entries
+                        .iter()
+                        .map(|e| super::dispatcher::WriteEntry {
+                            id: e.id,
+                            path: e.path.clone(),
+                            is_dir: e.is_dir,
+                            status_before: "tracked".to_string(),
+                        })
+                        .collect();
 
-                    let mut success_count = 0;
-                    let mut fail_count = 0;
-                    let total = deletion.entries.len();
+                    app.status_message = Some(format!("{}...", method.past_tense()));
 
-                    for entry in &deletion.entries {
-                        if let Err(e) =
-                            ctx.db
-                                .delete_entry(entry.id, &entry.path, entry.is_dir, method)
-                        {
-                            tracing::warn!(
-                                "Failed to {} entry {}: {}",
-                                method.description(),
-                                entry.path.display(),
-                                e
-                            );
-                            app.status_message =
-                                Some(format!("{} failed: {e}", method.past_tense()));
-                            app.status_message_time = Some(std::time::Instant::now());
-                            fail_count += 1;
-                        } else {
-                            success_count += 1;
-                            // Record audit entry with method-specific detail
-                            let detail = match method {
-                                RemovalMethod::Trash => {
-                                    if entry.is_dir {
-                                        "Directory moved to trash by user"
-                                    } else {
-                                        "File moved to trash by user"
-                                    }
-                                }
-                                RemovalMethod::PermanentDelete => {
-                                    if entry.is_dir {
-                                        "Directory permanently deleted by user"
-                                    } else {
-                                        "File permanently deleted by user"
-                                    }
-                                }
-                            };
-                            if let Err(e) = audit.record_event(&AuditEvent {
-                                user: &user,
-                                actor_source: AuditActorSource::Tui,
-                                action: AuditAction::Remove,
-                                target_path: Some(entry.path.as_path()),
-                                details: Some(detail),
-                                entry_id: Some(entry.id),
-                                root_id,
-                                status_before: Some("tracked"),
-                                status_after: Some("removed"),
-                                outcome: Some("removed"),
-                            }) {
-                                tracing::warn!("Failed to record audit entry for deletion: {}", e);
-                            }
-                        }
-                    }
-
-                    // Show result in status bar
-                    if fail_count == 0 && success_count > 0 {
-                        app.status_message = Some(format!("{action_past} {success_count} file(s)"));
-                        app.status_message_time = Some(std::time::Instant::now());
-                    } else if fail_count > 0 && success_count > 0 {
-                        app.status_message = Some(format!(
-                            "{action_past} {success_count}/{total}, {fail_count} failed"
-                        ));
-                        app.status_message_time = Some(std::time::Instant::now());
-                    }
-                    // If all failed, the last error message is already set
+                    ctx.db_dispatcher
+                        .send(super::dispatcher::DbRequest::Delete {
+                            entries: write_entries,
+                            method,
+                            audit: super::dispatcher::WriteAudit {
+                                user: AuditService::current_user(),
+                                root_id: app.current_root_id,
+                            },
+                        });
                 } else {
                     app.status_message = Some("No files pending delete".to_string());
                     app.status_message_time = Some(std::time::Instant::now());
                 }
-                // Clear pending deletion, visual mode, and selection
                 app.pending_entry_delete = None;
                 app.exit_visual_mode();
                 app.clear_selection();
@@ -846,87 +795,65 @@ impl InputHandler {
                 }
             }
             KeyCode::Enter => {
-                // User confirmed - process the deferral
-                if let Some(deferral) = &app.pending_entry_deferral {
+                if let Some(deferral) = app.pending_entry_deferral.take() {
                     // Parse the input as days (or use default if empty)
                     let days: u32 = if deferral.input.is_empty() {
                         deferral.default_days
                     } else if let Ok(parsed_days) = deferral.input.parse::<u32>() {
                         if parsed_days == 0 {
                             tracing::warn!("Invalid deferral period: must be > 0");
-                            app.pending_entry_deferral = None;
                             return;
                         }
                         parsed_days
                     } else {
                         tracing::warn!("Invalid deferral input: {}", deferral.input);
-                        app.pending_entry_deferral = None;
                         return;
                     };
 
-                    // Calculate deferred_until timestamp
                     let now = jiff::Timestamp::now();
-                    let days_i64 = i64::from(days);
-                    let deferred_until = now.as_second() + (days_i64 * 86400);
+                    let deferred_until = now.as_second() + (i64::from(days) * 86400);
 
-                    let audit = AuditService::new(ctx.db);
-                    let user = AuditService::current_user();
-                    let details = Some(format!("Deferred for {days} days"));
-                    let root_id = app.current_root_id;
+                    let write_entries: Vec<_> = deferral
+                        .entries
+                        .iter()
+                        .map(|e| super::dispatcher::WriteEntry {
+                            id: e.id,
+                            path: e.path.clone(),
+                            is_dir: e.is_dir,
+                            status_before: "tracked".to_string(),
+                        })
+                        .collect();
 
-                    let mut undo_entries = Vec::new();
-
-                    for entry in &deferral.entries {
-                        undo_entries.push(UndoEntry {
-                            entry_id: entry.id,
+                    let undo_entries: Vec<_> = deferral
+                        .entries
+                        .iter()
+                        .map(|e| UndoEntry {
+                            entry_id: e.id,
                             status_before: "tracked".to_string(),
                             deferred_until_before: None,
                             countdown_start_before: None,
-                        });
-                        if let Err(e) = ctx.db.defer_entry(entry.id, deferred_until) {
-                            tracing::warn!("Failed to defer entry {}: {}", entry.path.display(), e);
-                        } else {
-                            // Propagate to children if this is a directory
-                            if entry.is_dir
-                                && let Err(e) = ctx
-                                    .db
-                                    .defer_entries_by_path_prefix(&entry.path, deferred_until)
-                            {
-                                tracing::warn!(
-                                    "Failed to propagate deferral to children of {}: {}",
-                                    entry.path.display(),
-                                    e
-                                );
-                            }
-                            if let Err(e) = audit.record_event(&AuditEvent {
-                                user: &user,
-                                actor_source: AuditActorSource::Tui,
-                                action: AuditAction::Defer,
-                                target_path: Some(entry.path.as_path()),
-                                details: details.as_deref(),
-                                entry_id: Some(entry.id),
-                                root_id,
-                                status_before: Some("tracked"),
-                                status_after: Some("deferred"),
-                                outcome: Some("deferred"),
-                            }) {
-                                tracing::warn!("Failed to record audit entry for deferral: {}", e);
-                            }
-                        }
-                    }
+                        })
+                        .collect();
 
-                    if !undo_entries.is_empty() {
-                        let count = undo_entries.len();
-                        app.undo_stack.push(UndoAction {
-                            description: format!(
-                                "Deferred {count} entr{} for {days} days",
-                                if count == 1 { "y" } else { "ies" }
-                            ),
-                            entries: undo_entries,
-                        });
-                    }
+                    let count = undo_entries.len();
+                    app.undo_stack.push(UndoAction {
+                        description: format!(
+                            "Deferred {count} entr{} for {days} days",
+                            if count == 1 { "y" } else { "ies" }
+                        ),
+                        entries: undo_entries,
+                    });
+
+                    ctx.db_dispatcher.send(super::dispatcher::DbRequest::Defer {
+                        entries: write_entries,
+                        deferred_until,
+                        days,
+                        audit: super::dispatcher::WriteAudit {
+                            user: AuditService::current_user(),
+                            root_id: app.current_root_id,
+                        },
+                    });
                 }
-                // Clear pending deferral, visual mode, and selection
                 app.pending_entry_deferral = None;
                 app.exit_visual_mode();
                 app.clear_selection();
@@ -1013,67 +940,46 @@ impl InputHandler {
     fn handle_entry_ignore_confirmation(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
-                // User confirmed - perform the ignore for all pending entries
-                if let Some(entries) = &app.pending_entry_ignore {
-                    let audit = AuditService::new(ctx.db);
-                    let user = AuditService::current_user();
-                    let root_id = app.current_root_id;
-                    let mut undo_entries = Vec::new();
+                if let Some(entries) = app.pending_entry_ignore.take() {
+                    let write_entries: Vec<_> = entries
+                        .iter()
+                        .map(|e| super::dispatcher::WriteEntry {
+                            id: e.id,
+                            path: e.path.clone(),
+                            is_dir: e.is_dir,
+                            status_before: "tracked".to_string(),
+                        })
+                        .collect();
 
-                    for entry in entries {
-                        undo_entries.push(UndoEntry {
-                            entry_id: entry.id,
+                    let undo_entries: Vec<_> = entries
+                        .iter()
+                        .map(|e| UndoEntry {
+                            entry_id: e.id,
                             status_before: "tracked".to_string(),
                             deferred_until_before: None,
                             countdown_start_before: None,
-                        });
-                        if let Err(e) = ctx.db.update_entry_status(entry.id, "ignored") {
-                            tracing::warn!(
-                                "Failed to ignore entry {}: {}",
-                                entry.path.display(),
-                                e
-                            );
-                        } else {
-                            // Propagate to children if this is a directory
-                            if entry.is_dir
-                                && let Err(e) =
-                                    ctx.db.update_entries_by_path_prefix(&entry.path, "ignored")
-                            {
-                                tracing::warn!(
-                                    "Failed to propagate ignore to children of {}: {}",
-                                    entry.path.display(),
-                                    e
-                                );
-                            }
-                            if let Err(e) = audit.record_event(&AuditEvent {
-                                user: &user,
-                                actor_source: AuditActorSource::Tui,
-                                action: AuditAction::Ignore,
-                                target_path: Some(entry.path.as_path()),
-                                details: None,
-                                entry_id: Some(entry.id),
-                                root_id,
-                                status_before: Some("tracked"),
-                                status_after: Some("ignored"),
-                                outcome: Some("ignored"),
-                            }) {
-                                tracing::warn!("Failed to record audit entry for ignore: {}", e);
-                            }
-                        }
-                    }
+                        })
+                        .collect();
 
-                    if !undo_entries.is_empty() {
-                        let count = undo_entries.len();
-                        app.undo_stack.push(UndoAction {
-                            description: format!(
-                                "Ignored {count} entr{}",
-                                if count == 1 { "y" } else { "ies" }
-                            ),
-                            entries: undo_entries,
+                    let count = undo_entries.len();
+                    app.undo_stack.push(UndoAction {
+                        description: format!(
+                            "Ignored {count} entr{}",
+                            if count == 1 { "y" } else { "ies" }
+                        ),
+                        entries: undo_entries,
+                    });
+
+                    ctx.db_dispatcher
+                        .send(super::dispatcher::DbRequest::UpdateStatus {
+                            entries: write_entries,
+                            new_status: "ignored".to_string(),
+                            audit: super::dispatcher::WriteAudit {
+                                user: AuditService::current_user(),
+                                root_id: app.current_root_id,
+                            },
                         });
-                    }
                 }
-                // Clear pending ignore, visual mode, and selection
                 app.pending_entry_ignore = None;
                 app.exit_visual_mode();
                 app.clear_selection();
@@ -1121,12 +1027,16 @@ impl InputHandler {
             return;
         }
 
-        let audit = AuditService::new(ctx.db);
         let user = AuditService::current_user();
         let root_id = app.current_root_id;
+        let audit = super::dispatcher::WriteAudit {
+            user: user.clone(),
+            root_id,
+        };
 
-        let mut approved_count = 0;
-        let mut unapproved_count = 0;
+        // Split into approve and unapprove groups
+        let mut to_approve = Vec::new();
+        let mut to_unapprove = Vec::new();
         let mut undo_entries = Vec::new();
 
         for (entry, current_status) in &entries_to_toggle {
@@ -1136,63 +1046,42 @@ impl InputHandler {
                 deferred_until_before: None,
                 countdown_start_before: None,
             });
-            let (next_status, details) = if current_status == "approved" {
-                unapproved_count += 1;
-                ("tracked", Some("Unapproved (set status to tracked)"))
-            } else {
-                approved_count += 1;
-                ("approved", None)
+            let write_entry = super::dispatcher::WriteEntry {
+                id: entry.id,
+                path: entry.path.clone(),
+                is_dir: entry.is_dir,
+                status_before: current_status.clone(),
             };
-
-            if let Err(e) = ctx.db.update_entry_status(entry.id, next_status) {
-                tracing::warn!(
-                    "Failed to set approval status for entry {}: {}",
-                    entry.path.display(),
-                    e
-                );
-                continue;
-            }
-
-            // Propagate to children if this is a directory
-            if entry.is_dir
-                && let Err(e) = ctx
-                    .db
-                    .update_entries_by_path_prefix(&entry.path, next_status)
-            {
-                tracing::warn!(
-                    "Failed to propagate {} to children of {}: {}",
-                    next_status,
-                    entry.path.display(),
-                    e
-                );
-            }
-
-            let action = if next_status == "approved" {
-                AuditAction::Approve
+            if current_status == "approved" {
+                to_unapprove.push(write_entry);
             } else {
-                AuditAction::Unapprove
-            };
-            if let Err(e) = audit.record_event(&AuditEvent {
-                user: &user,
-                actor_source: AuditActorSource::Tui,
-                action,
-                target_path: Some(entry.path.as_path()),
-                details,
-                entry_id: Some(entry.id),
-                root_id,
-                status_before: Some(current_status.as_str()),
-                status_after: Some(next_status),
-                outcome: Some(if next_status == "approved" {
-                    "approved"
-                } else {
-                    "unapproved"
-                }),
-            }) {
-                tracing::warn!("Failed to record audit entry for approval toggle: {}", e);
+                to_approve.push(write_entry);
             }
         }
 
-        // Record undo action.
+        let approved_count = to_approve.len();
+        let unapproved_count = to_unapprove.len();
+
+        if !to_approve.is_empty() {
+            ctx.db_dispatcher
+                .send(super::dispatcher::DbRequest::UpdateStatus {
+                    entries: to_approve,
+                    new_status: "approved".to_string(),
+                    audit: super::dispatcher::WriteAudit {
+                        user: user.clone(),
+                        root_id,
+                    },
+                });
+        }
+        if !to_unapprove.is_empty() {
+            ctx.db_dispatcher
+                .send(super::dispatcher::DbRequest::UpdateStatus {
+                    entries: to_unapprove,
+                    new_status: "tracked".to_string(),
+                    audit,
+                });
+        }
+
         if !undo_entries.is_empty() {
             let desc = match (approved_count, unapproved_count) {
                 (a, 0) => format!("Approved {a} entr{}", if a == 1 { "y" } else { "ies" }),
@@ -1202,12 +1091,11 @@ impl InputHandler {
                 (a, u) => format!("Toggled approval for {} entries", a + u),
             };
             app.undo_stack.push(UndoAction {
-                description: desc.clone(),
+                description: desc,
                 entries: undo_entries,
             });
         }
 
-        // Clear interaction state and refresh.
         app.exit_visual_mode();
         app.clear_selection();
         app.dispatch_refresh(ctx.db_dispatcher, ctx);
@@ -1216,10 +1104,8 @@ impl InputHandler {
             (a, 0) => format!("Approved {a} entr{}", if a == 1 { "y" } else { "ies" }),
             (0, u) => format!("Unapproved {u} entr{}", if u == 1 { "y" } else { "ies" }),
             (a, u) => format!(
-                "Updated approval for {} entries ({} approved, {} unapproved)",
+                "Updated approval for {} entries ({a} approved, {u} unapproved)",
                 a + u,
-                a,
-                u
             ),
         });
         app.status_message_time = Some(std::time::Instant::now());
@@ -1306,91 +1192,24 @@ impl InputHandler {
             return;
         };
 
-        let entries = match ctx.db.list_entries_by_root_and_status(root_id, "approved") {
-            Ok(entries) => entries,
-            Err(e) => {
-                app.status_message = Some(format!("Failed to query approved entries: {e}"));
-                app.status_message_time = Some(std::time::Instant::now());
-                return;
-            }
-        };
-
-        if entries.is_empty() {
+        // Quick check against cached data to avoid dispatching a no-op
+        let has_approved = app.root_entries.iter().any(|e| e.status == "approved");
+        if !has_approved {
             app.status_message = Some("No approved entries to remove".to_string());
             app.status_message_time = Some(std::time::Instant::now());
             return;
         }
 
-        let audit = AuditService::new(ctx.db);
-        let user = AuditService::current_user();
-        let mut removed = 0u64;
-        let mut blocked = 0u64;
-        let mut bytes_freed = 0i64;
-
-        for entry in &entries {
-            match remove(&entry.path, RemovalMethod::PermanentDelete) {
-                Ok(_) => {
-                    if let Err(e) = ctx.db.update_entry_status(entry.id, "removed") {
-                        tracing::warn!("Failed to update status after removal: {e}");
-                    }
-                    removed += 1;
-                    bytes_freed += entry.size_bytes;
-
-                    let details = format!("Permanently deleted {} bytes", entry.size_bytes);
-                    if let Err(e) = audit.record_event(&AuditEvent {
-                        user: &user,
-                        actor_source: AuditActorSource::Tui,
-                        action: AuditAction::Remove,
-                        target_path: Some(entry.path.as_path()),
-                        details: Some(&details),
-                        entry_id: Some(entry.id),
-                        root_id: Some(root_id),
-                        status_before: Some("approved"),
-                        status_after: Some("removed"),
-                        outcome: Some("removed"),
-                    }) {
-                        tracing::warn!("Failed to record removal audit: {e}");
-                    }
-                }
-                Err(e) => {
-                    if let Err(db_err) = ctx.db.update_entry_status(entry.id, "blocked") {
-                        tracing::warn!("Failed to update status to blocked: {db_err}");
-                    }
-                    blocked += 1;
-
-                    let details = format!("Blocked: {e}");
-                    if let Err(audit_err) = audit.record_event(&AuditEvent {
-                        user: &user,
-                        actor_source: AuditActorSource::Tui,
-                        action: AuditAction::Remove,
-                        target_path: Some(entry.path.as_path()),
-                        details: Some(&details),
-                        entry_id: Some(entry.id),
-                        root_id: Some(root_id),
-                        status_before: Some("approved"),
-                        status_after: Some("blocked"),
-                        outcome: Some("blocked"),
-                    }) {
-                        tracing::warn!("Failed to record blocked removal audit: {audit_err}");
-                    }
-                }
-            }
-        }
-
+        app.status_message = Some("Removing approved entries...".to_string());
+        ctx.db_dispatcher
+            .send(super::dispatcher::DbRequest::ExecuteRemovals {
+                root_id,
+                audit: super::dispatcher::WriteAudit {
+                    user: AuditService::current_user(),
+                    root_id: Some(root_id),
+                },
+            });
         app.dispatch_refresh(ctx.db_dispatcher, ctx);
-
-        #[allow(clippy::cast_sign_loss)]
-        let bytes_display = super::super::format_bytes(bytes_freed.max(0) as u64);
-        app.status_message = Some(format!(
-            "Removed {removed} file{}, freed {bytes_display}{}",
-            if removed == 1 { "" } else { "s" },
-            if blocked > 0 {
-                format!(" ({blocked} blocked)")
-            } else {
-                String::new()
-            }
-        ));
-        app.status_message_time = Some(std::time::Instant::now());
     }
 
     /// Undo the most recent reversible action.
@@ -1405,47 +1224,28 @@ impl InputHandler {
             return;
         };
 
-        let audit = AuditService::new(ctx.db);
-        let user = AuditService::current_user();
-        let root_id = app.current_root_id;
-        let mut restored = 0u64;
+        let undo_writes: Vec<_> = action
+            .entries
+            .iter()
+            .map(|e| super::dispatcher::UndoWrite {
+                entry_id: e.entry_id,
+                status_before: e.status_before.clone(),
+                countdown_start_before: e.countdown_start_before,
+                deferred_until_before: e.deferred_until_before,
+            })
+            .collect();
 
-        for undo_entry in &action.entries {
-            if let Err(e) = ctx.db.restore_entry_state(
-                undo_entry.entry_id,
-                &undo_entry.status_before,
-                undo_entry.countdown_start_before,
-                undo_entry.deferred_until_before,
-            ) {
-                tracing::warn!("Failed to undo entry {}: {e}", undo_entry.entry_id);
-                continue;
-            }
-            restored += 1;
-        }
+        app.status_message = Some(format!("Undoing: {}", action.description));
 
-        let details = format!("Undid: {}", action.description);
-        if let Err(e) = audit.record_event(&AuditEvent {
-            user: &user,
-            actor_source: AuditActorSource::Tui,
-            action: AuditAction::Undo,
-            target_path: None,
-            details: Some(&details),
-            entry_id: None,
-            root_id,
-            status_before: None,
-            status_after: None,
-            outcome: Some("undone"),
-        }) {
-            tracing::warn!("Failed to record undo audit: {e}");
-        }
-
+        ctx.db_dispatcher.send(super::dispatcher::DbRequest::Undo {
+            entries: undo_writes,
+            description: action.description,
+            audit: super::dispatcher::WriteAudit {
+                user: AuditService::current_user(),
+                root_id: app.current_root_id,
+            },
+        });
         app.dispatch_refresh(ctx.db_dispatcher, ctx);
-        app.status_message = Some(format!(
-            "Undid: {} ({restored} entr{} restored)",
-            action.description,
-            if restored == 1 { "y" } else { "ies" }
-        ));
-        app.status_message_time = Some(std::time::Instant::now());
     }
 
     /// Reset the countdown timer for all entries under the current root.
@@ -1460,47 +1260,16 @@ impl InputHandler {
             return;
         };
 
-        let root_path = ctx
-            .db
-            .get_root(root_id)
-            .ok()
-            .flatten()
-            .map(|r| r.path)
-            .unwrap_or_default();
-
-        match ctx.db.reset_root_countdowns(root_id) {
-            Ok(count) => {
-                let audit = AuditService::new(ctx.db);
-                let user = AuditService::current_user();
-                if let Err(e) = audit.record_event(&AuditEvent {
-                    user: &user,
-                    actor_source: AuditActorSource::Tui,
-                    action: AuditAction::Defer,
-                    target_path: Some(root_path.as_path()),
-                    details: Some(&format!("Reset countdown for {count} entries under root")),
-                    entry_id: None,
+        app.status_message = Some("Resetting timers...".to_string());
+        ctx.db_dispatcher
+            .send(super::dispatcher::DbRequest::ResetRootTimer {
+                root_id,
+                audit: super::dispatcher::WriteAudit {
+                    user: AuditService::current_user(),
                     root_id: Some(root_id),
-                    status_before: None,
-                    status_after: Some("tracked"),
-                    outcome: Some("reset"),
-                }) {
-                    tracing::warn!("Failed to record timer reset audit: {e}");
-                }
-
-                app.dispatch_refresh(ctx.db_dispatcher, ctx);
-
-                app.status_message = Some(format!(
-                    "Reset timer for {count} entr{} in {}",
-                    if count == 1 { "y" } else { "ies" },
-                    root_path.display()
-                ));
-                app.status_message_time = Some(std::time::Instant::now());
-            }
-            Err(e) => {
-                app.status_message = Some(format!("Timer reset failed: {e}"));
-                app.status_message_time = Some(std::time::Instant::now());
-            }
-        }
+                },
+            });
+        app.dispatch_refresh(ctx.db_dispatcher, ctx);
     }
 
     /// Unignore an entry (reset status from "ignored" back to "tracked").
@@ -1578,67 +1347,46 @@ impl InputHandler {
             return;
         }
 
-        // Perform the unignore
-        let audit = AuditService::new(ctx.db);
-        let user = AuditService::current_user();
-        let root_id = app.current_root_id;
-        let mut undo_entries = Vec::new();
+        let write_entries: Vec<_> = entries_to_unignore
+            .iter()
+            .map(|e| super::dispatcher::WriteEntry {
+                id: e.id,
+                path: e.path.clone(),
+                is_dir: e.is_dir,
+                status_before: "ignored".to_string(),
+            })
+            .collect();
 
-        let mut success_count = 0;
-        for entry in &entries_to_unignore {
-            if let Err(e) = ctx.db.update_entry_status(entry.id, "tracked") {
-                tracing::warn!("Failed to unignore entry {}: {}", entry.path.display(), e);
-                app.status_message = Some(format!("Unignore failed: {e}"));
-                app.status_message_time = Some(std::time::Instant::now());
-            } else {
-                success_count += 1;
-                undo_entries.push(UndoEntry {
-                    entry_id: entry.id,
-                    status_before: "ignored".to_string(),
-                    deferred_until_before: None,
-                    countdown_start_before: None,
-                });
-                // Propagate to children if this is a directory
-                if entry.is_dir
-                    && let Err(e) = ctx.db.update_entries_by_path_prefix(&entry.path, "tracked")
-                {
-                    tracing::warn!(
-                        "Failed to propagate unignore to children of {}: {}",
-                        entry.path.display(),
-                        e
-                    );
-                }
-                if let Err(e) = audit.record_event(&AuditEvent {
-                    user: &user,
-                    actor_source: AuditActorSource::Tui,
-                    action: AuditAction::Unignore,
-                    target_path: Some(entry.path.as_path()),
-                    details: None,
-                    entry_id: Some(entry.id),
-                    root_id,
-                    status_before: Some("ignored"),
-                    status_after: Some("tracked"),
-                    outcome: Some("unignored"),
-                }) {
-                    tracing::warn!("Failed to record audit entry for unignore: {}", e);
-                }
-            }
-        }
+        let undo_entries: Vec<_> = entries_to_unignore
+            .iter()
+            .map(|e| UndoEntry {
+                entry_id: e.id,
+                status_before: "ignored".to_string(),
+                deferred_until_before: None,
+                countdown_start_before: None,
+            })
+            .collect();
 
-        if success_count > 0 {
-            if !undo_entries.is_empty() {
-                app.undo_stack.push(UndoAction {
-                    description: format!(
-                        "Unignored {success_count} entr{}",
-                        if success_count == 1 { "y" } else { "ies" }
-                    ),
-                    entries: undo_entries,
-                });
-            }
-            app.status_message = Some(format!("Unignored {success_count} entry/entries"));
-            app.status_message_time = Some(std::time::Instant::now());
-            app.dispatch_refresh(ctx.db_dispatcher, ctx);
-        }
+        let count = undo_entries.len();
+        app.undo_stack.push(UndoAction {
+            description: format!(
+                "Unignored {count} entr{}",
+                if count == 1 { "y" } else { "ies" }
+            ),
+            entries: undo_entries,
+        });
+
+        ctx.db_dispatcher
+            .send(super::dispatcher::DbRequest::UpdateStatus {
+                entries: write_entries,
+                new_status: "tracked".to_string(),
+                audit: super::dispatcher::WriteAudit {
+                    user: AuditService::current_user(),
+                    root_id: app.current_root_id,
+                },
+            });
+
+        app.dispatch_refresh(ctx.db_dispatcher, ctx);
         app.exit_visual_mode();
         app.clear_selection();
     }
@@ -1843,12 +1591,11 @@ impl InputHandler {
                         return;
                     }
 
-                    // Insert as a root in the database
-                    if let Err(e) = ctx.db.insert_root(&canonical_path) {
-                        tracing::warn!("Failed to add root to database: {}", e);
-                        app.pending_add_path = None;
-                        return;
-                    }
+                    ctx.db_dispatcher
+                        .send(super::dispatcher::DbRequest::InsertRoot {
+                            path: canonical_path.clone(),
+                        });
+                    app.dispatch_refresh(ctx.db_dispatcher, ctx);
 
                     tracing::info!(
                         "Added tracked path: {} (will be included on next refresh)",
@@ -1899,41 +1646,26 @@ impl InputHandler {
     }
 
     /// Handle remove path confirmation (y/n/Esc).
-    fn handle_remove_path_confirmation(app: &mut App, db: &Database, key: KeyEvent) {
+    fn handle_remove_path_confirmation(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
-                // User confirmed - remove the root from the database
                 if let Some(path_to_remove) = &app.pending_remove_path {
-                    match db.get_root_by_path(path_to_remove) {
-                        Ok(Some(root)) => {
-                            if let Err(e) = db.delete_root(root.id) {
-                                tracing::warn!("Failed to remove root from database: {}", e);
-                            } else {
-                                tracing::info!(
-                                    "Removed tracked path: {}",
-                                    path_to_remove.display()
-                                );
-                                // If we were browsing this root, clear the view
-                                if app.current_path.starts_with(path_to_remove) {
-                                    app.current_path = PathBuf::new();
-                                    app.current_root_id = None;
-                                    app.focus_panel = FocusPanel::Sidebar;
-                                }
-                            }
+                    // Find the root ID from the cached roots list
+                    if let Some(root) = app.roots.iter().find(|r| r.path == *path_to_remove) {
+                        let root_id = root.id;
+                        ctx.db_dispatcher
+                            .send(super::dispatcher::DbRequest::DeleteRoot { root_id });
+                        tracing::info!("Removed tracked path: {}", path_to_remove.display());
+                        if app.current_path.starts_with(path_to_remove) {
+                            app.current_path = PathBuf::new();
+                            app.current_root_id = None;
+                            app.focus_panel = FocusPanel::Sidebar;
                         }
-                        Ok(None) => {
-                            tracing::warn!(
-                                "Root not found in database: {}",
-                                path_to_remove.display()
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to look up root: {}", e);
-                        }
+                        app.dispatch_refresh(ctx.db_dispatcher, ctx);
+                    } else {
+                        tracing::warn!("Root not found: {}", path_to_remove.display());
                     }
                 }
-
-                // Clear pending remove path
                 app.pending_remove_path = None;
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
@@ -1983,7 +1715,7 @@ impl InputHandler {
     }
 
     /// Handle quota target input (digits, Tab, arrows, Enter, Esc).
-    fn handle_quota_target_input(app: &mut App, db: &Database, key: KeyEvent) {
+    fn handle_quota_target_input(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         let Some(ref mut target) = app.pending_quota_target else {
             return;
         };
@@ -2000,7 +1732,7 @@ impl InputHandler {
                     target.focus = super::QuotaTargetFocus::Unit;
                 }
                 KeyCode::Enter => {
-                    Self::confirm_quota_target(app, db);
+                    Self::confirm_quota_target(app, ctx);
                 }
                 KeyCode::Esc => {
                     app.pending_quota_target = None;
@@ -2018,7 +1750,7 @@ impl InputHandler {
                     target.focus = super::QuotaTargetFocus::Size;
                 }
                 KeyCode::Enter => {
-                    Self::confirm_quota_target(app, db);
+                    Self::confirm_quota_target(app, ctx);
                 }
                 KeyCode::Esc => {
                     app.pending_quota_target = None;
@@ -2029,7 +1761,7 @@ impl InputHandler {
     }
 
     /// Confirm and save the quota target.
-    fn confirm_quota_target(app: &mut App, db: &Database) {
+    fn confirm_quota_target(app: &mut App, ctx: &TuiContext) {
         let Some(target) = app.pending_quota_target.take() else {
             return;
         };
@@ -2048,16 +1780,18 @@ impl InputHandler {
             }
         };
 
-        if let Err(e) = db.set_root_target_bytes(target.root_id, target_bytes) {
-            tracing::warn!("Failed to set quota target: {}", e);
-        } else {
-            let msg = match target_bytes {
-                Some(_) => format!("Quota target set to {} {}", target.input, target.unit),
-                None => "Quota target cleared".to_string(),
-            };
-            app.status_message = Some(msg);
-            app.status_message_time = Some(std::time::Instant::now());
-        }
+        ctx.db_dispatcher
+            .send(super::dispatcher::DbRequest::SetQuotaTarget {
+                root_id: target.root_id,
+                target_bytes,
+            });
+        app.dispatch_refresh(ctx.db_dispatcher, ctx);
+        let msg = match target_bytes {
+            Some(_) => format!("Quota target set to {} {}", target.input, target.unit),
+            None => "Quota target cleared".to_string(),
+        };
+        app.status_message = Some(msg);
+        app.status_message_time = Some(std::time::Instant::now());
     }
 }
 
@@ -2079,21 +1813,26 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
-    fn temp_database() -> (Database, tempfile::TempDir) {
+    fn temp_database() -> (Database, std::path::PathBuf, tempfile::TempDir) {
         let dir = tempdir().expect("Failed to create temp dir");
         let db_path = dir.path().join("test.db");
         let db = Database::open(&db_path).expect("Failed to create test database");
-        (db, dir)
+        (db, db_path, dir)
     }
 
     fn test_config() -> Config {
         Config::default()
     }
 
-    /// Noop dispatcher that lives alongside the test context.
-    /// Kept as a separate binding so the dispatcher outlives the context.
+    /// Noop dispatcher for tests that don't need DB writes to take effect.
     fn test_dispatcher() -> crate::tui::dispatcher::DbDispatcher {
         crate::tui::dispatcher::DbDispatcher::noop()
+    }
+
+    /// Synchronous dispatcher that writes directly to the DB, for tests
+    /// that assert on DB state after dispatching actions.
+    fn test_sync_dispatcher(db_path: &Path) -> crate::tui::dispatcher::DbDispatcher {
+        crate::tui::dispatcher::DbDispatcher::sync_for_db(db_path)
     }
 
     fn test_context<'a>(
@@ -2112,7 +1851,7 @@ mod tests {
 
     #[test]
     fn tab_switches_focus_between_panels() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2132,7 +1871,7 @@ mod tests {
 
     #[test]
     fn h_at_root_level_returns_to_sidebar() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2150,7 +1889,7 @@ mod tests {
 
     #[test]
     fn h_in_subdirectory_navigates_up() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2172,7 +1911,7 @@ mod tests {
 
     #[test]
     fn h_in_sidebar_is_noop() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2189,7 +1928,7 @@ mod tests {
 
     #[test]
     fn l_from_sidebar_enters_root() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2210,7 +1949,7 @@ mod tests {
 
     #[test]
     fn l_on_directory_entry_navigates_into_it() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2252,7 +1991,7 @@ mod tests {
 
     #[test]
     fn l_on_file_entry_is_noop() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2283,7 +2022,7 @@ mod tests {
 
     #[test]
     fn j_navigates_down_in_focused_panel() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2309,7 +2048,7 @@ mod tests {
 
     #[test]
     fn k_navigates_up_in_focused_panel() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2330,7 +2069,7 @@ mod tests {
 
     #[test]
     fn g_goes_to_top_of_focused_panel() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2351,7 +2090,7 @@ mod tests {
 
     #[test]
     fn capital_g_goes_to_bottom_of_focused_panel() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2378,7 +2117,7 @@ mod tests {
 
     #[test]
     fn s_cycles_sort_modes() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2403,7 +2142,7 @@ mod tests {
 
     #[test]
     fn number_1_switches_to_file_list_view() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2416,7 +2155,7 @@ mod tests {
 
     #[test]
     fn number_2_switches_to_audit_log_view() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2429,7 +2168,7 @@ mod tests {
 
     #[test]
     fn question_mark_switches_to_help_view() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2442,7 +2181,7 @@ mod tests {
 
     #[test]
     fn number_3_switches_to_help_view() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2455,7 +2194,7 @@ mod tests {
 
     #[test]
     fn help_view_closes_on_any_key() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2468,7 +2207,7 @@ mod tests {
 
     #[test]
     fn audit_log_view_returns_to_file_list_on_q() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2481,7 +2220,7 @@ mod tests {
 
     #[test]
     fn audit_log_j_clamps_at_bottom_without_accumulating_extra_steps() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2504,7 +2243,7 @@ mod tests {
 
     #[test]
     fn audit_log_view_switches_to_help_on_question_mark() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2517,7 +2256,7 @@ mod tests {
 
     #[test]
     fn audit_log_view_e_opens_export_modal() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2530,7 +2269,7 @@ mod tests {
 
     #[test]
     fn audit_export_modal_tab_cycles_format() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2556,7 +2295,7 @@ mod tests {
 
     #[test]
     fn q_quits_application() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2569,7 +2308,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits_application() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2588,7 +2327,7 @@ mod tests {
 
     #[test]
     fn enter_in_sidebar_sets_current_path_and_focuses_main_panel() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2612,7 +2351,7 @@ mod tests {
 
     #[test]
     fn enter_in_sidebar_with_no_roots_is_noop() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2628,7 +2367,7 @@ mod tests {
 
     #[test]
     fn backspace_at_root_level_returns_to_sidebar() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2649,7 +2388,7 @@ mod tests {
 
     #[test]
     fn backspace_not_at_root_level_is_noop() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2704,7 +2443,7 @@ mod tests {
 
     #[test]
     fn d_key_initiates_file_delete_confirmation() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2746,7 +2485,7 @@ mod tests {
 
     #[test]
     fn d_key_ignored_when_sidebar_focused() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2771,10 +2510,10 @@ mod tests {
 
     #[test]
     fn file_delete_confirmation_y_deletes_file() {
-        let (db, _db_dir) = temp_database();
+        let (db, db_path, _db_dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let dispatcher = test_dispatcher();
+        let dispatcher = test_sync_dispatcher(&db_path);
         let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Create a real temporary file for deletion
@@ -2841,7 +2580,7 @@ mod tests {
 
     #[test]
     fn file_delete_confirmation_n_cancels() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2886,7 +2625,7 @@ mod tests {
 
     #[test]
     fn r_key_initiates_file_deferral() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -2923,10 +2662,10 @@ mod tests {
 
     #[test]
     fn file_deferral_enter_confirms_with_default_days() {
-        let (db, _dir) = temp_database();
+        let (db, db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let dispatcher = test_dispatcher();
+        let dispatcher = test_sync_dispatcher(&db_path);
         let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
@@ -2973,10 +2712,10 @@ mod tests {
 
     #[test]
     fn file_deferral_enter_confirms_with_custom_days() {
-        let (db, _dir) = temp_database();
+        let (db, db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let dispatcher = test_dispatcher();
+        let dispatcher = test_sync_dispatcher(&db_path);
         let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
@@ -3027,7 +2766,7 @@ mod tests {
 
     #[test]
     fn i_key_initiates_file_ignore() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3061,10 +2800,10 @@ mod tests {
 
     #[test]
     fn file_ignore_confirmation_y_ignores_file() {
-        let (db, _dir) = temp_database();
+        let (db, db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let dispatcher = test_dispatcher();
+        let dispatcher = test_sync_dispatcher(&db_path);
         let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
@@ -3100,10 +2839,10 @@ mod tests {
 
     #[test]
     fn x_key_approves_file_immediately() {
-        let (db, _dir) = temp_database();
+        let (db, db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let dispatcher = test_dispatcher();
+        let dispatcher = test_sync_dispatcher(&db_path);
         let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
@@ -3134,7 +2873,7 @@ mod tests {
 
     #[test]
     fn x_key_toggles_approved_entry_back_to_tracked() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3202,7 +2941,7 @@ mod tests {
 
     #[test]
     fn find_search_matches_returns_matching_indices() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3249,7 +2988,7 @@ mod tests {
 
     #[test]
     fn find_search_matches_is_case_insensitive() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3283,7 +3022,7 @@ mod tests {
 
     #[test]
     fn find_search_matches_no_matches_returns_empty() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3309,7 +3048,7 @@ mod tests {
 
     #[test]
     fn slash_enters_search_mode() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3329,7 +3068,7 @@ mod tests {
 
     #[test]
     fn slash_only_works_in_main_panel() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3348,7 +3087,7 @@ mod tests {
 
     #[test]
     fn search_input_appends_characters() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3369,7 +3108,7 @@ mod tests {
 
     #[test]
     fn search_input_backspace_removes_character() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3385,7 +3124,7 @@ mod tests {
 
     #[test]
     fn search_input_esc_cancels_search() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3405,7 +3144,7 @@ mod tests {
 
     #[test]
     fn search_enter_confirms_and_jumps_to_first_match() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3445,7 +3184,7 @@ mod tests {
 
     #[test]
     fn n_jumps_to_next_match() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3495,7 +3234,7 @@ mod tests {
 
     #[test]
     fn capital_n_jumps_to_previous_match() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3525,7 +3264,7 @@ mod tests {
 
     #[test]
     fn esc_clears_confirmed_search() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3557,7 +3296,7 @@ mod tests {
 
     #[test]
     fn navigate_up_clears_search() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3573,7 +3312,7 @@ mod tests {
 
     #[test]
     fn n_without_search_is_noop() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3640,7 +3379,7 @@ mod tests {
 
     #[test]
     fn v_enters_visual_mode_with_anchor_at_cursor() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3665,7 +3404,7 @@ mod tests {
 
     #[test]
     fn v_again_exits_visual_mode_keeping_selection() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3692,7 +3431,7 @@ mod tests {
 
     #[test]
     fn visual_mode_j_extends_selection_downward() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3722,7 +3461,7 @@ mod tests {
 
     #[test]
     fn visual_mode_k_extends_selection_upward() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3752,7 +3491,7 @@ mod tests {
 
     #[test]
     fn visual_mode_preserves_pre_existing_space_selections() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3791,7 +3530,7 @@ mod tests {
 
     #[test]
     fn visual_mode_shrinks_when_cursor_reverses() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3827,7 +3566,7 @@ mod tests {
 
     #[test]
     fn esc_exits_visual_mode_but_keeps_selection() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3856,7 +3595,7 @@ mod tests {
 
     #[test]
     fn space_exits_visual_mode() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3879,7 +3618,7 @@ mod tests {
 
     #[test]
     fn h_navigation_exits_visual_mode() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3900,7 +3639,7 @@ mod tests {
 
     #[test]
     fn visual_mode_g_extends_to_top() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3929,7 +3668,7 @@ mod tests {
 
     #[test]
     fn v_on_empty_directory_is_noop() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3946,7 +3685,7 @@ mod tests {
 
     #[test]
     fn a_selects_all_entries_in_current_directory() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -3971,7 +3710,7 @@ mod tests {
 
     #[test]
     fn y_key_shows_status_message_when_no_approved_entries() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -3998,7 +3737,7 @@ mod tests {
 
     #[test]
     fn y_key_opens_modal_when_approved_entries_fail_check() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -4031,7 +3770,7 @@ mod tests {
 
     #[test]
     fn y_key_ignored_in_sidebar() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -4050,7 +3789,7 @@ mod tests {
 
     #[test]
     fn dry_run_modal_dismissed_by_any_key() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -4078,7 +3817,7 @@ mod tests {
 
     #[test]
     fn f_key_shows_message_when_no_approved_entries() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -4099,7 +3838,7 @@ mod tests {
 
     #[test]
     fn f_key_ignored_in_sidebar() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -4114,10 +3853,10 @@ mod tests {
 
     #[test]
     fn t_key_resets_root_timer() {
-        let (db, _dir) = temp_database();
+        let (db, db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let dispatcher = test_dispatcher();
+        let dispatcher = test_sync_dispatcher(&db_path);
         let ctx = test_context(&db, &app_config, &dispatcher);
 
         let (root_id, file_ids) = setup_with_files(&db);
@@ -4132,12 +3871,12 @@ mod tests {
 
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('T')));
 
-        // Status message should confirm reset
+        // Status message should indicate the reset is in progress
         assert!(
             app.status_message
                 .as_deref()
-                .is_some_and(|m| m.contains("Reset timer")),
-            "Should show timer reset confirmation"
+                .is_some_and(|m| m.contains("Resetting")),
+            "Should show timer reset status"
         );
 
         // Previously approved entry should be back to tracked
@@ -4156,7 +3895,7 @@ mod tests {
 
     #[test]
     fn t_key_with_no_root_shows_message() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -4172,7 +3911,7 @@ mod tests {
 
     #[test]
     fn a_in_sidebar_does_nothing() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
@@ -4191,10 +3930,10 @@ mod tests {
 
     #[test]
     fn u_key_undoes_approval() {
-        let (db, _dir) = temp_database();
+        let (db, db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let dispatcher = test_dispatcher();
+        let dispatcher = test_sync_dispatcher(&db_path);
         let ctx = test_context(&db, &app_config, &dispatcher);
 
         let (root_id, file_ids) = setup_with_files(&db);
@@ -4231,7 +3970,7 @@ mod tests {
 
     #[test]
     fn u_key_with_empty_stack_shows_message() {
-        let (db, _dir) = temp_database();
+        let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
@@ -4246,10 +3985,10 @@ mod tests {
 
     #[test]
     fn capital_i_unignores_entry() {
-        let (db, _dir) = temp_database();
+        let (db, db_path, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let dispatcher = test_dispatcher();
+        let dispatcher = test_sync_dispatcher(&db_path);
         let ctx = test_context(&db, &app_config, &dispatcher);
 
         let (root_id, file_ids) = setup_with_files(&db);

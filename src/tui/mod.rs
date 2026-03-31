@@ -935,6 +935,19 @@ impl App {
                 self.loading.audit_entries = false;
                 self.audit_entries = entries;
             }
+            dispatcher::DbResult::WriteOk => {
+                // Optimistic state was correct — nothing to do.
+            }
+            dispatcher::DbResult::WritePartial { message } => {
+                self.status_message = Some(message);
+                self.status_message_time = Some(std::time::Instant::now());
+            }
+            dispatcher::DbResult::WriteFailed { message } => {
+                // TODO(phase3): revert optimistic state. For now, just
+                // show the error and let the next refresh correct the UI.
+                self.status_message = Some(message);
+                self.status_message_time = Some(std::time::Instant::now());
+            }
             dispatcher::DbResult::Error { context, message } => {
                 tracing::warn!("DB worker error in {context}: {message}");
             }
