@@ -83,6 +83,12 @@ pub(crate) enum DbRequest {
         root_id: i64,
         target_bytes: Option<i64>,
     },
+    /// Export recent audit entries to a file.
+    ExportAudit {
+        limit: usize,
+        format: crate::audit::AuditExportFormat,
+        path: PathBuf,
+    },
 }
 
 /// Identifies an entry being mutated, carrying enough info for the worker
@@ -402,6 +408,27 @@ fn process_request(db: &Database, request: DbRequest) -> DbResult {
                 message: format!("Failed to set quota target: {e}"),
             },
         },
+
+        DbRequest::ExportAudit {
+            limit,
+            format,
+            path,
+        } => {
+            let audit = AuditService::new(db);
+            match audit.export_recent_to_path(limit, format, &path) {
+                Ok(count) => DbResult::WritePartial {
+                    message: format!(
+                        "Exported {count} audit entr{} to {} ({})",
+                        if count == 1 { "y" } else { "ies" },
+                        path.display(),
+                        format.label()
+                    ),
+                },
+                Err(e) => DbResult::WriteFailed {
+                    message: format!("Audit export failed: {e}"),
+                },
+            }
+        }
     }
 }
 
@@ -410,12 +437,15 @@ fn process_request(db: &Database, request: DbRequest) -> DbResult {
 // ---------------------------------------------------------------------------
 
 /// Update status for entries, propagating to children for directories.
+/// Wraps the batch in a transaction for atomicity and performance (one
+/// fsync instead of N).
 fn process_update_status(
     db: &Database,
     entries: &[WriteEntry],
     new_status: &str,
     audit: &WriteAudit,
 ) -> DbResult {
+    let tx = db.conn().unchecked_transaction().ok();
     let audit_svc = AuditService::new(db);
 
     let mut failed = 0;
@@ -451,6 +481,10 @@ fn process_update_status(
         });
     }
 
+    if let Some(tx) = tx {
+        let _ = tx.commit();
+    }
+
     if failed == 0 {
         DbResult::WriteOk
     } else {
@@ -461,6 +495,7 @@ fn process_update_status(
 }
 
 /// Defer entries, propagating to children for directories.
+/// Wraps the batch in a transaction for atomicity and performance.
 fn process_defer(
     db: &Database,
     entries: &[WriteEntry],
@@ -468,6 +503,7 @@ fn process_defer(
     days: u32,
     audit: &WriteAudit,
 ) -> DbResult {
+    let tx = db.conn().unchecked_transaction().ok();
     let audit_svc = AuditService::new(db);
     let detail = format!("Deferred for {days} days");
     let mut failed = 0;
@@ -497,6 +533,10 @@ fn process_defer(
         });
     }
 
+    if let Some(tx) = tx {
+        let _ = tx.commit();
+    }
+
     if failed == 0 {
         DbResult::WriteOk
     } else {
@@ -513,6 +553,7 @@ fn process_delete(
     method: RemovalMethod,
     audit: &WriteAudit,
 ) -> DbResult {
+    let tx = db.conn().unchecked_transaction().ok();
     let audit_svc = AuditService::new(db);
     let mut success = 0u32;
     let mut failed = 0u32;
@@ -552,6 +593,10 @@ fn process_delete(
                 outcome: Some("removed"),
             });
         }
+    }
+
+    if let Some(tx) = tx {
+        let _ = tx.commit();
     }
 
     let action_past = method.past_tense();
@@ -640,6 +685,7 @@ fn process_undo(
     description: &str,
     audit: &WriteAudit,
 ) -> DbResult {
+    let tx = db.conn().unchecked_transaction().ok();
     let mut failed = 0;
     for entry in entries {
         if let Err(e) = db.restore_entry_state(
@@ -666,6 +712,10 @@ fn process_undo(
         status_after: None,
         outcome: Some("undone"),
     });
+
+    if let Some(tx) = tx {
+        let _ = tx.commit();
+    }
 
     if failed == 0 {
         DbResult::WriteOk

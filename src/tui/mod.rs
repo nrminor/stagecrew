@@ -35,74 +35,24 @@ use input::InputHandler;
 /// input handlers, replacing the previous pattern of threading `&Config` and
 /// `&Database` as separate parameters through every function.
 pub(crate) struct TuiContext<'a> {
-    /// Database connection for queries and mutations.
-    /// Still used by input handlers for synchronous writes (Phase 3 will
-    /// move these behind the dispatcher).
-    pub(crate) db: &'a Database,
     /// Full application config including per-root overrides.
     pub(crate) app_config: &'a AppConfig,
-    /// Async DB dispatcher for non-blocking reads.
+    /// Async DB dispatcher for non-blocking reads and writes.
     pub(crate) db_dispatcher: &'a dispatcher::DbDispatcher,
 }
 
 impl TuiContext<'_> {
     /// Returns the effective config for the currently selected root, falling
     /// back to the global config if no root is selected or the root has no
-    /// local override.
+    /// local override. Looks up the root from the cached `app.roots` list
+    /// rather than querying the database.
     pub fn config(&self, app: &App) -> &crate::config::Config {
-        let root = app.current_root_id.and_then(|id| match self.db.get_root(id) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(root_id = id, error = %e, "Failed to look up root for config resolution, using global config");
-                None
-            }
-        });
+        let root = app
+            .current_root_id
+            .and_then(|id| app.roots.iter().find(|r| r.id == id));
         root.map_or(&self.app_config.global, |r| {
             self.app_config.for_root(&r.path)
         })
-    }
-
-    /// Query entries for the current path, compute days remaining using the
-    /// effective per-root config, and sort them.
-    ///
-    /// Returns `None` if the current path is empty or the database query fails.
-    /// The returned vec is sorted according to the app's current sort mode and
-    /// the indices match what the user sees on screen.
-    pub fn sorted_entry_rows(&self, app: &App) -> Option<Vec<(crate::db::Entry, i64)>> {
-        if app.current_path.as_os_str().is_empty() {
-            return None;
-        }
-        let config = self.config(app);
-        let entries = self.db.list_entries_by_parent(app.current_path()).ok()?;
-        let mut rows: Vec<_> = entries
-            .into_iter()
-            .map(|entry| {
-                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    crate::scanner::calculate_expiration(cs, config.expiration_days)
-                });
-                (entry, days_remaining)
-            })
-            .collect();
-        ui::sort_entry_rows(&mut rows, app.sort_mode());
-        Some(rows)
-    }
-
-    /// Compute search match indices for the current directory's sorted entry list.
-    ///
-    /// Returns indices into the sorted entry rows where the filename contains
-    /// the active search query (case-insensitive). Returns an empty vec if
-    /// there is no active search query.
-    pub fn compute_current_matches(&self, app: &App) -> Vec<usize> {
-        let query = match &app.search_query {
-            Some(q) if !q.is_empty() => q,
-            _ => return Vec::new(),
-        };
-
-        let Some(entry_rows) = self.sorted_entry_rows(app) else {
-            return Vec::new();
-        };
-
-        input::find_search_matches(&entry_rows, query)
     }
 }
 
@@ -456,6 +406,10 @@ pub struct App {
     /// Tracks which async data fetches are currently in flight.
     pub(crate) loading: LoadingState,
 
+    /// Path to restore cursor to when `dir_entries` arrives. Set by
+    /// `navigate_up` so the cursor lands on the directory we just left.
+    pub(crate) pending_cursor_restore: Option<PathBuf>,
+
     /// In-memory stack of reversible actions for undo.
     pub(crate) undo_stack: Vec<UndoAction>,
 }
@@ -640,32 +594,32 @@ impl App {
     /// Called at startup and after refresh completion so the user sees files
     /// immediately instead of the empty "Select a root" prompt. This is a
     /// no-op when a root is already entered (i.e., `current_path` is non-empty).
-    pub(crate) fn auto_enter_first_root(&mut self, db: &crate::db::Database) {
+    pub(crate) fn auto_enter_first_root(&mut self) {
         if !self.current_path.as_os_str().is_empty() {
             return;
         }
-        if let Ok(roots) = db.list_roots()
-            && !roots.is_empty()
-        {
-            self.navigate_into(roots[0].path.clone());
-            self.current_root_id = Some(roots[0].id);
+        if let Some(root) = self.roots.first() {
+            let path = root.path.clone();
+            let id = root.id;
+            self.navigate_into(path);
+            self.current_root_id = Some(id);
         }
     }
 
     /// Sync the main panel to show the currently selected sidebar root.
     ///
-    /// Looks up the root at `sidebar_selected_index` and updates `current_path`
-    /// and `current_root_id` to match. This ensures the main panel immediately
-    /// reflects sidebar navigation rather than requiring an explicit "enter".
-    pub(crate) fn sync_to_sidebar_selection(&mut self, db: &crate::db::Database) {
-        let Ok(roots) = db.list_roots() else {
+    /// Looks up the root at `sidebar_selected_index` in the cached roots list
+    /// and updates `current_path` and `current_root_id` to match. This ensures
+    /// the main panel immediately reflects sidebar navigation rather than
+    /// requiring an explicit "enter".
+    pub(crate) fn sync_to_sidebar_selection(&mut self) {
+        let Some(root) = self.roots.get(self.sidebar_selected_index) else {
             return;
         };
-        let Some(root) = roots.get(self.sidebar_selected_index) else {
-            return;
-        };
-        self.navigate_into(root.path.clone());
-        self.current_root_id = Some(root.id);
+        let path = root.path.clone();
+        let id = root.id;
+        self.navigate_into(path);
+        self.current_root_id = Some(id);
     }
 
     /// Navigate up to the parent directory.
@@ -673,30 +627,19 @@ impl App {
     /// If already at a root level, this is a no-op.
     /// Clears any active search since results are directory-specific.
     /// Attempts to restore cursor position to the directory we came from.
-    pub(crate) fn navigate_up(&mut self, ctx: &TuiContext) {
+    pub(crate) fn navigate_up(&mut self) {
         let Some(parent) = self.current_path.parent() else {
             return;
         };
 
-        // Remember the directory we're leaving so we can restore cursor to it
-        let leaving_path = self.current_path.clone();
+        // Remember where we came from so the cursor can be restored
+        // when the async dir_entries load completes.
+        self.pending_cursor_restore = Some(self.current_path.clone());
 
         self.current_path = parent.to_path_buf();
+        self.entry_selected_index = 0;
         self.ensure_cursor_visible = true;
         self.clear_search();
-
-        // Try to find the directory we came from in the parent's entry list
-        // and set the cursor to it (instead of defaulting to index 0).
-        // sorted_entry_rows uses self.current_path which we just updated to the parent.
-        if let Some(rows) = ctx.sorted_entry_rows(self) {
-            if let Some(idx) = rows.iter().position(|(e, _)| e.path == leaving_path) {
-                self.entry_selected_index = idx;
-            } else {
-                self.entry_selected_index = 0;
-            }
-        } else {
-            self.entry_selected_index = 0;
-        }
     }
 }
 
@@ -876,6 +819,7 @@ impl App {
             dir_entries: Vec::new(),
             audit_entries: Vec::new(),
             loading: LoadingState::default(),
+            pending_cursor_restore: None,
             undo_stack: Vec::new(),
         }
     }
@@ -914,6 +858,7 @@ impl App {
             dispatcher::DbResult::Roots(roots) => {
                 self.loading.roots = false;
                 self.roots = roots;
+                self.auto_enter_first_root();
             }
             dispatcher::DbResult::RootEntries(entries) => {
                 self.loading.root_entries = false;
@@ -921,6 +866,14 @@ impl App {
             }
             dispatcher::DbResult::DirEntries(entries) => {
                 self.loading.dir_entries = false;
+                // If we have a pending cursor restore (from navigate_up),
+                // find the directory we came from and place the cursor there.
+                if let Some(restore_path) = self.pending_cursor_restore.take()
+                    && let Some(idx) = entries.iter().position(|(e, _)| e.path == restore_path)
+                {
+                    self.entry_selected_index = idx;
+                    self.ensure_cursor_visible = true;
+                }
                 self.dir_entries = entries;
             }
             dispatcher::DbResult::Stats {
@@ -980,9 +933,12 @@ impl App {
         let mut terminal_manager = TerminalManager::setup().map_err(crate::error::Error::Io)?;
         let mut event_stream = EventStream::new();
 
-        // Auto-enter the first root so the user sees files immediately
-        // instead of staring at "Select a root from the sidebar".
-        self.auto_enter_first_root(db);
+        // Synchronously load roots so auto_enter_first_root can work.
+        // This is the only synchronous DB read remaining in the event loop.
+        if let Ok(roots) = db.list_roots() {
+            self.roots = roots;
+        }
+        self.auto_enter_first_root();
 
         // Channel for receiving scan completion results
         let (scan_tx, mut scan_rx) =
@@ -995,7 +951,6 @@ impl App {
         let (db_dispatcher, mut db_result_rx) = dispatcher::spawn_db_worker(db_path);
 
         let ctx = TuiContext {
-            db,
             app_config,
             db_dispatcher: &db_dispatcher,
         };
@@ -1090,7 +1045,6 @@ impl App {
                     match result {
                         Ok(()) => {
                             self.status_message = Some("Refresh complete".to_string());
-                            self.auto_enter_first_root(ctx.db);
                             self.dispatch_refresh(&db_dispatcher, &ctx);
                         }
                         Err(e) => {
@@ -1273,18 +1227,6 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-
-    fn temp_database() -> (crate::db::Database, tempfile::TempDir) {
-        let dir = tempdir().expect("Failed to create temp dir");
-        let db_path = dir.path().join("test.db");
-        let db = crate::db::Database::open(&db_path).expect("Failed to create test database");
-        (db, dir)
-    }
-
-    fn test_config() -> crate::config::Config {
-        crate::config::Config::default()
-    }
 
     #[test]
     fn sort_mode_default_is_expiration() {
@@ -1458,37 +1400,20 @@ mod tests {
 
     #[test]
     fn app_navigate_up_goes_to_parent() {
-        let (db, _dir) = temp_database();
-        let app_config = crate::config::AppConfig::from_global(test_config());
-        let dispatcher = dispatcher::DbDispatcher::noop();
-        let ctx = TuiContext {
-            db: &db,
-            app_config: &app_config,
-            db_dispatcher: &dispatcher,
-        };
         let mut app = App::new();
         app.current_path = PathBuf::from("/test/path/child");
         app.entry_selected_index = 5;
-        app.navigate_up(&ctx);
+        app.navigate_up();
         assert_eq!(app.current_path, PathBuf::from("/test/path"));
-        // With no entries in the database, cursor defaults to 0
         assert_eq!(app.entry_selected_index, 0);
     }
 
     #[test]
     fn app_navigate_up_at_root_is_noop() {
-        let (db, _dir) = temp_database();
-        let app_config = crate::config::AppConfig::from_global(test_config());
-        let dispatcher = dispatcher::DbDispatcher::noop();
-        let ctx = TuiContext {
-            db: &db,
-            app_config: &app_config,
-            db_dispatcher: &dispatcher,
-        };
         let mut app = App::new();
         app.current_path = PathBuf::from("/");
         app.entry_selected_index = 5;
-        app.navigate_up(&ctx);
+        app.navigate_up();
         // "/" has no parent, so navigate_up is a no-op (path and index unchanged).
         assert_eq!(app.current_path, PathBuf::from("/"));
         assert_eq!(app.entry_selected_index, 5);

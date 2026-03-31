@@ -4,16 +4,12 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::ui::sort_entry_rows;
 use super::{
     App, FocusPanel, PendingAuditExport, PendingDeletion, PendingEntry, SortMode, TuiContext,
     UndoAction, UndoEntry, View,
 };
 use crate::audit::{AuditExportFormat, AuditService};
-use crate::config::Config;
-use crate::db::Database;
-use crate::removal::{RemovalMethod, dry_run_approved};
-use crate::scanner::calculate_expiration;
+use crate::removal::RemovalMethod;
 
 /// Handles keyboard input with vim-style bindings.
 pub(crate) struct InputHandler;
@@ -44,6 +40,19 @@ pub(super) fn find_search_matches(
         .collect()
 }
 
+/// Compute search match indices from the cached `dir_entries` on App.
+///
+/// Returns indices into `app.dir_entries` where the filename contains
+/// the active search query (case-insensitive). Returns an empty vec if
+/// there is no active search query.
+fn compute_search_matches(app: &App) -> Vec<usize> {
+    let query = match &app.search_query {
+        Some(q) if !q.is_empty() => q,
+        _ => return Vec::new(),
+    };
+    find_search_matches(&app.dir_entries, query)
+}
+
 impl InputHandler {
     /// Process a key event and update app state.
     ///
@@ -62,11 +71,10 @@ impl InputHandler {
     #[allow(clippy::too_many_lines)]
     fn handle_file_list(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         let config = ctx.config(app);
-        let db = ctx.db;
 
         // Check for search input mode first (highest priority text input)
         if app.search_input_active {
-            Self::handle_search_input(app, ctx, key);
+            Self::handle_search_input(app, key);
             return;
         }
 
@@ -146,7 +154,8 @@ impl InputHandler {
                             app.sidebar_selected_index =
                                 app.sidebar_selected_index.min(app.sidebar_len - 1);
                         }
-                        app.sync_to_sidebar_selection(db);
+                        app.sync_to_sidebar_selection();
+                        app.dispatch_refresh(ctx.db_dispatcher, ctx);
                     }
                     FocusPanel::MainPanel => {
                         app.entry_selected_index = app.entry_selected_index.saturating_add(1);
@@ -154,7 +163,7 @@ impl InputHandler {
                             app.entry_selected_index =
                                 app.entry_selected_index.min(app.entry_list_len - 1);
                         }
-                        Self::update_visual_selection(app, ctx);
+                        Self::update_visual_selection(app);
                     }
                 }
                 app.ensure_cursor_visible = true;
@@ -163,11 +172,12 @@ impl InputHandler {
                 match app.focus_panel {
                     FocusPanel::Sidebar => {
                         app.sidebar_selected_index = app.sidebar_selected_index.saturating_sub(1);
-                        app.sync_to_sidebar_selection(db);
+                        app.sync_to_sidebar_selection();
+                        app.dispatch_refresh(ctx.db_dispatcher, ctx);
                     }
                     FocusPanel::MainPanel => {
                         app.entry_selected_index = app.entry_selected_index.saturating_sub(1);
-                        Self::update_visual_selection(app, ctx);
+                        Self::update_visual_selection(app);
                     }
                 }
                 app.ensure_cursor_visible = true;
@@ -178,7 +188,7 @@ impl InputHandler {
                     FocusPanel::Sidebar => app.sidebar_selected_index = 0,
                     FocusPanel::MainPanel => {
                         app.entry_selected_index = 0;
-                        Self::update_visual_selection(app, ctx);
+                        Self::update_visual_selection(app);
                     }
                 }
                 app.ensure_cursor_visible = true;
@@ -191,7 +201,7 @@ impl InputHandler {
                     }
                     FocusPanel::MainPanel => {
                         app.select_last_entry(app.entry_list_len);
-                        Self::update_visual_selection(app, ctx);
+                        Self::update_visual_selection(app);
                     }
                 }
                 app.ensure_cursor_visible = true;
@@ -205,17 +215,18 @@ impl InputHandler {
                     SortMode::Name => SortMode::Modified,
                     SortMode::Modified => SortMode::Expiration,
                 };
+                app.dispatch_refresh(ctx.db_dispatcher, ctx);
             }
 
             // Selection mode (only when main panel is focused)
             KeyCode::Char(' ') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::toggle_entry_selection(app, ctx);
+                Self::toggle_entry_selection(app);
             }
             KeyCode::Char('v') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::toggle_visual_mode(app, ctx);
+                Self::toggle_visual_mode(app);
             }
             KeyCode::Char('a') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::select_all_entries(app, ctx);
+                Self::select_all_entries(app);
             }
             KeyCode::Esc if app.focus_panel == FocusPanel::MainPanel => {
                 if app.is_visual_mode() {
@@ -230,17 +241,17 @@ impl InputHandler {
             // Entry-level actions (only when main panel is focused)
             // d = move to trash (safe, recoverable)
             KeyCode::Char('d') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::initiate_entry_delete(app, config, db, RemovalMethod::Trash);
+                Self::initiate_entry_delete(app, RemovalMethod::Trash);
             }
             // D = permanent delete (irreversible)
             KeyCode::Char('D') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::initiate_entry_delete(app, config, db, RemovalMethod::PermanentDelete);
+                Self::initiate_entry_delete(app, RemovalMethod::PermanentDelete);
             }
             KeyCode::Char('r') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::initiate_entry_defer(app, config, db);
+                Self::initiate_entry_defer(app, config.expiration_days);
             }
             KeyCode::Char('i') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::initiate_entry_ignore(app, config, db);
+                Self::initiate_entry_ignore(app);
             }
             KeyCode::Char('x') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::toggle_entry_approval(app, ctx);
@@ -254,10 +265,10 @@ impl InputHandler {
 
             // Open in external application
             KeyCode::Char('e') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::request_open_in_editor(app, ctx);
+                Self::request_open_in_editor(app);
             }
             KeyCode::Char('o') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::request_open_in_system_viewer(app, ctx);
+                Self::request_open_in_system_viewer(app);
             }
 
             // Search
@@ -266,11 +277,11 @@ impl InputHandler {
                 app.search_input_active = true;
             }
             KeyCode::Char('n') if app.search_query.is_some() => {
-                Self::jump_to_next_match(app, ctx);
+                Self::jump_to_next_match(app);
                 app.ensure_cursor_visible = true;
             }
             KeyCode::Char('N') if app.search_query.is_some() => {
-                Self::jump_to_prev_match(app, ctx);
+                Self::jump_to_prev_match(app);
                 app.ensure_cursor_visible = true;
             }
 
@@ -288,7 +299,7 @@ impl InputHandler {
 
             // Dry run preflight check on approved entries for the current root
             KeyCode::Char('Y') if app.focus_panel == FocusPanel::MainPanel => {
-                Self::run_dry_run(app, db);
+                Self::run_dry_run(app);
             }
 
             // Execute approved removals for the current root
@@ -305,24 +316,21 @@ impl InputHandler {
 
             // Enter a root from the sidebar
             KeyCode::Enter if app.focus_panel == FocusPanel::Sidebar => {
-                if let Ok(roots) = db.list_roots() {
-                    let idx = app
-                        .sidebar_selected_index
-                        .min(roots.len().saturating_sub(1));
-                    if let Some(root) = roots.get(idx) {
-                        app.navigate_into(root.path.clone());
-                        app.focus_panel = FocusPanel::MainPanel;
-                    }
+                let idx = app
+                    .sidebar_selected_index
+                    .min(app.roots.len().saturating_sub(1));
+                if let Some(root) = app.roots.get(idx) {
+                    app.navigate_into(root.path.clone());
+                    app.focus_panel = FocusPanel::MainPanel;
+                    app.dispatch_refresh(ctx.db_dispatcher, ctx);
                 }
             }
 
             // Return to sidebar from main panel at root level
             KeyCode::Backspace if app.focus_panel == FocusPanel::MainPanel => {
-                if let Ok(roots) = db.list_roots() {
-                    let at_root_level = roots.iter().any(|r| r.path == app.current_path);
-                    if at_root_level {
-                        app.focus_panel = FocusPanel::Sidebar;
-                    }
+                let at_root_level = app.roots.iter().any(|r| r.path == app.current_path);
+                if at_root_level {
+                    app.focus_panel = FocusPanel::Sidebar;
                 }
             }
 
@@ -339,7 +347,7 @@ impl InputHandler {
             KeyCode::Char('t')
                 if matches!(app.focus_panel, FocusPanel::Sidebar | FocusPanel::MainPanel) =>
             {
-                Self::initiate_quota_target(app, db);
+                Self::initiate_quota_target(app);
             }
 
             _ => {}
@@ -347,13 +355,17 @@ impl InputHandler {
     }
 
     /// Toggle selection of the currently focused file.
-    fn toggle_entry_selection(app: &mut App, ctx: &TuiContext) {
-        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
+    fn toggle_entry_selection(app: &mut App) {
+        if app.dir_entries.is_empty() {
             tracing::warn!("Cannot toggle selection: no path selected or query failed");
             return;
-        };
+        }
 
-        let Some((entry, _)) = entry_rows.get(app.entry_selected_index) else {
+        let Some(entry_id) = app
+            .dir_entries
+            .get(app.entry_selected_index)
+            .map(|(e, _)| e.id)
+        else {
             tracing::warn!("No entry selected (index out of bounds)");
             return;
         };
@@ -362,20 +374,21 @@ impl InputHandler {
         app.exit_visual_mode();
 
         // Toggle selection and advance cursor for hold-to-multi-select behavior
-        app.toggle_entry_selection(entry.id);
+        app.toggle_entry_selection(entry_id);
         app.entry_selected_index = app.entry_selected_index.saturating_add(1);
     }
 
     /// Recompute the visual selection after a cursor movement.
     ///
     /// No-op if visual mode is not active.
-    fn update_visual_selection(app: &mut App, ctx: &TuiContext) {
+    fn update_visual_selection(app: &mut App) {
         if !app.is_visual_mode() {
             return;
         }
-        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
+        let entry_rows = &app.dir_entries;
+        if entry_rows.is_empty() {
             return;
-        };
+        }
         let entry_ids: Vec<i64> = entry_rows.iter().map(|(e, _)| e.id).collect();
         app.recompute_visual_selection(&entry_ids);
     }
@@ -385,16 +398,17 @@ impl InputHandler {
     /// On entry: snapshots the current selection, sets the anchor at the cursor,
     /// and selects the entry under the cursor.
     /// On exit (pressing `v` again): keeps the selection, clears visual state.
-    fn toggle_visual_mode(app: &mut App, ctx: &TuiContext) {
+    fn toggle_visual_mode(app: &mut App) {
         if app.is_visual_mode() {
             app.exit_visual_mode();
             return;
         }
 
-        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
+        let entry_rows = &app.dir_entries;
+        if entry_rows.is_empty() {
             tracing::warn!("Cannot enter visual mode: no path selected or query failed");
             return;
-        };
+        }
 
         if entry_rows.is_empty() {
             return;
@@ -416,18 +430,19 @@ impl InputHandler {
     }
 
     /// Select all entries in the current directory.
-    fn select_all_entries(app: &mut App, ctx: &TuiContext) {
-        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
+    fn select_all_entries(app: &mut App) {
+        if app.dir_entries.is_empty() {
             tracing::warn!("Cannot select all: no path selected or query failed");
             return;
-        };
+        }
 
         // Exit visual mode if active
         app.exit_visual_mode();
 
         // Add all entry IDs to selection
-        for (entry, _) in &entry_rows {
-            app.selected_entries.insert(entry.id);
+        let ids: Vec<i64> = app.dir_entries.iter().map(|(e, _)| e.id).collect();
+        for id in ids {
+            app.selected_entries.insert(id);
         }
     }
 
@@ -499,24 +514,18 @@ impl InputHandler {
 
                 let expanded = shellexpand::tilde(export.path_input.trim()).to_string();
                 let export_path = PathBuf::from(expanded);
-                let audit = AuditService::new(ctx.db);
+                let format = export.format;
 
-                match audit.export_recent_to_path(1000, export.format, &export_path) {
-                    Ok(count) => {
-                        app.status_message = Some(format!(
-                            "Exported {count} audit entr{} to {} ({})",
-                            if count == 1 { "y" } else { "ies" },
-                            export_path.display(),
-                            export.format.label()
-                        ));
-                        app.status_message_time = Some(std::time::Instant::now());
-                        app.pending_audit_export = None;
-                    }
-                    Err(e) => {
-                        app.status_message = Some(format!("Audit export failed: {e}"));
-                        app.status_message_time = Some(std::time::Instant::now());
-                    }
-                }
+                // Dispatch audit export through the async worker
+                ctx.db_dispatcher
+                    .send(super::dispatcher::DbRequest::ExportAudit {
+                        limit: 1000,
+                        format,
+                        path: export_path,
+                    });
+                app.pending_audit_export = None;
+                app.status_message = Some("Exporting audit log...".to_string());
+                app.status_message_time = Some(std::time::Instant::now());
             }
             KeyCode::Char(c) => {
                 export.path_input.push(c);
@@ -541,14 +550,13 @@ impl InputHandler {
             FocusPanel::Sidebar => {}
             FocusPanel::MainPanel => {
                 app.exit_visual_mode();
-                if let Ok(roots) = ctx.db.list_roots() {
-                    let at_root_level = roots.iter().any(|r| r.path == app.current_path);
-                    if at_root_level {
-                        app.sidebar_visible = true;
-                        app.focus_panel = FocusPanel::Sidebar;
-                    } else {
-                        app.navigate_up(ctx);
-                    }
+                let at_root_level = app.roots.iter().any(|r| r.path == app.current_path);
+                if at_root_level {
+                    app.sidebar_visible = true;
+                    app.focus_panel = FocusPanel::Sidebar;
+                } else {
+                    app.navigate_up();
+                    app.dispatch_refresh(ctx.db_dispatcher, ctx);
                 }
             }
         }
@@ -563,26 +571,30 @@ impl InputHandler {
         match app.focus_panel {
             FocusPanel::Sidebar => {
                 // Enter the selected root (same behavior as Enter)
-                if let Ok(roots) = ctx.db.list_roots() {
-                    let idx = app
-                        .sidebar_selected_index
-                        .min(roots.len().saturating_sub(1));
-                    if let Some(root) = roots.get(idx) {
-                        app.navigate_into(root.path.clone());
-                        app.focus_panel = FocusPanel::MainPanel;
-                    }
+                let idx = app
+                    .sidebar_selected_index
+                    .min(app.roots.len().saturating_sub(1));
+                if let Some(root) = app.roots.get(idx) {
+                    app.navigate_into(root.path.clone());
+                    app.focus_panel = FocusPanel::MainPanel;
+                    app.dispatch_refresh(ctx.db_dispatcher, ctx);
                 }
             }
             FocusPanel::MainPanel => {
-                let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
+                if app.dir_entries.is_empty() {
                     return;
-                };
+                }
 
-                if let Some((entry, _)) = entry_rows.get(app.entry_selected_index)
-                    && entry.is_dir
-                {
+                let nav_path = app
+                    .dir_entries
+                    .get(app.entry_selected_index)
+                    .filter(|(entry, _)| entry.is_dir)
+                    .map(|(entry, _)| entry.path.clone());
+
+                if let Some(path) = nav_path {
                     app.exit_visual_mode();
-                    app.navigate_into(entry.path.clone());
+                    app.navigate_into(path);
+                    app.dispatch_refresh(ctx.db_dispatcher, ctx);
                 }
             }
         }
@@ -595,33 +607,18 @@ impl InputHandler {
     ///
     /// The `method` parameter determines whether to trash (recoverable) or
     /// permanently delete (irreversible).
-    fn initiate_entry_delete(app: &mut App, config: &Config, db: &Database, method: RemovalMethod) {
+    fn initiate_entry_delete(app: &mut App, method: RemovalMethod) {
         // Get entries for current path
         if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot delete entry: no path selected");
             return;
         }
 
-        // Query entries for current browsing path
-        let entries = match db.list_entries_by_parent(app.current_path()) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("Failed to query entries: {}", e);
-                return;
-            }
-        };
-
-        // Sort entries the same way the UI does so indices match
-        let mut entry_rows: Vec<_> = entries
-            .into_iter()
-            .map(|entry| {
-                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    calculate_expiration(cs, config.expiration_days)
-                });
-                (entry, days_remaining)
-            })
-            .collect();
-        sort_entry_rows(&mut entry_rows, app.sort_mode());
+        let entry_rows = &app.dir_entries;
+        if entry_rows.is_empty() {
+            tracing::warn!("Cannot delete entry: no entries loaded");
+            return;
+        }
 
         // Determine which entries to delete
         let entries_to_delete: Vec<PendingEntry> = if app.selected_entries.is_empty() {
@@ -639,7 +636,7 @@ impl InputHandler {
         } else {
             // Use selected entries (selection is by ID, so sorting doesn't matter here)
             entry_rows
-                .into_iter()
+                .iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
                 .map(|(e, _)| PendingEntry {
                     id: e.id,
@@ -712,33 +709,18 @@ impl InputHandler {
     ///
     /// If entries are selected via multi-select, defer all selected entries with the same number of days.
     /// Otherwise, defer the currently focused entry.
-    fn initiate_entry_defer(app: &mut App, config: &Config, db: &Database) {
+    fn initiate_entry_defer(app: &mut App, default_days: u32) {
         // Get entries for current path
         if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot defer entry: no path selected");
             return;
         }
 
-        // Query entries for current browsing path
-        let entries = match db.list_entries_by_parent(app.current_path()) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("Failed to query entries: {}", e);
-                return;
-            }
-        };
-
-        // Sort entries the same way the UI does so indices match
-        let mut entry_rows: Vec<_> = entries
-            .into_iter()
-            .map(|entry| {
-                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    calculate_expiration(cs, config.expiration_days)
-                });
-                (entry, days_remaining)
-            })
-            .collect();
-        sort_entry_rows(&mut entry_rows, app.sort_mode());
+        let entry_rows = &app.dir_entries;
+        if entry_rows.is_empty() {
+            tracing::warn!("Cannot defer entry: no entries loaded");
+            return;
+        }
 
         // Determine which entries to defer
         let entries_to_defer: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
@@ -756,7 +738,7 @@ impl InputHandler {
         } else {
             // Use selected entries (selection is by ID, so sorting doesn't matter here)
             entry_rows
-                .into_iter()
+                .iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
                 .map(|(e, _)| super::PendingEntry {
                     id: e.id,
@@ -771,11 +753,11 @@ impl InputHandler {
             return;
         }
 
-        // Set pending deferral state
+        // Set pending deferral state (use the cached expiration_days from the app)
         app.pending_entry_deferral = Some(super::PendingDeferral {
             entries: entries_to_defer,
             input: String::new(),
-            default_days: config.expiration_days,
+            default_days,
         });
     }
 
@@ -873,33 +855,18 @@ impl InputHandler {
     ///
     /// If files are selected via multi-select, ignore all selected files.
     /// Otherwise, ignore the currently focused file.
-    fn initiate_entry_ignore(app: &mut App, config: &Config, db: &Database) {
+    fn initiate_entry_ignore(app: &mut App) {
         // Get entries for current path
         if app.current_path.as_os_str().is_empty() {
             tracing::warn!("Cannot ignore entry: no path selected");
             return;
         }
 
-        // Query entries for current browsing path
-        let entries = match db.list_entries_by_parent(app.current_path()) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("Failed to query entries: {}", e);
-                return;
-            }
-        };
-
-        // Sort entries the same way the UI does so indices match
-        let mut entry_rows: Vec<_> = entries
-            .into_iter()
-            .map(|entry| {
-                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    calculate_expiration(cs, config.expiration_days)
-                });
-                (entry, days_remaining)
-            })
-            .collect();
-        sort_entry_rows(&mut entry_rows, app.sort_mode());
+        let entry_rows = &app.dir_entries;
+        if entry_rows.is_empty() {
+            tracing::warn!("Cannot ignore entry: no entries loaded");
+            return;
+        }
 
         // Determine which entries to ignore
         let entries_to_ignore: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
@@ -917,7 +884,7 @@ impl InputHandler {
         } else {
             // Use selected entries (selection is by ID, so sorting doesn't matter here)
             entry_rows
-                .into_iter()
+                .iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
                 .map(|(e, _)| super::PendingEntry {
                     id: e.id,
@@ -1011,10 +978,11 @@ impl InputHandler {
             return;
         }
 
-        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
+        let entry_rows = &app.dir_entries;
+        if entry_rows.is_empty() {
             tracing::warn!("Failed to query entries");
             return;
-        };
+        }
 
         // Determine which entries to toggle
         let Some(entries_to_toggle) = Self::entries_for_approval_toggle(app, entry_rows) else {
@@ -1113,7 +1081,7 @@ impl InputHandler {
 
     fn entries_for_approval_toggle(
         app: &App,
-        entry_rows: Vec<(crate::db::Entry, i64)>,
+        entry_rows: &[(crate::db::Entry, i64)],
     ) -> Option<Vec<(super::PendingEntry, String)>> {
         if app.selected_entries.is_empty() {
             // No selection - use currently focused entry
@@ -1131,7 +1099,7 @@ impl InputHandler {
             // Use selected entries (selection is by ID, so sorting doesn't matter here)
             Some(
                 entry_rows
-                    .into_iter()
+                    .iter()
                     .filter(|(e, _)| app.selected_entries.contains(&e.id))
                     .map(|(e, _)| {
                         (
@@ -1140,7 +1108,7 @@ impl InputHandler {
                                 path: e.path.clone(),
                                 is_dir: e.is_dir,
                             },
-                            e.status,
+                            e.status.clone(),
                         )
                     })
                     .collect(),
@@ -1152,32 +1120,49 @@ impl InputHandler {
     ///
     /// If all approved entries are removable (or there are none), shows a status
     /// message. If any would fail, opens the dry run results modal.
-    fn run_dry_run(app: &mut App, db: &Database) {
-        let Some(root_id) = app.current_root_id else {
+    fn run_dry_run(app: &mut App) {
+        if app.current_root_id.is_none() {
             app.status_message = Some("No root selected".to_string());
             app.status_message_time = Some(std::time::Instant::now());
             return;
-        };
+        }
 
-        match dry_run_approved(db, root_id) {
-            Ok(result) => {
-                if result.total_count == 0 {
-                    app.status_message = Some("No approved entries for this root".to_string());
-                    app.status_message_time = Some(std::time::Instant::now());
-                } else if result.failures.is_empty() {
-                    app.status_message = Some(format!(
-                        "Dry run: {} of {} approved entries removable",
-                        result.removable_count, result.total_count
-                    ));
-                    app.status_message_time = Some(std::time::Instant::now());
-                } else {
-                    app.pending_dry_run = Some(result);
-                }
+        // Compute dry run locally from cached root_entries
+        let approved: Vec<_> = app
+            .root_entries
+            .iter()
+            .filter(|e| e.status == "approved")
+            .collect();
+
+        if approved.is_empty() {
+            app.status_message = Some("No approved entries for this root".to_string());
+            app.status_message_time = Some(std::time::Instant::now());
+            return;
+        }
+
+        let total_count = approved.len();
+        let mut failures = Vec::new();
+        for entry in &approved {
+            if !entry.path.exists() {
+                failures.push(crate::removal::DryRunFailure {
+                    path: entry.path.clone(),
+                    reason: "Path does not exist on disk".to_string(),
+                });
             }
-            Err(e) => {
-                app.status_message = Some(format!("Dry run failed: {e}"));
-                app.status_message_time = Some(std::time::Instant::now());
-            }
+        }
+
+        let removable_count = total_count - failures.len();
+        if failures.is_empty() {
+            app.status_message = Some(format!(
+                "Dry run: {removable_count} of {total_count} approved entries removable"
+            ));
+            app.status_message_time = Some(std::time::Instant::now());
+        } else {
+            app.pending_dry_run = Some(crate::removal::DryRunResult {
+                removable_count,
+                total_count,
+                failures,
+            });
         }
     }
 
@@ -1285,28 +1270,7 @@ impl InputHandler {
             return;
         }
 
-        let config = ctx.config(app);
-
-        // Query entries for current browsing path
-        let entries = match ctx.db.list_entries_by_parent(app.current_path()) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("Failed to query entries: {}", e);
-                return;
-            }
-        };
-
-        // Sort entries the same way the UI does so indices match
-        let mut entry_rows: Vec<_> = entries
-            .into_iter()
-            .map(|entry| {
-                let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                    calculate_expiration(cs, config.expiration_days)
-                });
-                (entry, days_remaining)
-            })
-            .collect();
-        sort_entry_rows(&mut entry_rows, app.sort_mode());
+        let entry_rows = &app.dir_entries;
 
         // Determine which entries to unignore
         let entries_to_unignore: Vec<super::PendingEntry> = if app.selected_entries.is_empty() {
@@ -1331,7 +1295,7 @@ impl InputHandler {
         } else {
             // Use selected entries that are ignored
             entry_rows
-                .into_iter()
+                .iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id) && e.status == "ignored")
                 .map(|(e, _)| super::PendingEntry {
                     id: e.id,
@@ -1395,8 +1359,8 @@ impl InputHandler {
     ///
     /// Collects paths from selected entries (or the focused entry if none selected)
     /// and sets `external_open_request` for the main loop to handle.
-    fn request_open_in_editor(app: &mut App, ctx: &TuiContext) {
-        let paths = Self::collect_paths_for_external_open(app, ctx);
+    fn request_open_in_editor(app: &mut App) {
+        let paths = Self::collect_paths_for_external_open(app);
         if paths.is_empty() {
             app.status_message = Some("No files to open".to_string());
             app.status_message_time = Some(std::time::Instant::now());
@@ -1409,8 +1373,8 @@ impl InputHandler {
     ///
     /// Collects paths from selected entries (or the focused entry if none selected)
     /// and sets `external_open_request` for the main loop to handle.
-    fn request_open_in_system_viewer(app: &mut App, ctx: &TuiContext) {
-        let paths = Self::collect_paths_for_external_open(app, ctx);
+    fn request_open_in_system_viewer(app: &mut App) {
+        let paths = Self::collect_paths_for_external_open(app);
         if paths.is_empty() {
             app.status_message = Some("No files to open".to_string());
             app.status_message_time = Some(std::time::Instant::now());
@@ -1423,10 +1387,11 @@ impl InputHandler {
     ///
     /// Returns paths from selected entries if any are selected, otherwise
     /// returns the path of the currently focused entry.
-    fn collect_paths_for_external_open(app: &App, ctx: &TuiContext) -> Vec<PathBuf> {
-        let Some(entry_rows) = ctx.sorted_entry_rows(app) else {
+    fn collect_paths_for_external_open(app: &App) -> Vec<PathBuf> {
+        let entry_rows = &app.dir_entries;
+        if entry_rows.is_empty() {
             return Vec::new();
-        };
+        }
 
         if app.selected_entries.is_empty() {
             // No selection - use currently focused entry
@@ -1437,9 +1402,9 @@ impl InputHandler {
         } else {
             // Use selected entries
             entry_rows
-                .into_iter()
+                .iter()
                 .filter(|(e, _)| app.selected_entries.contains(&e.id))
-                .map(|(e, _)| e.path)
+                .map(|(e, _)| e.path.clone())
                 .collect()
         }
     }
@@ -1448,7 +1413,7 @@ impl InputHandler {
     ///
     /// Characters append to the query, Backspace removes, Enter confirms and
     /// jumps to the first match, Esc cancels the search entirely.
-    fn handle_search_input(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
+    fn handle_search_input(app: &mut App, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) if !c.is_control() => {
                 if let Some(ref mut query) = app.search_query {
@@ -1463,7 +1428,7 @@ impl InputHandler {
             KeyCode::Enter => {
                 // Confirm search and jump to first match
                 app.search_input_active = false;
-                Self::jump_to_first_match(app, ctx);
+                Self::jump_to_first_match(app);
                 app.ensure_cursor_visible = true;
             }
             KeyCode::Esc => {
@@ -1475,16 +1440,16 @@ impl InputHandler {
     }
 
     /// Jump the cursor to the first search match in the current entry list.
-    fn jump_to_first_match(app: &mut App, ctx: &TuiContext) {
-        let matches = ctx.compute_current_matches(app);
+    fn jump_to_first_match(app: &mut App) {
+        let matches = compute_search_matches(app);
         if let Some(&first) = matches.first() {
             app.entry_selected_index = first;
         }
     }
 
     /// Jump the cursor to the next search match after the current position.
-    fn jump_to_next_match(app: &mut App, ctx: &TuiContext) {
-        let matches = ctx.compute_current_matches(app);
+    fn jump_to_next_match(app: &mut App) {
+        let matches = compute_search_matches(app);
         if matches.is_empty() {
             return;
         }
@@ -1500,8 +1465,8 @@ impl InputHandler {
     }
 
     /// Jump the cursor to the previous search match before the current position.
-    fn jump_to_prev_match(app: &mut App, ctx: &TuiContext) {
-        let matches = ctx.compute_current_matches(app);
+    fn jump_to_prev_match(app: &mut App) {
+        let matches = compute_search_matches(app);
         if matches.is_empty() {
             return;
         }
@@ -1583,9 +1548,7 @@ impl InputHandler {
                         return;
                     }
 
-                    if let Ok(roots) = ctx.db.list_roots()
-                        && roots.iter().any(|r| r.path == canonical_path)
-                    {
+                    if app.roots.iter().any(|r| r.path == canonical_path) {
                         tracing::warn!("Path already tracked: {}", canonical_path.display());
                         app.pending_add_path = None;
                         return;
@@ -1622,15 +1585,7 @@ impl InputHandler {
     /// because they are re-seeded on every refresh. The user must edit the config
     /// file directly to remove those.
     fn initiate_remove_path(app: &mut App, ctx: &TuiContext) {
-        let roots = match ctx.db.list_roots() {
-            Ok(roots) => roots,
-            Err(e) => {
-                tracing::warn!("Failed to query roots: {}", e);
-                return;
-            }
-        };
-
-        if let Some(root) = roots.get(app.sidebar_selected_index) {
+        if let Some(root) = app.roots.get(app.sidebar_selected_index) {
             let is_config_root = ctx.app_config.global.tracked_paths.contains(&root.path);
 
             if is_config_root {
@@ -1682,20 +1637,14 @@ impl InputHandler {
     ///
     /// When called from the sidebar, uses the selected root. When called from
     /// the entries panel, finds the root containing the current path.
-    fn initiate_quota_target(app: &mut App, db: &Database) {
-        let roots = match db.list_roots() {
-            Ok(roots) => roots,
-            Err(e) => {
-                tracing::warn!("Failed to query roots: {}", e);
-                return;
-            }
-        };
-
+    fn initiate_quota_target(app: &mut App) {
         // Determine which root to use based on context
         let root = if app.focus_panel == FocusPanel::Sidebar {
-            roots.get(app.sidebar_selected_index)
+            app.roots.get(app.sidebar_selected_index)
         } else if !app.current_path.as_os_str().is_empty() {
-            roots.iter().find(|r| app.current_path.starts_with(&r.path))
+            app.roots
+                .iter()
+                .find(|r| app.current_path.starts_with(&r.path))
         } else {
             None
         };
@@ -1802,6 +1751,8 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, Config};
     use crate::db::Database;
+    use crate::scanner::calculate_expiration;
+    use crate::tui::ui::sort_entry_rows;
     use crate::tui::{PendingDeferral, PendingEntry};
     use tempfile::tempdir;
 
@@ -1836,14 +1787,43 @@ mod tests {
     }
 
     fn test_context<'a>(
-        db: &'a Database,
+        _db: &'a Database,
         app_config: &'a AppConfig,
         dispatcher: &'a crate::tui::dispatcher::DbDispatcher,
     ) -> TuiContext<'a> {
         TuiContext {
-            db,
             app_config,
             db_dispatcher: dispatcher,
+        }
+    }
+
+    /// Populate `app.dir_entries` and `app.roots` from the database so that
+    /// input handlers (which read from cached App state) see the test data.
+    /// Call this after inserting entries into the DB and setting
+    /// `app.current_path` and `app.current_root_id`.
+    fn populate_app_from_db(app: &mut App, db: &Database, config: &Config) {
+        if let Ok(roots) = db.list_roots() {
+            app.roots = roots;
+        }
+        if let Some(root_id) = app.current_root_id
+            && let Ok(entries) = db.list_entries_by_root(root_id)
+        {
+            app.root_entries = entries;
+        }
+        if !app.current_path.as_os_str().is_empty()
+            && let Ok(entries) = db.list_entries_by_parent(app.current_path())
+        {
+            let mut rows: Vec<_> = entries
+                .into_iter()
+                .map(|entry| {
+                    let days = entry.countdown_start.map_or(i64::MAX, |cs| {
+                        calculate_expiration(cs, config.expiration_days)
+                    });
+                    (entry, days)
+                })
+                .collect();
+            sort_entry_rows(&mut rows, app.sort_mode());
+            app.dir_entries = rows;
         }
     }
 
@@ -1882,6 +1862,7 @@ mod tests {
 
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/downloads");
+        populate_app_from_db(&mut app, &db, &test_config());
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('h')));
         assert_eq!(app.focus_panel, FocusPanel::Sidebar);
         assert!(app.sidebar_visible);
@@ -1939,6 +1920,7 @@ mod tests {
 
         app.focus_panel = FocusPanel::Sidebar;
         app.sidebar_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('l')));
 
@@ -1982,6 +1964,7 @@ mod tests {
         // Sort by name puts directories first, so index 0 should be the subdir
         app.sort_mode = SortMode::Name;
         app.entry_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('l')));
 
@@ -2340,6 +2323,7 @@ mod tests {
         // Focus sidebar and select the root
         app.focus_panel = FocusPanel::Sidebar;
         app.sidebar_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Press Enter
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
@@ -2379,6 +2363,7 @@ mod tests {
         // Simulate being inside a root
         app.current_path = PathBuf::from("/test/downloads");
         app.focus_panel = FocusPanel::MainPanel;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Press Backspace
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Backspace));
@@ -2449,14 +2434,12 @@ mod tests {
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
 
-        // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
-
-        // Set up app state to simulate viewing directory with first entry selected
         app.current_root_id = Some(dir_id);
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Press 'd' key
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('d')));
@@ -2639,6 +2622,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Press 'r' key
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('r')));
@@ -2780,6 +2764,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Press 'i' key
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('i')));
@@ -2853,6 +2838,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Press 'x' key
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
@@ -3155,6 +3141,7 @@ mod tests {
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/search");
         app.entry_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Enter search mode and type "notes"
         app.search_query = Some("notes".to_string());
@@ -3188,19 +3175,20 @@ mod tests {
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
-        let ctx = test_context(&db, &app_config, &dispatcher);
+        let _ctx = test_context(&db, &app_config, &dispatcher);
 
         setup_search_files(&db);
 
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/search");
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Set up confirmed search for "re" (matches readme.md and report.pdf)
         app.search_query = Some("re".to_string());
         app.search_input_active = false;
 
         // Verify matches exist
-        let matches = ctx.compute_current_matches(&app);
+        let matches = compute_search_matches(&app);
         assert!(
             matches.len() >= 2,
             "Expected at least 2 matches for 're', got {matches:?}"
@@ -3210,7 +3198,7 @@ mod tests {
         app.entry_selected_index = 0;
 
         // Call jump_to_next_match directly to verify wrapping
-        InputHandler::jump_to_next_match(&mut app, &ctx);
+        InputHandler::jump_to_next_match(&mut app);
         let first_jump = app.entry_selected_index;
         assert!(
             matches.contains(&first_jump),
@@ -3218,7 +3206,7 @@ mod tests {
         );
 
         // Jump again — should advance to next match or wrap
-        InputHandler::jump_to_next_match(&mut app, &ctx);
+        InputHandler::jump_to_next_match(&mut app);
         let second_jump = app.entry_selected_index;
         assert!(
             matches.contains(&second_jump),
@@ -3244,6 +3232,7 @@ mod tests {
 
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/search");
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Set up confirmed search for "re" (matches readme.md and report.pdf)
         app.search_query = Some("re".to_string());
@@ -3299,13 +3288,13 @@ mod tests {
         let (db, _db_path, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
-        let ctx = test_context(&db, &app_config, &dispatcher);
+        let _ctx = test_context(&db, &app_config, &dispatcher);
         let mut app = App::new();
         app.current_path = PathBuf::from("/some/path/child");
         app.search_query = Some("test".to_string());
         app.search_input_active = false;
 
-        app.navigate_up(&ctx);
+        app.navigate_up();
 
         assert_eq!(app.search_query, None, "Navigation up should clear search");
     }
@@ -3364,17 +3353,21 @@ mod tests {
     }
 
     /// Helper to get sorted entry IDs for the visual test directory.
-    fn visual_entry_ids(ctx: &TuiContext) -> Vec<i64> {
-        let app = {
-            let mut a = App::new();
-            a.current_path = PathBuf::from("/test/visual");
-            a
-        };
-        ctx.sorted_entry_rows(&app)
-            .expect("should have entries")
-            .iter()
-            .map(|(e, _)| e.id)
-            .collect()
+    fn visual_entry_ids(db: &Database) -> Vec<i64> {
+        let entries = db
+            .list_entries_by_parent(Path::new("/test/visual"))
+            .expect("should have entries");
+        let mut rows: Vec<_> = entries
+            .into_iter()
+            .map(|entry| {
+                let days = entry
+                    .countdown_start
+                    .map_or(i64::MAX, |cs| calculate_expiration(cs, 90));
+                (entry, days)
+            })
+            .collect();
+        sort_entry_rows(&mut rows, super::SortMode::Expiration);
+        rows.iter().map(|(e, _)| e.id).collect()
     }
 
     #[test]
@@ -3389,6 +3382,7 @@ mod tests {
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
         app.entry_selected_index = 2; // charlie
+        populate_app_from_db(&mut app, &db, &test_config());
 
         assert!(!app.is_visual_mode());
 
@@ -3397,7 +3391,7 @@ mod tests {
         assert!(app.is_visual_mode());
         assert_eq!(app.visual_anchor, Some(2));
         // The entry at index 2 should be selected
-        let ids = visual_entry_ids(&ctx);
+        let ids = visual_entry_ids(&db);
         assert!(app.selected_entries.contains(&ids[2]));
         assert_eq!(app.selected_entries.len(), 1);
     }
@@ -3414,12 +3408,13 @@ mod tests {
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
         app.entry_selected_index = 1;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Enter visual mode
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
         assert!(app.is_visual_mode());
 
-        let ids = visual_entry_ids(&ctx);
+        let ids = visual_entry_ids(&db);
         assert!(app.selected_entries.contains(&ids[1]));
 
         // Exit visual mode with v again
@@ -3442,6 +3437,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 1; // bravo
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Enter visual mode at index 1
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
@@ -3450,7 +3446,7 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
-        let ids = visual_entry_ids(&ctx);
+        let ids = visual_entry_ids(&db);
         // Should have indices 1, 2, 3 selected (bravo, charlie, delta)
         assert!(app.selected_entries.contains(&ids[1]));
         assert!(app.selected_entries.contains(&ids[2]));
@@ -3472,6 +3468,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 3; // delta
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Enter visual mode at index 3
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
@@ -3480,7 +3477,7 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
 
-        let ids = visual_entry_ids(&ctx);
+        let ids = visual_entry_ids(&db);
         // Should have indices 1, 2, 3 selected
         assert!(app.selected_entries.contains(&ids[1]));
         assert!(app.selected_entries.contains(&ids[2]));
@@ -3502,8 +3499,9 @@ mod tests {
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
-        let ids = visual_entry_ids(&ctx);
+        let ids = visual_entry_ids(&db);
 
         // Space-select item 0 (alpha) — Space also advances cursor to 1
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char(' ')));
@@ -3541,6 +3539,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 1; // bravo
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Enter visual mode
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
@@ -3549,7 +3548,7 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
-        let ids = visual_entry_ids(&ctx);
+        let ids = visual_entry_ids(&db);
         assert_eq!(app.selected_entries.len(), 3); // 1, 2, 3
 
         // Now reverse: move back up to index 2
@@ -3577,12 +3576,13 @@ mod tests {
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 1;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Enter visual mode and extend
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
-        let ids = visual_entry_ids(&ctx);
+        let ids = visual_entry_ids(&db);
         assert_eq!(app.selected_entries.len(), 2);
 
         // Esc exits visual mode
@@ -3606,6 +3606,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 2;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Enter visual mode
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
@@ -3650,6 +3651,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 3; // delta
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Enter visual mode at index 3
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
@@ -3657,7 +3659,7 @@ mod tests {
         // g jumps to top
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('g')));
 
-        let ids = visual_entry_ids(&ctx);
+        let ids = visual_entry_ids(&db);
         // Range should be [0, 3] inclusive
         assert!(app.selected_entries.contains(&ids[0]));
         assert!(app.selected_entries.contains(&ids[1]));
@@ -3694,12 +3696,13 @@ mod tests {
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
         app.current_path = PathBuf::from("/test/visual");
+        populate_app_from_db(&mut app, &db, &test_config());
 
         assert!(app.selected_entries.is_empty());
 
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('a')));
 
-        let ids = visual_entry_ids(&ctx);
+        let ids = visual_entry_ids(&db);
         assert_eq!(app.selected_entries.len(), ids.len());
         for id in &ids {
             assert!(app.selected_entries.contains(id));
@@ -3752,6 +3755,7 @@ mod tests {
         app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('Y')));
 
@@ -3941,6 +3945,7 @@ mod tests {
         app.current_path = PathBuf::from("/test/dir");
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         // Approve an entry
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
@@ -4000,6 +4005,7 @@ mod tests {
         app.focus_panel = FocusPanel::MainPanel;
         // Use multi-select to target the specific entry by ID
         app.selected_entries.insert(file_ids[0]);
+        populate_app_from_db(&mut app, &db, &test_config());
 
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('I')));
 
