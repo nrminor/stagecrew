@@ -747,7 +747,7 @@ impl InputHandler {
                 app.pending_entry_delete = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_view_data(ctx);
+                app.dispatch_refresh(ctx.db_dispatcher, ctx);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel deletion
@@ -930,7 +930,7 @@ impl InputHandler {
                 app.pending_entry_deferral = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_view_data(ctx);
+                app.dispatch_refresh(ctx.db_dispatcher, ctx);
             }
             KeyCode::Esc => {
                 // Cancel deferral input
@@ -1077,7 +1077,7 @@ impl InputHandler {
                 app.pending_entry_ignore = None;
                 app.exit_visual_mode();
                 app.clear_selection();
-                app.refresh_view_data(ctx);
+                app.dispatch_refresh(ctx.db_dispatcher, ctx);
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel ignore
@@ -1210,7 +1210,7 @@ impl InputHandler {
         // Clear interaction state and refresh.
         app.exit_visual_mode();
         app.clear_selection();
-        app.refresh_view_data(ctx);
+        app.dispatch_refresh(ctx.db_dispatcher, ctx);
 
         app.status_message = Some(match (approved_count, unapproved_count) {
             (a, 0) => format!("Approved {a} entr{}", if a == 1 { "y" } else { "ies" }),
@@ -1377,7 +1377,7 @@ impl InputHandler {
             }
         }
 
-        app.refresh_view_data(ctx);
+        app.dispatch_refresh(ctx.db_dispatcher, ctx);
 
         #[allow(clippy::cast_sign_loss)]
         let bytes_display = super::super::format_bytes(bytes_freed.max(0) as u64);
@@ -1439,7 +1439,7 @@ impl InputHandler {
             tracing::warn!("Failed to record undo audit: {e}");
         }
 
-        app.refresh_view_data(ctx);
+        app.dispatch_refresh(ctx.db_dispatcher, ctx);
         app.status_message = Some(format!(
             "Undid: {} ({restored} entr{} restored)",
             action.description,
@@ -1487,7 +1487,7 @@ impl InputHandler {
                     tracing::warn!("Failed to record timer reset audit: {e}");
                 }
 
-                app.refresh_view_data(ctx);
+                app.dispatch_refresh(ctx.db_dispatcher, ctx);
 
                 app.status_message = Some(format!(
                     "Reset timer for {count} entr{} in {}",
@@ -1637,7 +1637,7 @@ impl InputHandler {
             }
             app.status_message = Some(format!("Unignored {success_count} entry/entries"));
             app.status_message_time = Some(std::time::Instant::now());
-            app.refresh_view_data(ctx);
+            app.dispatch_refresh(ctx.db_dispatcher, ctx);
         }
         app.exit_visual_mode();
         app.clear_selection();
@@ -2090,8 +2090,22 @@ mod tests {
         Config::default()
     }
 
-    fn test_context<'a>(db: &'a Database, app_config: &'a AppConfig) -> TuiContext<'a> {
-        TuiContext { db, app_config }
+    /// Noop dispatcher that lives alongside the test context.
+    /// Kept as a separate binding so the dispatcher outlives the context.
+    fn test_dispatcher() -> crate::tui::dispatcher::DbDispatcher {
+        crate::tui::dispatcher::DbDispatcher::noop()
+    }
+
+    fn test_context<'a>(
+        db: &'a Database,
+        app_config: &'a AppConfig,
+        dispatcher: &'a crate::tui::dispatcher::DbDispatcher,
+    ) -> TuiContext<'a> {
+        TuiContext {
+            db,
+            app_config,
+            db_dispatcher: dispatcher,
+        }
     }
 
     // ===== Navigation and Focus Tests =====
@@ -2101,7 +2115,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Start with main panel focused (default for immediate file interaction)
         assert_eq!(app.focus_panel, FocusPanel::MainPanel);
@@ -2120,7 +2135,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
@@ -2137,7 +2153,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
@@ -2158,7 +2175,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.focus_panel = FocusPanel::Sidebar;
         app.sidebar_selected_index = 2;
@@ -2174,7 +2192,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
@@ -2194,7 +2213,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         let root_id = db
             .insert_root(Path::new("/test/downloads"))
@@ -2235,7 +2255,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         let root_id = db
             .insert_root(Path::new("/test/downloads"))
@@ -2265,7 +2286,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Navigate down in sidebar
         app.focus_panel = FocusPanel::Sidebar;
@@ -2290,7 +2312,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Navigate up in sidebar
         app.focus_panel = FocusPanel::Sidebar;
@@ -2310,7 +2333,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Go to top in sidebar
         app.focus_panel = FocusPanel::Sidebar;
@@ -2330,7 +2354,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Simulate list lengths (normally set by render)
         app.sidebar_len = 10;
@@ -2356,7 +2381,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         assert_eq!(app.sort_mode, SortMode::Expiration);
 
@@ -2380,7 +2406,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.view = View::AuditLog;
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('1')));
@@ -2392,7 +2419,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         assert_eq!(app.view, View::FileList);
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('2')));
@@ -2404,7 +2432,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         assert_eq!(app.view, View::FileList);
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('?')));
@@ -2416,7 +2445,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         assert_eq!(app.view, View::FileList);
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('3')));
@@ -2428,7 +2458,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.view = View::Help;
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
@@ -2440,7 +2471,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.view = View::AuditLog;
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('q')));
@@ -2452,7 +2484,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.view = View::AuditLog;
         app.sidebar_len = 3;
@@ -2474,7 +2507,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.view = View::AuditLog;
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('?')));
@@ -2486,7 +2520,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.view = View::AuditLog;
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('E')));
@@ -2498,7 +2533,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.view = View::AuditLog;
         app.pending_audit_export = Some(PendingAuditExport {
@@ -2523,7 +2559,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         assert!(!app.should_quit);
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('q')));
@@ -2535,7 +2572,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         assert!(!app.should_quit);
         InputHandler::handle(
@@ -2553,7 +2591,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Create a root in the database
         db.insert_root(Path::new("/test/downloads"))
@@ -2576,7 +2615,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.focus_panel = FocusPanel::Sidebar;
 
@@ -2591,7 +2631,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
@@ -2611,7 +2652,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         db.insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
@@ -2665,7 +2707,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2706,7 +2749,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, _file_ids) = setup_with_files(&db);
@@ -2730,7 +2774,8 @@ mod tests {
         let (db, _db_dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Create a real temporary file for deletion
         let temp_dir = tempdir().expect("Failed to create temp dir");
@@ -2799,7 +2844,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2843,7 +2889,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, _file_ids) = setup_with_files(&db);
@@ -2879,7 +2926,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2928,7 +2976,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -2981,7 +3030,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -3014,7 +3064,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -3052,7 +3103,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -3085,7 +3137,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Set up database with files
         let (dir_id, file_ids) = setup_with_files(&db);
@@ -3151,7 +3204,8 @@ mod tests {
     fn find_search_matches_returns_matching_indices() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         let root_id = setup_search_files(&db);
 
         let entries = db
@@ -3197,7 +3251,8 @@ mod tests {
     fn find_search_matches_is_case_insensitive() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_search_files(&db);
 
         let entries = db
@@ -3230,7 +3285,8 @@ mod tests {
     fn find_search_matches_no_matches_returns_empty() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_search_files(&db);
 
         let entries = db
@@ -3256,7 +3312,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.focus_panel = FocusPanel::MainPanel;
 
@@ -3275,7 +3332,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.focus_panel = FocusPanel::Sidebar;
 
@@ -3293,7 +3351,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Enter search mode
         app.search_query = Some(String::new());
@@ -3313,7 +3372,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.search_query = Some("abc".to_string());
         app.search_input_active = true;
@@ -3328,7 +3388,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.search_query = Some("test".to_string());
         app.search_input_active = true;
@@ -3347,7 +3408,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         setup_search_files(&db);
 
@@ -3386,7 +3448,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         setup_search_files(&db);
 
@@ -3435,7 +3498,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         setup_search_files(&db);
 
@@ -3464,7 +3528,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.focus_panel = FocusPanel::MainPanel;
 
@@ -3494,7 +3559,8 @@ mod tests {
     fn navigate_up_clears_search() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         let mut app = App::new();
         app.current_path = PathBuf::from("/some/path/child");
         app.search_query = Some("test".to_string());
@@ -3510,7 +3576,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.focus_panel = FocusPanel::MainPanel;
         app.entry_selected_index = 2;
@@ -3575,7 +3642,8 @@ mod tests {
     fn v_enters_visual_mode_with_anchor_at_cursor() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3599,7 +3667,8 @@ mod tests {
     fn v_again_exits_visual_mode_keeping_selection() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3625,7 +3694,8 @@ mod tests {
     fn visual_mode_j_extends_selection_downward() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3654,7 +3724,8 @@ mod tests {
     fn visual_mode_k_extends_selection_upward() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3683,7 +3754,8 @@ mod tests {
     fn visual_mode_preserves_pre_existing_space_selections() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3721,7 +3793,8 @@ mod tests {
     fn visual_mode_shrinks_when_cursor_reverses() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3756,7 +3829,8 @@ mod tests {
     fn esc_exits_visual_mode_but_keeps_selection() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3784,7 +3858,8 @@ mod tests {
     fn space_exits_visual_mode() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3806,7 +3881,8 @@ mod tests {
     fn h_navigation_exits_visual_mode() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3826,7 +3902,8 @@ mod tests {
     fn visual_mode_g_extends_to_top() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3854,7 +3931,8 @@ mod tests {
     fn v_on_empty_directory_is_noop() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         db.insert_root(Path::new("/test/empty"))
             .expect("Failed to create test root");
 
@@ -3870,7 +3948,8 @@ mod tests {
     fn a_selects_all_entries_in_current_directory() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -3895,7 +3974,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         let (root_id, _file_ids) = setup_with_files(&db);
 
@@ -3921,7 +4001,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         let (root_id, file_ids) = setup_with_files(&db);
 
@@ -3953,7 +4034,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.focus_panel = FocusPanel::Sidebar;
 
@@ -3971,7 +4053,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         // Manually set pending_dry_run to simulate an open modal
         app.pending_dry_run = Some(crate::removal::DryRunResult {
@@ -3998,7 +4081,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         let (root_id, _file_ids) = setup_with_files(&db);
         app.current_root_id = Some(root_id);
@@ -4018,7 +4102,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.focus_panel = FocusPanel::Sidebar;
 
@@ -4032,7 +4117,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         let (root_id, file_ids) = setup_with_files(&db);
 
@@ -4073,7 +4159,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.current_root_id = None;
         app.focus_panel = FocusPanel::MainPanel;
@@ -4087,7 +4174,8 @@ mod tests {
     fn a_in_sidebar_does_nothing() {
         let (db, _dir) = temp_database();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
         setup_visual_files(&db);
 
         let mut app = App::new();
@@ -4106,7 +4194,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         let (root_id, file_ids) = setup_with_files(&db);
         app.current_root_id = Some(root_id);
@@ -4145,7 +4234,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         app.focus_panel = FocusPanel::MainPanel;
 
@@ -4159,7 +4249,8 @@ mod tests {
         let (db, _dir) = temp_database();
         let mut app = App::new();
         let app_config = AppConfig::from_global(test_config());
-        let ctx = test_context(&db, &app_config);
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
 
         let (root_id, file_ids) = setup_with_files(&db);
         db.update_entry_status(file_ids[0], "ignored")

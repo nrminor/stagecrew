@@ -1,5 +1,6 @@
 //! TUI application state and main loop.
 
+pub(crate) mod dispatcher;
 mod input;
 mod ui;
 
@@ -20,12 +21,12 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::widgets::{ScrollbarState, TableState};
 
-use crate::audit::{AuditEntry, AuditExportFormat, AuditService};
+use crate::audit::{AuditEntry, AuditExportFormat};
 use crate::config::{AppConfig, AppPaths};
 use crate::db::{Database, Entry, Root};
 use crate::error::Result;
 use crate::removal::{DryRunResult, RemovalMethod};
-use crate::scanner::{self, Scanner, refresh};
+use crate::scanner::{Scanner, refresh};
 
 use input::InputHandler;
 
@@ -35,9 +36,13 @@ use input::InputHandler;
 /// `&Database` as separate parameters through every function.
 pub(crate) struct TuiContext<'a> {
     /// Database connection for queries and mutations.
+    /// Still used by input handlers for synchronous writes (Phase 3 will
+    /// move these behind the dispatcher).
     pub(crate) db: &'a Database,
     /// Full application config including per-root overrides.
     pub(crate) app_config: &'a AppConfig,
+    /// Async DB dispatcher for non-blocking reads.
+    pub(crate) db_dispatcher: &'a dispatcher::DbDispatcher,
 }
 
 impl TuiContext<'_> {
@@ -268,6 +273,24 @@ pub(crate) struct PendingAuditExport {
     pub format: AuditExportFormat,
 }
 
+/// Tracks which async data fetches are currently in flight.
+/// Used by render to show loading indicators and by the dispatcher
+/// to debounce redundant requests.
+#[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct LoadingState {
+    /// True while a roots query is in flight.
+    pub roots: bool,
+    /// True while a root-entries query is in flight.
+    pub root_entries: bool,
+    /// True while a dir-entries query is in flight.
+    pub dir_entries: bool,
+    /// True while a stats query is in flight.
+    pub stats: bool,
+    /// True while an audit-entries query is in flight.
+    pub audit_entries: bool,
+}
+
 /// Main TUI application state.
 // Allow: The bools represent independent flags (quit, sidebar visibility, scan state,
 // search input) that don't naturally form a state machine. Each has distinct semantics.
@@ -429,6 +452,9 @@ pub struct App {
     /// Cached audit log entries for the audit log view. Updated on view
     /// switch to audit log and after user actions that write audit records.
     pub(crate) audit_entries: Vec<AuditEntry>,
+
+    /// Tracks which async data fetches are currently in flight.
+    pub(crate) loading: LoadingState,
 
     /// In-memory stack of reversible actions for undo.
     pub(crate) undo_stack: Vec<UndoAction>,
@@ -849,77 +875,69 @@ impl App {
             root_entries: Vec::new(),
             dir_entries: Vec::new(),
             audit_entries: Vec::new(),
+            loading: LoadingState::default(),
             undo_stack: Vec::new(),
         }
     }
 
-    /// Refresh all cached view data from the database.
+    /// Dispatch async read requests to refresh all cached view data.
     ///
-    /// Populates `roots`, `root_entries`, `dir_entries`, `audit_entries`,
-    /// `cached_stats`, and `nearest_expiration` from the database in a single
-    /// pass. Call this instead of (or in addition to) `refresh_stats` at
-    /// event boundaries: startup, navigation, user actions, scan completion.
-    ///
-    /// This replaces the per-frame DB queries that previously lived in the
-    /// render path. Render functions now read from these cached fields.
-    pub(crate) fn refresh_view_data(&mut self, ctx: &TuiContext) {
+    /// This is the async counterpart to `refresh_view_data`. Instead of
+    /// blocking on DB queries, it sends requests to the DB worker and sets
+    /// loading flags. Results arrive via the `db_result_rx` channel and
+    /// are applied to App state in the event loop.
+    pub(crate) fn dispatch_refresh(
+        &mut self,
+        db_dispatcher: &dispatcher::DbDispatcher,
+        ctx: &TuiContext,
+    ) {
         let config = ctx.config(self);
+        self.loading.roots = true;
+        self.loading.root_entries = self.current_root_id.is_some();
+        self.loading.dir_entries = !self.current_path.as_os_str().is_empty();
+        self.loading.stats = true;
+        self.loading.audit_entries = true;
+        db_dispatcher.dispatch_refresh_all(
+            self.current_root_id,
+            self.current_path(),
+            config.expiration_days,
+            config.warning_days,
+            self.sort_mode(),
+        );
+    }
 
-        // Roots (feeds sidebar + quota widget)
-        match ctx.db.list_roots() {
-            Ok(roots) => self.roots = roots,
-            Err(e) => tracing::warn!("Failed to refresh roots: {e}"),
-        }
-
-        // Entries for the selected root (feeds lifecycle, timeline, quota)
-        if let Some(root_id) = self.current_root_id {
-            match ctx.db.list_entries_by_root(root_id) {
-                Ok(entries) => self.root_entries = entries,
-                Err(e) => tracing::warn!("Failed to refresh root entries: {e}"),
+    /// Apply a `DbResult` received from the worker to the cached App state.
+    ///
+    /// Clears the corresponding loading flag and updates the relevant field.
+    pub(crate) fn apply_db_result(&mut self, result: dispatcher::DbResult) {
+        match result {
+            dispatcher::DbResult::Roots(roots) => {
+                self.loading.roots = false;
+                self.roots = roots;
             }
-        } else {
-            self.root_entries.clear();
-        }
-
-        // Entries for the current directory (feeds main entry panel)
-        if self.current_path.as_os_str().is_empty() {
-            self.dir_entries.clear();
-        } else {
-            match ctx.db.list_entries_by_parent(self.current_path()) {
-                Ok(entries) => {
-                    let mut rows: Vec<_> = entries
-                        .into_iter()
-                        .map(|entry| {
-                            let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
-                                scanner::calculate_expiration(cs, config.expiration_days)
-                            });
-                            (entry, days_remaining)
-                        })
-                        .collect();
-                    ui::sort_entry_rows(&mut rows, self.sort_mode());
-                    self.dir_entries = rows;
-                }
-                Err(e) => tracing::warn!("Failed to refresh dir entries: {e}"),
+            dispatcher::DbResult::RootEntries(entries) => {
+                self.loading.root_entries = false;
+                self.root_entries = entries;
             }
-        }
-
-        // Audit log entries (feeds audit view)
-        match AuditService::new(ctx.db).list_recent(1000) {
-            Ok(entries) => self.audit_entries = entries,
-            Err(e) => tracing::warn!("Failed to refresh audit entries: {e}"),
-        }
-
-        // Stats + nearest expiration (feeds header)
-        match ctx
-            .db
-            .compute_live_stats(config.expiration_days, config.warning_days)
-        {
-            Ok(stats) => self.cached_stats = stats,
-            Err(e) => tracing::warn!("Failed to refresh stats: {e}"),
-        }
-        match ctx.db.nearest_expiration(config.expiration_days) {
-            Ok(ts) => self.nearest_expiration = ts,
-            Err(e) => tracing::warn!("Failed to query nearest expiration: {e}"),
+            dispatcher::DbResult::DirEntries(entries) => {
+                self.loading.dir_entries = false;
+                self.dir_entries = entries;
+            }
+            dispatcher::DbResult::Stats {
+                stats,
+                nearest_expiration,
+            } => {
+                self.loading.stats = false;
+                self.cached_stats = stats;
+                self.nearest_expiration = nearest_expiration;
+            }
+            dispatcher::DbResult::AuditEntries(entries) => {
+                self.loading.audit_entries = false;
+                self.audit_entries = entries;
+            }
+            dispatcher::DbResult::Error { context, message } => {
+                tracing::warn!("DB worker error in {context}: {message}");
+            }
         }
     }
 
@@ -960,10 +978,17 @@ impl App {
         // Track the scan task handle so we can await it properly
         let mut scan_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-        let ctx = TuiContext { db, app_config };
+        // Spawn the async DB worker with its own connection
+        let (db_dispatcher, mut db_result_rx) = dispatcher::spawn_db_worker(db_path);
 
-        // Load initial view data from the database
-        self.refresh_view_data(&ctx);
+        let ctx = TuiContext {
+            db,
+            app_config,
+            db_dispatcher: &db_dispatcher,
+        };
+
+        // Dispatch initial data load asynchronously
+        self.dispatch_refresh(&db_dispatcher, &ctx);
 
         // Main event loop
         loop {
@@ -1039,6 +1064,11 @@ impl App {
                     }
                 }
 
+                // Handle async DB results
+                Some(result) = db_result_rx.recv() => {
+                    self.apply_db_result(result);
+                }
+
                 // Handle refresh completion
                 Some(result) = scan_rx.recv() => {
                     self.scan_in_progress = false;
@@ -1048,7 +1078,7 @@ impl App {
                         Ok(()) => {
                             self.status_message = Some("Refresh complete".to_string());
                             self.auto_enter_first_root(ctx.db);
-                            self.refresh_view_data(&ctx);
+                            self.dispatch_refresh(&db_dispatcher, &ctx);
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Refresh failed: {e}"));
@@ -1417,9 +1447,11 @@ mod tests {
     fn app_navigate_up_goes_to_parent() {
         let (db, _dir) = temp_database();
         let app_config = crate::config::AppConfig::from_global(test_config());
+        let dispatcher = dispatcher::DbDispatcher::noop();
         let ctx = TuiContext {
             db: &db,
             app_config: &app_config,
+            db_dispatcher: &dispatcher,
         };
         let mut app = App::new();
         app.current_path = PathBuf::from("/test/path/child");
@@ -1434,9 +1466,11 @@ mod tests {
     fn app_navigate_up_at_root_is_noop() {
         let (db, _dir) = temp_database();
         let app_config = crate::config::AppConfig::from_global(test_config());
+        let dispatcher = dispatcher::DbDispatcher::noop();
         let ctx = TuiContext {
             db: &db,
             app_config: &app_config,
+            db_dispatcher: &dispatcher,
         };
         let mut app = App::new();
         app.current_path = PathBuf::from("/");

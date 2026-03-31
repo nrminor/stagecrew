@@ -15,6 +15,7 @@
 !/rust-toolchain.toml
 !/INSTALL.sh
 !/cliff.toml
+!/clippy.toml
 
 # === Allowed: static assets ===
 !/assets
@@ -54,6 +55,7 @@
 !/src/audit/mod.rs
 !/src/tui
 !/src/tui/mod.rs
+!/src/tui/dispatcher.rs
 !/src/tui/input.rs
 !/src/tui/ui.rs
 
