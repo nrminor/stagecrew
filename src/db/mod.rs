@@ -10,6 +10,14 @@ use crate::removal::RemovalMethod;
 /// Current SQLite schema version managed via `PRAGMA user_version`.
 const SCHEMA_VERSION: i64 = 2;
 
+/// Expiration policy for a tracked root, used when computing global deduplicated stats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootStatConfig {
+    pub root_id: i64,
+    pub expiration_days: u32,
+    pub warning_days: u32,
+}
+
 /// A user-configured tracked root path.
 ///
 /// Roots are the top-level directories that users add to stagecrew for monitoring.
@@ -1264,81 +1272,229 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
+    // TODO(cleanup): Remove once all callers use explicit per-root config maps.
+    // This remains useful in tests that exercise the legacy single-config path.
+    #[allow(dead_code)]
     pub fn compute_live_stats(&self, expiration_days: u32, warning_days: u32) -> Result<Stats> {
-        let now = jiff::Timestamp::now().as_second();
-        let expiration_days_i64 = i64::from(expiration_days);
-        let warning_days_i64 = i64::from(warning_days);
+        let root_configs = self
+            .list_roots()?
+            .into_iter()
+            .map(|root| RootStatConfig {
+                root_id: root.id,
+                expiration_days,
+                warning_days,
+            })
+            .collect::<Vec<_>>();
+        self.compute_live_stats_with_root_configs(&root_configs)
+    }
 
-        self.conn
-            .query_row(
-                "SELECT
-                    -- 0: total files (excludes removed and ignored)
-                    (SELECT COUNT(*) FROM entries
-                     WHERE is_dir = 0 AND status NOT IN ('removed', 'ignored')),
-                    -- 1: total size bytes (excludes removed and ignored)
-                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND status NOT IN ('removed', 'ignored')),
-                    -- 2: files within warning period
-                    (SELECT COUNT(*) FROM entries
-                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
-                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= ?3
-                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) > 0),
-                    -- 3: files pending approval
-                    (SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status = 'pending'),
-                    -- 4: files overdue (tracked, pending, or approved past expiration)
-                    (SELECT COUNT(*) FROM entries
-                     WHERE is_dir = 0 AND countdown_start IS NOT NULL
-                       AND status IN ('tracked', 'pending', 'approved')
-                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= 0),
-                    -- 5: last scan completed
-                    (SELECT last_scan_completed FROM stats WHERE id = 1),
-                    -- 6: healthy files (tracked, outside warning period)
-                    (SELECT COUNT(*) FROM entries
-                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
-                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) > ?3),
-                    -- 7: healthy bytes
-                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
-                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) > ?3),
-                    -- 8: warning bytes
-                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND countdown_start IS NOT NULL AND status = 'tracked'
-                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= ?3
-                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) > 0),
-                    -- 9: pending bytes
-                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND status = 'pending'),
-                    -- 10: overdue bytes (tracked, pending, or approved past expiration)
-                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND countdown_start IS NOT NULL
-                       AND status IN ('tracked', 'pending', 'approved')
-                       AND ((countdown_start + (?1 * 86400) - ?2) / 86400) <= 0),
-                    -- 11: ignored files
-                    (SELECT COUNT(*) FROM entries
-                     WHERE is_dir = 0 AND status = 'ignored'),
-                    -- 12: ignored bytes
-                    (SELECT COALESCE(SUM(size_bytes), 0) FROM entries
-                     WHERE is_dir = 0 AND status = 'ignored')",
-                (expiration_days_i64, now, warning_days_i64),
-                |row| {
-                    Ok(Stats {
-                        total_files: row.get(0)?,
-                        total_size_bytes: row.get(1)?,
-                        files_within_warning: row.get(2)?,
-                        files_pending_approval: row.get(3)?,
-                        files_overdue: row.get(4)?,
-                        last_scan_completed: row.get(5)?,
-                        files_healthy: row.get(6)?,
-                        bytes_healthy: row.get(7)?,
-                        bytes_within_warning: row.get(8)?,
-                        bytes_pending_approval: row.get(9)?,
-                        bytes_overdue: row.get(10)?,
-                        files_ignored: row.get(11)?,
-                        bytes_ignored: row.get(12)?,
-                    })
-                },
-            )
-            .map_err(Into::into)
+    /// Compute live statistics using explicit per-root expiration policies.
+    ///
+    /// Global totals are deduplicated by file path so overlapping roots do not
+    /// double-count bytes or files in the header and shell status surfaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entries or stats tables cannot be queried.
+    pub fn compute_live_stats_with_root_configs(
+        &self,
+        root_configs: &[RootStatConfig],
+    ) -> Result<Stats> {
+        let now = jiff::Timestamp::now().as_second();
+        let config_map: std::collections::HashMap<i64, (u32, u32)> = root_configs
+            .iter()
+            .map(|cfg| (cfg.root_id, (cfg.expiration_days, cfg.warning_days)))
+            .collect();
+
+        let last_scan_completed: Option<i64> = self.conn.query_row(
+            "SELECT last_scan_completed FROM stats WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT path, root_id, size_bytes, countdown_start, deferred_until, status
+             FROM entries
+             WHERE is_dir = 0
+             ORDER BY path, root_id",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(DedupedStatRow {
+                path: row.get(0)?,
+                root_id: row.get(1)?,
+                size_bytes: row.get(2)?,
+                countdown_start: row.get(3)?,
+                deferred_until: row.get(4)?,
+                status: row.get(5)?,
+            })
+        })?;
+
+        let mut aggregate = DedupedStatAggregate::default();
+        let mut current_path: Option<String> = None;
+        let mut current_bucket = PathStatBucket::default();
+
+        for row in rows {
+            let row = row?;
+            if current_path.as_deref() != Some(&row.path) {
+                if current_path.is_some() {
+                    aggregate.observe(&current_bucket);
+                }
+                current_path = Some(row.path.clone());
+                current_bucket = PathStatBucket::default();
+            }
+
+            let (expiration_days, warning_days) =
+                config_map.get(&row.root_id).copied().unwrap_or((90, 14));
+            current_bucket.observe_row(&row, expiration_days, warning_days, now);
+        }
+
+        if current_path.is_some() {
+            aggregate.observe(&current_bucket);
+        }
+
+        Ok(Stats {
+            total_files: aggregate.total_files,
+            total_size_bytes: aggregate.total_size_bytes,
+            files_within_warning: aggregate.files_within_warning,
+            files_pending_approval: aggregate.files_pending_approval,
+            files_overdue: aggregate.files_overdue,
+            last_scan_completed,
+            files_healthy: aggregate.files_healthy,
+            bytes_healthy: aggregate.bytes_healthy,
+            bytes_within_warning: aggregate.bytes_within_warning,
+            bytes_pending_approval: aggregate.bytes_pending_approval,
+            bytes_overdue: aggregate.bytes_overdue,
+            files_ignored: aggregate.files_ignored,
+            bytes_ignored: aggregate.bytes_ignored,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct DedupedStatRow {
+    path: String,
+    root_id: i64,
+    size_bytes: i64,
+    countdown_start: Option<i64>,
+    deferred_until: Option<i64>,
+    status: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PathUrgency {
+    #[default]
+    None,
+    Healthy,
+    Warning,
+    Pending,
+    Overdue,
+}
+
+#[derive(Debug, Default)]
+struct PathStatBucket {
+    size_bytes: i64,
+    has_active: bool,
+    has_ignored_only: bool,
+    urgency: PathUrgency,
+}
+
+impl PathStatBucket {
+    fn observe_row(
+        &mut self,
+        row: &DedupedStatRow,
+        expiration_days: u32,
+        warning_days: u32,
+        now: i64,
+    ) {
+        self.size_bytes = self.size_bytes.max(row.size_bytes);
+
+        if row.status != "removed" && row.status != "ignored" {
+            self.has_active = true;
+            self.has_ignored_only = false;
+        } else if row.status == "ignored" && !self.has_active {
+            self.has_ignored_only = true;
+        }
+
+        let days_remaining = if row.status == "deferred" {
+            row.deferred_until.map(|until| (until - now) / 86400)
+        } else {
+            row.countdown_start.map(|countdown_start| {
+                let expiration_timestamp = countdown_start + (i64::from(expiration_days) * 86400);
+                (expiration_timestamp - now) / 86400
+            })
+        };
+
+        if row.status == "pending" {
+            self.urgency = self.urgency.max(PathUrgency::Pending);
+        }
+
+        if row.status == "tracked"
+            && let Some(days) = days_remaining
+        {
+            if days <= 0 {
+                self.urgency = self.urgency.max(PathUrgency::Overdue);
+            } else if days <= i64::from(warning_days) {
+                self.urgency = self.urgency.max(PathUrgency::Warning);
+            } else {
+                self.urgency = self.urgency.max(PathUrgency::Healthy);
+            }
+        }
+
+        if (row.status == "approved" || row.status == "pending")
+            && let Some(days) = days_remaining
+            && days <= 0
+        {
+            self.urgency = self.urgency.max(PathUrgency::Overdue);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DedupedStatAggregate {
+    total_files: i64,
+    total_size_bytes: i64,
+    files_within_warning: i64,
+    files_pending_approval: i64,
+    files_overdue: i64,
+    files_healthy: i64,
+    bytes_healthy: i64,
+    bytes_within_warning: i64,
+    bytes_pending_approval: i64,
+    bytes_overdue: i64,
+    files_ignored: i64,
+    bytes_ignored: i64,
+}
+
+impl DedupedStatAggregate {
+    fn observe(&mut self, bucket: &PathStatBucket) {
+        if bucket.has_active {
+            self.total_files += 1;
+            self.total_size_bytes += bucket.size_bytes;
+
+            match bucket.urgency {
+                PathUrgency::Overdue => {
+                    self.files_overdue += 1;
+                    self.bytes_overdue += bucket.size_bytes;
+                }
+                PathUrgency::Pending => {
+                    self.files_pending_approval += 1;
+                    self.bytes_pending_approval += bucket.size_bytes;
+                }
+                PathUrgency::Warning => {
+                    self.files_within_warning += 1;
+                    self.bytes_within_warning += bucket.size_bytes;
+                }
+                PathUrgency::Healthy => {
+                    self.files_healthy += 1;
+                    self.bytes_healthy += bucket.size_bytes;
+                }
+                PathUrgency::None => {}
+            }
+        } else if bucket.has_ignored_only {
+            self.files_ignored += 1;
+            self.bytes_ignored += bucket.size_bytes;
+        }
     }
 }
 
@@ -2717,6 +2873,148 @@ mod tests {
         assert_eq!(
             after.total_files, 1,
             "reader should see writer's committed data"
+        );
+    }
+
+    #[test]
+    fn compute_live_stats_deduplicates_overlapping_paths() {
+        let (_temp, db) = temp_database();
+
+        let parent_root_id = db
+            .insert_root(Path::new("/data"))
+            .expect("insert parent root");
+        let nested_root_id = db
+            .insert_root(Path::new("/data/project"))
+            .expect("insert nested root");
+
+        db.upsert_entry(
+            parent_root_id,
+            Path::new("/data/top.bin"),
+            Path::new("/data"),
+            false,
+            10,
+            Some(1000),
+        )
+        .expect("insert parent-only file");
+        let parent_shared_id = db
+            .upsert_entry(
+                parent_root_id,
+                Path::new("/data/project/shared.bin"),
+                Path::new("/data/project"),
+                false,
+                20,
+                Some(1000),
+            )
+            .expect("insert parent shared file");
+        let nested_shared_id = db
+            .upsert_entry(
+                nested_root_id,
+                Path::new("/data/project/shared.bin"),
+                Path::new("/data/project"),
+                false,
+                20,
+                Some(1000),
+            )
+            .expect("insert nested shared file");
+
+        let old_countdown = jiff::Timestamp::now().as_second() - (100 * 86400);
+        db.conn()
+            .execute(
+                "UPDATE entries SET countdown_start = ?1 WHERE id = ?2",
+                rusqlite::params![old_countdown, parent_shared_id],
+            )
+            .expect("backdate parent shared countdown");
+        db.conn()
+            .execute(
+                "UPDATE entries SET countdown_start = ?1 WHERE id = ?2",
+                rusqlite::params![old_countdown, nested_shared_id],
+            )
+            .expect("backdate nested shared countdown");
+
+        let stats = db
+            .compute_live_stats_with_root_configs(&[
+                RootStatConfig {
+                    root_id: parent_root_id,
+                    expiration_days: 90,
+                    warning_days: 14,
+                },
+                RootStatConfig {
+                    root_id: nested_root_id,
+                    expiration_days: 90,
+                    warning_days: 14,
+                },
+            ])
+            .expect("compute deduped live stats");
+
+        assert_eq!(
+            stats.total_files, 2,
+            "shared path should count once globally"
+        );
+        assert_eq!(
+            stats.total_size_bytes, 30,
+            "shared bytes should count once globally"
+        );
+        assert_eq!(
+            stats.files_overdue, 1,
+            "shared overdue file should count once globally"
+        );
+    }
+
+    #[test]
+    fn compute_live_stats_prefers_active_rows_over_ignored_overlap_rows() {
+        let (_temp, db) = temp_database();
+
+        let parent_root_id = db
+            .insert_root(Path::new("/data"))
+            .expect("insert parent root");
+        let nested_root_id = db
+            .insert_root(Path::new("/data/project"))
+            .expect("insert nested root");
+
+        db.upsert_entry(
+            parent_root_id,
+            Path::new("/data/project/shared.bin"),
+            Path::new("/data/project"),
+            false,
+            20,
+            Some(1000),
+        )
+        .expect("insert parent shared file");
+        let nested_shared_id = db
+            .upsert_entry(
+                nested_root_id,
+                Path::new("/data/project/shared.bin"),
+                Path::new("/data/project"),
+                false,
+                20,
+                Some(1000),
+            )
+            .expect("insert nested shared file");
+        db.update_entry_status(nested_shared_id, "ignored")
+            .expect("ignore nested shared file");
+
+        let stats = db
+            .compute_live_stats_with_root_configs(&[
+                RootStatConfig {
+                    root_id: parent_root_id,
+                    expiration_days: 90,
+                    warning_days: 14,
+                },
+                RootStatConfig {
+                    root_id: nested_root_id,
+                    expiration_days: 90,
+                    warning_days: 14,
+                },
+            ])
+            .expect("compute deduped live stats");
+
+        assert_eq!(
+            stats.total_files, 1,
+            "active overlapping file should remain globally tracked"
+        );
+        assert_eq!(
+            stats.files_ignored, 0,
+            "ignored duplicate should not hide active path"
         );
     }
 

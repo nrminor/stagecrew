@@ -836,6 +836,18 @@ impl App {
         ctx: &TuiContext,
     ) {
         let config = ctx.config(self);
+        let root_configs = self
+            .roots
+            .iter()
+            .map(|root| {
+                let root_config = ctx.app_config.for_root(&root.path);
+                crate::db::RootStatConfig {
+                    root_id: root.id,
+                    expiration_days: root_config.expiration_days,
+                    warning_days: root_config.warning_days,
+                }
+            })
+            .collect::<Vec<_>>();
         self.loading.roots = true;
         self.loading.root_entries = self.current_root_id.is_some();
         self.loading.dir_entries = !self.current_path.as_os_str().is_empty();
@@ -845,7 +857,7 @@ impl App {
             self.current_root_id,
             self.current_path(),
             config.expiration_days,
-            config.warning_days,
+            root_configs,
             self.sort_mode(),
         );
     }

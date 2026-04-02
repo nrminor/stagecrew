@@ -360,14 +360,7 @@ pub async fn scan_and_persist(
     // Update stats table with per-root expiration awareness
     // Allow: Total counts are realistic filesystem statistics that won't exceed i64::MAX.
     #[allow(clippy::cast_possible_wrap)]
-    update_stats(
-        db,
-        total_files as i64,
-        total_size_bytes as i64,
-        scan_timestamp,
-        app_config,
-        &roots,
-    )?;
+    update_stats(db, scan_timestamp, app_config, &roots)?;
 
     // Record scan in audit log
     let audit = AuditService::new(db);
@@ -621,62 +614,24 @@ fn record_scan_summary_audit(
 /// Returns an error if database operations fail.
 fn update_stats(
     db: &Database,
-    total_files: i64,
-    total_size_bytes: i64,
     scan_timestamp: i64,
     app_config: &AppConfig,
     roots: &[Root],
 ) -> Result<()> {
-    // Build root_id -> (expiration_days, warning_days) lookup
-    let root_configs: HashMap<i64, (u32, u32)> = roots
+    // Build per-root expiration policy for deduplicated global stats.
+    let root_configs = roots
         .iter()
         .map(|r| {
             let cfg = app_config.for_root(&r.path);
-            (r.id, (cfg.expiration_days, cfg.warning_days))
-        })
-        .collect();
-
-    // Query entries and compute stats in Rust for per-root awareness
-    let mut files_within_warning = 0i64;
-    let mut files_overdue = 0i64;
-
-    let mut stmt = db.conn().prepare(
-        "SELECT root_id, countdown_start, status
-         FROM entries
-         WHERE is_dir = 0 AND countdown_start IS NOT NULL",
-    )?;
-
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let root_id: i64 = row.get(0)?;
-        let countdown_start: i64 = row.get(1)?;
-        let status: String = row.get(2)?;
-
-        let (expiration_days, warning_days) = root_configs.get(&root_id).copied().unwrap_or((
-            app_config.global.expiration_days,
-            app_config.global.warning_days,
-        ));
-
-        let days_remaining = calculate_expiration(countdown_start, expiration_days);
-
-        if status == "tracked" {
-            if days_remaining <= 0 {
-                files_overdue += 1;
-            } else if days_remaining <= i64::from(warning_days) {
-                files_within_warning += 1;
+            crate::db::RootStatConfig {
+                root_id: r.id,
+                expiration_days: cfg.expiration_days,
+                warning_days: cfg.warning_days,
             }
-        }
-    }
+        })
+        .collect::<Vec<_>>();
 
-    drop(rows);
-    drop(stmt);
-
-    // files_pending_approval doesn't depend on expiration config
-    let files_pending: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM entries WHERE is_dir = 0 AND status = 'pending'",
-        [],
-        |row| row.get(0),
-    )?;
+    let live_stats = db.compute_live_stats_with_root_configs(&root_configs)?;
 
     db.conn().execute(
         "UPDATE stats SET
@@ -688,12 +643,12 @@ fn update_stats(
             files_overdue = ?6
          WHERE id = 1",
         (
-            total_files,
-            total_size_bytes,
+            live_stats.total_files,
+            live_stats.total_size_bytes,
             scan_timestamp,
-            files_within_warning,
-            files_pending,
-            files_overdue,
+            live_stats.files_within_warning,
+            live_stats.files_pending_approval,
+            live_stats.files_overdue,
         ),
     )?;
 
@@ -2680,6 +2635,57 @@ mod tests {
 
         assert_eq!(parent_shared.status, "removed");
         assert_eq!(nested_shared.status, "removed");
+    }
+
+    #[tokio::test]
+    async fn scan_and_persist_updates_global_stats_with_deduped_overlap_totals() {
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
+        let root = temp_dir.path();
+
+        let parent_root = root.join("staging");
+        let nested_root = parent_root.join("projectA");
+        fs::create_dir(&parent_root)
+            .expect("failed to create parent root directory - check permissions and disk space");
+        fs::create_dir(&nested_root)
+            .expect("failed to create nested root directory - check permissions and disk space");
+
+        File::create(parent_root.join("top.bin"))
+            .expect("failed to create parent-root file - check permissions and disk space")
+            .write_all(&[0u8; 10])
+            .expect("failed to write parent-root file - disk may be full");
+        File::create(nested_root.join("shared.bin"))
+            .expect("failed to create shared file - check permissions and disk space")
+            .write_all(&[0u8; 20])
+            .expect("failed to write shared file - disk may be full");
+
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
+        let scanner = Scanner::new();
+        let app_config =
+            test_app_config_with_paths(vec![parent_root.clone(), nested_root.clone()], 90, 14);
+
+        let summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to scan and persist overlapping roots");
+        assert_eq!(
+            summary.total_files, 3,
+            "scan summary remains root-summed for now"
+        );
+
+        let stats = db
+            .get_stats()
+            .expect("failed to query deduped stats after overlapping scan");
+        assert_eq!(
+            stats.total_files, 2,
+            "global stats should dedupe overlapping files"
+        );
+        assert_eq!(
+            stats.total_size_bytes, 30,
+            "global bytes should dedupe overlapping files"
+        );
     }
 
     #[tokio::test]

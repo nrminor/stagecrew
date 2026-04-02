@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use crate::audit::{AuditAction, AuditActorSource, AuditEntry, AuditEvent, AuditService};
-use crate::db::{Database, Entry, Root, Stats};
+use crate::db::{Database, Entry, Root, RootStatConfig, Stats};
 use crate::removal::RemovalMethod;
 use crate::scanner::calculate_expiration;
 
@@ -35,10 +35,7 @@ pub(crate) enum DbRequest {
         sort_mode: SortMode,
     },
     /// Compute live stats and nearest expiration timestamp.
-    Stats {
-        expiration_days: u32,
-        warning_days: u32,
-    },
+    Stats { root_configs: Vec<RootStatConfig> },
     /// Load recent audit log entries.
     AuditEntries,
 
@@ -208,8 +205,8 @@ impl DbDispatcher {
         &self,
         current_root_id: Option<i64>,
         current_path: &Path,
-        expiration_days: u32,
-        warning_days: u32,
+        current_expiration_days: u32,
+        root_configs: Vec<RootStatConfig>,
         sort_mode: SortMode,
     ) {
         self.send(DbRequest::Roots);
@@ -219,15 +216,12 @@ impl DbDispatcher {
                 self.send(DbRequest::DirEntries {
                     root_id,
                     parent_path: current_path.to_path_buf(),
-                    expiration_days,
+                    expiration_days: current_expiration_days,
                     sort_mode,
                 });
             }
         }
-        self.send(DbRequest::Stats {
-            expiration_days,
-            warning_days,
-        });
+        self.send(DbRequest::Stats { root_configs });
         self.send(DbRequest::AuditEntries);
     }
 }
@@ -326,25 +320,28 @@ fn process_request(db: &Database, request: DbRequest) -> DbResult {
             },
         },
 
-        DbRequest::Stats {
-            expiration_days,
-            warning_days,
-        } => match db.compute_live_stats(expiration_days, warning_days) {
-            Ok(stats) => {
-                let nearest = db.nearest_expiration(expiration_days).unwrap_or_else(|e| {
-                    tracing::warn!("Failed to query nearest expiration: {e}");
-                    None
-                });
-                DbResult::Stats {
-                    stats,
-                    nearest_expiration: nearest,
+        DbRequest::Stats { root_configs } => {
+            match db.compute_live_stats_with_root_configs(&root_configs) {
+                Ok(stats) => {
+                    let fallback_expiration_days =
+                        root_configs.first().map_or(90, |cfg| cfg.expiration_days);
+                    let nearest = db
+                        .nearest_expiration(fallback_expiration_days)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("Failed to query nearest expiration: {e}");
+                            None
+                        });
+                    DbResult::Stats {
+                        stats,
+                        nearest_expiration: nearest,
+                    }
                 }
+                Err(e) => DbResult::Error {
+                    context: "Stats",
+                    message: e.to_string(),
+                },
             }
-            Err(e) => DbResult::Error {
-                context: "Stats",
-                message: e.to_string(),
-            },
-        },
+        }
 
         DbRequest::AuditEntries => match AuditService::new(db).list_recent(1000) {
             Ok(entries) => DbResult::AuditEntries(entries),
