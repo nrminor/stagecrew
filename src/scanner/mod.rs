@@ -2547,6 +2547,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_and_persist_preserves_overlapping_entries_for_both_roots() {
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
+        let root = temp_dir.path();
+
+        let parent_root = root.join("staging");
+        let nested_root = parent_root.join("projectA");
+        fs::create_dir(&parent_root)
+            .expect("failed to create parent root directory - check permissions and disk space");
+        fs::create_dir(&nested_root)
+            .expect("failed to create nested root directory - check permissions and disk space");
+
+        File::create(parent_root.join("top.bin"))
+            .expect("failed to create parent-root file - check permissions and disk space")
+            .write_all(&[0u8; 10])
+            .expect("failed to write parent-root file - disk may be full");
+        let shared_file = nested_root.join("shared.bin");
+        File::create(&shared_file)
+            .expect("failed to create shared file - check permissions and disk space")
+            .write_all(&[0u8; 20])
+            .expect("failed to write shared file - disk may be full");
+
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
+        let scanner = Scanner::new();
+        let app_config =
+            test_app_config_with_paths(vec![parent_root.clone(), nested_root.clone()], 90, 14);
+
+        let summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to scan and persist overlapping roots");
+
+        assert_eq!(
+            summary.total_files, 3,
+            "scan summary still counts both roots separately"
+        );
+
+        let parent_root_id = db
+            .get_root_by_path(&parent_root)
+            .expect("query parent root")
+            .expect("parent root should exist")
+            .id;
+        let nested_root_id = db
+            .get_root_by_path(&nested_root)
+            .expect("query nested root")
+            .expect("nested root should exist")
+            .id;
+
+        let parent_shared = db
+            .get_entry_by_root_and_path(parent_root_id, &shared_file)
+            .expect("query parent shared entry")
+            .expect("parent root should retain overlapping entry");
+        let nested_shared = db
+            .get_entry_by_root_and_path(nested_root_id, &shared_file)
+            .expect("query nested shared entry")
+            .expect("nested root should retain overlapping entry");
+
+        assert_eq!(parent_shared.root_id, parent_root_id);
+        assert_eq!(nested_shared.root_id, nested_root_id);
+        assert_ne!(parent_shared.id, nested_shared.id);
+
+        let parent_entries = db
+            .list_entries_by_root(parent_root_id)
+            .expect("list parent-root entries");
+        let nested_entries = db
+            .list_entries_by_root(nested_root_id)
+            .expect("list nested-root entries");
+
+        assert!(parent_entries.iter().any(|entry| entry.path == shared_file));
+        assert!(nested_entries.iter().any(|entry| entry.path == shared_file));
+    }
+
+    #[tokio::test]
+    async fn scan_and_persist_marks_removed_overlap_entries_per_root() {
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
+        let root = temp_dir.path();
+
+        let parent_root = root.join("staging");
+        let nested_root = parent_root.join("projectA");
+        fs::create_dir(&parent_root)
+            .expect("failed to create parent root directory - check permissions and disk space");
+        fs::create_dir(&nested_root)
+            .expect("failed to create nested root directory - check permissions and disk space");
+
+        let shared_file = nested_root.join("shared.bin");
+        File::create(&shared_file)
+            .expect("failed to create shared file - check permissions and disk space")
+            .write_all(&[0u8; 20])
+            .expect("failed to write shared file - disk may be full");
+
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
+        let scanner = Scanner::new();
+        let app_config =
+            test_app_config_with_paths(vec![parent_root.clone(), nested_root.clone()], 90, 14);
+
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to perform initial overlapping scan");
+
+        fs::remove_file(&shared_file).expect("failed to remove shared file");
+
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to rescan after removing shared file");
+
+        let parent_root_id = db
+            .get_root_by_path(&parent_root)
+            .expect("query parent root")
+            .expect("parent root should exist")
+            .id;
+        let nested_root_id = db
+            .get_root_by_path(&nested_root)
+            .expect("query nested root")
+            .expect("nested root should exist")
+            .id;
+
+        let parent_shared = db
+            .get_entry_by_root_and_path(parent_root_id, &shared_file)
+            .expect("query parent shared entry")
+            .expect("parent root entry should still exist for auditability");
+        let nested_shared = db
+            .get_entry_by_root_and_path(nested_root_id, &shared_file)
+            .expect("query nested shared entry")
+            .expect("nested root entry should still exist for auditability");
+
+        assert_eq!(parent_shared.status, "removed");
+        assert_eq!(nested_shared.status, "removed");
+    }
+
+    #[tokio::test]
+    async fn scan_and_persist_ignored_inheritance_stays_root_local_for_overlap() {
+        let temp_dir = TempDir::new().expect(
+            "failed to create temp directory for scanner test - check disk space and permissions",
+        );
+        let root = temp_dir.path();
+
+        let parent_root = root.join("staging");
+        let nested_root = parent_root.join("projectA");
+        fs::create_dir(&parent_root)
+            .expect("failed to create parent root directory - check permissions and disk space");
+        fs::create_dir(&nested_root)
+            .expect("failed to create nested root directory - check permissions and disk space");
+
+        let shared_file = nested_root.join("shared.bin");
+        File::create(&shared_file)
+            .expect("failed to create shared file - check permissions and disk space")
+            .write_all(&[0u8; 20])
+            .expect("failed to write shared file - disk may be full");
+
+        let db_path = root.join("test.db");
+        let db = Database::open(&db_path)
+            .expect("failed to open test database - check permissions and disk space");
+        let scanner = Scanner::new();
+        let app_config =
+            test_app_config_with_paths(vec![parent_root.clone(), nested_root.clone()], 90, 14);
+
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to perform initial overlapping scan");
+
+        let nested_root_id = db
+            .get_root_by_path(&nested_root)
+            .expect("query nested root")
+            .expect("nested root should exist")
+            .id;
+        let parent_root_id = db
+            .get_root_by_path(&parent_root)
+            .expect("query parent root")
+            .expect("parent root should exist")
+            .id;
+
+        let nested_dir_entry = db
+            .get_entry_by_root_and_path(nested_root_id, &nested_root)
+            .expect("query nested root directory entry")
+            .expect("nested root directory should be persisted");
+        db.update_entry_status(nested_dir_entry.id, "ignored")
+            .expect("mark nested root directory ignored");
+
+        let new_child = nested_root.join("new.bin");
+        File::create(&new_child)
+            .expect("failed to create new overlapping child file")
+            .write_all(&[0u8; 5])
+            .expect("failed to write new overlapping child file");
+
+        let _summary = scan_and_persist(&db, &scanner, &app_config)
+            .await
+            .expect("failed to rescan overlapping roots after ignore");
+
+        let nested_child = db
+            .get_entry_by_root_and_path(nested_root_id, &new_child)
+            .expect("query nested child entry")
+            .expect("nested child should exist");
+        let parent_child = db
+            .get_entry_by_root_and_path(parent_root_id, &new_child)
+            .expect("query parent child entry")
+            .expect("parent child should exist");
+
+        assert_eq!(nested_child.status, "ignored");
+        assert_eq!(parent_child.status, "tracked");
+    }
+
+    #[tokio::test]
     async fn scan_and_persist_upserts_existing_entries() {
         let temp_dir = TempDir::new().expect(
             "failed to create temp directory for scanner test - check disk space and permissions",
