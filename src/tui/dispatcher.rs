@@ -29,6 +29,7 @@ pub(crate) enum DbRequest {
     RootEntries { root_id: i64 },
     /// Load entries for a directory, compute `days_remaining`, and sort.
     DirEntries {
+        root_id: i64,
         parent_path: PathBuf,
         expiration_days: u32,
         sort_mode: SortMode,
@@ -214,13 +215,14 @@ impl DbDispatcher {
         self.send(DbRequest::Roots);
         if let Some(root_id) = current_root_id {
             self.send(DbRequest::RootEntries { root_id });
-        }
-        if !current_path.as_os_str().is_empty() {
-            self.send(DbRequest::DirEntries {
-                parent_path: current_path.to_path_buf(),
-                expiration_days,
-                sort_mode,
-            });
+            if !current_path.as_os_str().is_empty() {
+                self.send(DbRequest::DirEntries {
+                    root_id,
+                    parent_path: current_path.to_path_buf(),
+                    expiration_days,
+                    sort_mode,
+                });
+            }
         }
         self.send(DbRequest::Stats {
             expiration_days,
@@ -300,10 +302,11 @@ fn process_request(db: &Database, request: DbRequest) -> DbResult {
         },
 
         DbRequest::DirEntries {
+            root_id,
             parent_path,
             expiration_days,
             sort_mode,
-        } => match db.list_entries_by_parent(&parent_path) {
+        } => match db.list_entries_by_parent(root_id, &parent_path) {
             Ok(entries) => {
                 let mut rows: Vec<_> = entries
                     .into_iter()
@@ -456,7 +459,8 @@ fn process_update_status(
             continue;
         }
         if entry.is_dir
-            && let Err(e) = db.update_entries_by_path_prefix(&entry.path, new_status)
+            && let Some(root_id) = audit.root_id
+            && let Err(e) = db.update_entries_by_path_prefix(root_id, &entry.path, new_status)
         {
             tracing::warn!("Failed to propagate status to children: {e}");
         }
@@ -515,7 +519,8 @@ fn process_defer(
             continue;
         }
         if entry.is_dir
-            && let Err(e) = db.defer_entries_by_path_prefix(&entry.path, deferred_until)
+            && let Some(root_id) = audit.root_id
+            && let Err(e) = db.defer_entries_by_path_prefix(root_id, &entry.path, deferred_until)
         {
             tracing::warn!("Failed to propagate deferral to children: {e}");
         }

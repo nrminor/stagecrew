@@ -87,7 +87,7 @@ async fn test_full_workflow() {
 
     // 5. Verify entries are in database
     let all_entries = db
-        .list_entries_by_parent(&tracked_dir)
+        .list_entries_by_parent(roots[0].id, &tracked_dir)
         .expect("should list entries");
     assert_eq!(
         all_entries.len(),

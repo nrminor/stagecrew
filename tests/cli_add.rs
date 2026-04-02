@@ -232,7 +232,7 @@ async fn add_with_scan_flag() {
 
     // List entries under the root - should have 2 file entries
     let entries = db
-        .list_entries_by_parent(&canonical_path)
+        .list_entries_by_parent(roots[0].id, &canonical_path)
         .expect("failed to list entries");
     assert_eq!(entries.len(), 2, "should have 2 file entries under root");
 

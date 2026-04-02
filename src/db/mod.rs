@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::removal::RemovalMethod;
 
 /// Current SQLite schema version managed via `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// A user-configured tracked root path.
 ///
@@ -173,6 +173,13 @@ impl Database {
         match version {
             0 => {
                 self.migrate_v0_to_v1()?;
+                self.set_user_version(1)?;
+                self.migrate_v1_to_v2()?;
+                self.set_user_version(SCHEMA_VERSION)?;
+                Ok(())
+            }
+            1 => {
+                self.migrate_v1_to_v2()?;
                 self.set_user_version(SCHEMA_VERSION)?;
                 Ok(())
             }
@@ -186,6 +193,59 @@ impl Database {
     /// Migrate legacy unversioned databases into the versioned schema flow.
     fn migrate_v0_to_v1(&self) -> Result<()> {
         self.migrate_audit_log_if_needed()
+    }
+
+    fn migrate_v1_to_v2(&self) -> Result<()> {
+        tracing::info!("Migrating entries table to root-scoped uniqueness");
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS idx_entries_root_id;
+             DROP INDEX IF EXISTS idx_entries_parent_path;
+             DROP INDEX IF EXISTS idx_entries_status;
+             DROP INDEX IF EXISTS idx_entries_mtime;
+
+             CREATE TABLE entries_new (
+                 id INTEGER PRIMARY KEY,
+                 root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+                 path TEXT NOT NULL,
+                 parent_path TEXT NOT NULL,
+                 is_dir INTEGER NOT NULL DEFAULT 0,
+                 size_bytes INTEGER NOT NULL DEFAULT 0,
+                 mtime INTEGER,
+                 tracked_since INTEGER,
+                 countdown_start INTEGER,
+                 status TEXT NOT NULL DEFAULT 'tracked'
+                     CHECK (status IN ('tracked', 'pending', 'approved', 'deferred', 'ignored', 'removed', 'blocked')),
+                 deferred_until INTEGER,
+                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                 UNIQUE(root_id, path)
+             );
+
+             INSERT INTO entries_new (
+                 id, root_id, path, parent_path, is_dir, size_bytes, mtime,
+                 tracked_since, countdown_start, status, deferred_until, created_at, updated_at
+             )
+             SELECT
+                 id, root_id, path, parent_path, is_dir, size_bytes, mtime,
+                 tracked_since, countdown_start, status, deferred_until, created_at, updated_at
+             FROM entries;
+
+             DROP TABLE entries;
+             ALTER TABLE entries_new RENAME TO entries;
+
+             CREATE INDEX IF NOT EXISTS idx_entries_root_id ON entries(root_id);
+             CREATE INDEX IF NOT EXISTS idx_entries_root_parent_path ON entries(root_id, parent_path);
+             CREATE INDEX IF NOT EXISTS idx_entries_root_status ON entries(root_id, status);
+             CREATE INDEX IF NOT EXISTS idx_entries_root_is_dir_status ON entries(root_id, is_dir, status);
+             CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
+             CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);",
+        )?;
+        tx.commit()?;
+
+        tracing::info!("entries table migration complete");
+        Ok(())
     }
 
     fn user_version(&self) -> Result<i64> {
@@ -500,8 +560,8 @@ impl Database {
 
         let path_str = path.to_string_lossy();
         let id: i64 = self.conn.query_row(
-            "SELECT id FROM entries WHERE path = ?1",
-            [&*path_str],
+            "SELECT id FROM entries WHERE root_id = ?1 AND path = ?2",
+            rusqlite::params![root_id, &*path_str],
             |row| row.get(0),
         )?;
         Ok(id)
@@ -541,8 +601,7 @@ impl Database {
         self.conn.execute(
             "INSERT INTO entries (root_id, path, parent_path, is_dir, size_bytes, mtime, tracked_since, countdown_start)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'), strftime('%s', 'now'))
-             ON CONFLICT(path) DO UPDATE SET
-                 root_id = excluded.root_id,
+             ON CONFLICT(root_id, path) DO UPDATE SET
                  parent_path = excluded.parent_path,
                  is_dir = excluded.is_dir,
                  size_bytes = excluded.size_bytes,
@@ -611,6 +670,49 @@ impl Database {
         }
     }
 
+    /// Get an entry for a specific root by its path.
+    ///
+    /// # Returns
+    ///
+    /// `Some(Entry)` if found, `None` if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    // TODO(cleanup): Replace remaining test-only path lookups with explicit root-scoped helpers.
+    // Overlap-aware production code should prefer get_entry_by_root_and_path.
+    #[allow(dead_code)]
+    pub fn get_entry_by_root_and_path(&self, root_id: i64, path: &Path) -> Result<Option<Entry>> {
+        let path_str = path.to_string_lossy();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
+                    tracked_since, countdown_start, status, deferred_until, created_at, updated_at
+             FROM entries
+             WHERE root_id = ?1 AND path = ?2",
+        )?;
+
+        let mut rows = stmt.query(rusqlite::params![root_id, &*path_str])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Entry {
+                id: row.get(0)?,
+                root_id: row.get(1)?,
+                path: PathBuf::from(row.get::<_, String>(2)?),
+                parent_path: PathBuf::from(row.get::<_, String>(3)?),
+                is_dir: row.get(4)?,
+                size_bytes: row.get(5)?,
+                mtime: row.get(6)?,
+                tracked_since: row.get(7)?,
+                countdown_start: row.get(8)?,
+                status: row.get(9)?,
+                deferred_until: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// List all entries with a given parent path.
     ///
     /// This is the primary method for browsing the filesystem tree. Given a
@@ -627,17 +729,17 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    pub fn list_entries_by_parent(&self, parent_path: &Path) -> Result<Vec<Entry>> {
+    pub fn list_entries_by_parent(&self, root_id: i64, parent_path: &Path) -> Result<Vec<Entry>> {
         let parent_path_str = parent_path.to_string_lossy();
         let mut stmt = self.conn.prepare(
             "SELECT id, root_id, path, parent_path, is_dir, size_bytes, mtime,
-                    tracked_since, countdown_start, status, deferred_until, created_at, updated_at
-             FROM entries
-             WHERE parent_path = ?1 AND status != 'removed'
-             ORDER BY path",
+                     tracked_since, countdown_start, status, deferred_until, created_at, updated_at
+              FROM entries
+             WHERE root_id = ?1 AND parent_path = ?2 AND status != 'removed'
+              ORDER BY path",
         )?;
 
-        let rows = stmt.query_map([&*parent_path_str], |row| {
+        let rows = stmt.query_map(rusqlite::params![root_id, &*parent_path_str], |row| {
             Ok(Entry {
                 id: row.get(0)?,
                 root_id: row.get(1)?,
@@ -902,6 +1004,7 @@ impl Database {
     /// Returns an error if the database operation fails.
     pub fn update_entries_by_path_prefix(
         &self,
+        root_id: i64,
         path_prefix: &Path,
         new_status: &str,
     ) -> Result<usize> {
@@ -909,9 +1012,9 @@ impl Database {
         // Use path || '/' to match the directory itself and all children
         let rows_affected = self.conn.execute(
             "UPDATE entries
-             SET status = ?1, updated_at = strftime('%s', 'now')
-             WHERE path = ?2 OR path LIKE ?3",
-            (new_status, &*prefix_str, format!("{prefix_str}/%")),
+              SET status = ?1, updated_at = strftime('%s', 'now')
+             WHERE root_id = ?2 AND (path = ?3 OR path LIKE ?4)",
+            rusqlite::params![new_status, root_id, &*prefix_str, format!("{prefix_str}/%")],
         )?;
 
         Ok(rows_affected)
@@ -982,15 +1085,21 @@ impl Database {
     /// Returns an error if the database operation fails.
     pub fn defer_entries_by_path_prefix(
         &self,
+        root_id: i64,
         path_prefix: &Path,
         deferred_until: i64,
     ) -> Result<usize> {
         let prefix_str = path_prefix.to_string_lossy();
         let rows_affected = self.conn.execute(
             "UPDATE entries
-             SET status = 'deferred', deferred_until = ?1, updated_at = strftime('%s', 'now')
-             WHERE path = ?2 OR path LIKE ?3",
-            (deferred_until, &*prefix_str, format!("{prefix_str}/%")),
+              SET status = 'deferred', deferred_until = ?1, updated_at = strftime('%s', 'now')
+             WHERE root_id = ?2 AND (path = ?3 OR path LIKE ?4)",
+            rusqlite::params![
+                deferred_until,
+                root_id,
+                &*prefix_str,
+                format!("{prefix_str}/%")
+            ],
         )?;
 
         Ok(rows_affected)
@@ -1049,7 +1158,12 @@ impl Database {
 
         // If it was a directory, also mark all children as removed
         if is_dir {
-            self.update_entries_by_path_prefix(path, "removed")?;
+            let root_id: i64 = self.conn.query_row(
+                "SELECT root_id FROM entries WHERE id = ?1",
+                [entry_id],
+                |row| row.get(0),
+            )?;
+            self.update_entries_by_path_prefix(root_id, path, "removed")?;
         }
 
         Ok(())
@@ -1236,6 +1350,69 @@ mod tests {
 
     use super::*;
 
+    const LEGACY_V1_SCHEMA: &str = "
+        CREATE TABLE roots (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            added_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            last_scanned INTEGER,
+            target_bytes INTEGER
+        );
+
+        CREATE TABLE entries (
+            id INTEGER PRIMARY KEY,
+            root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+            path TEXT NOT NULL UNIQUE,
+            parent_path TEXT NOT NULL,
+            is_dir INTEGER NOT NULL DEFAULT 0,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            mtime INTEGER,
+            tracked_since INTEGER,
+            countdown_start INTEGER,
+            status TEXT NOT NULL DEFAULT 'tracked'
+                CHECK (status IN ('tracked', 'pending', 'approved', 'deferred', 'ignored', 'removed', 'blocked')),
+            deferred_until INTEGER,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        );
+
+        CREATE TABLE audit_log (
+            id INTEGER PRIMARY KEY,
+            timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            user TEXT NOT NULL,
+            action TEXT NOT NULL
+                CHECK (action IN ('approve', 'unapprove', 'defer', 'ignore', 'unignore', 'remove', 'scan', 'undo', 'config_change')),
+            target_path TEXT,
+            details TEXT,
+            entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL,
+            actor_source TEXT,
+            root_id INTEGER,
+            outcome TEXT,
+            status_before TEXT,
+            status_after TEXT
+        );
+
+        CREATE INDEX idx_entries_root_id ON entries(root_id);
+        CREATE INDEX idx_entries_parent_path ON entries(parent_path);
+        CREATE INDEX idx_entries_status ON entries(status);
+        CREATE INDEX idx_entries_mtime ON entries(mtime);
+        CREATE INDEX idx_audit_log_timestamp ON audit_log(timestamp);
+        CREATE INDEX idx_audit_log_action ON audit_log(action);
+
+        CREATE TABLE stats (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            total_files INTEGER NOT NULL DEFAULT 0,
+            total_size_bytes INTEGER NOT NULL DEFAULT 0,
+            files_within_warning INTEGER NOT NULL DEFAULT 0,
+            files_pending_approval INTEGER NOT NULL DEFAULT 0,
+            files_overdue INTEGER NOT NULL DEFAULT 0,
+            last_scan_completed INTEGER,
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        );
+
+        INSERT OR IGNORE INTO stats (id) VALUES (1);
+    ";
+
     /// Creates a temporary database for testing.
     fn temp_database() -> (NamedTempFile, Database) {
         let temp_file = NamedTempFile::new().expect("failed to create temp file");
@@ -1313,9 +1490,11 @@ mod tests {
 
         let expected = [
             "idx_entries_root_id",
-            "idx_entries_parent_path",
-            "idx_entries_status",
+            "idx_entries_root_parent_path",
+            "idx_entries_root_status",
+            "idx_entries_root_is_dir_status",
             "idx_entries_mtime",
+            "idx_entries_path",
             "idx_audit_log_timestamp",
             "idx_audit_log_action",
         ];
@@ -1381,7 +1560,7 @@ mod tests {
         assert_eq!(roots[0].path, PathBuf::from("/test"));
 
         let entries = db
-            .list_entries_by_parent(Path::new("/test"))
+            .list_entries_by_parent(roots[0].id, Path::new("/test"))
             .expect("list entries");
         assert_eq!(entries.len(), 1, "entry should persist across opens");
 
@@ -1437,8 +1616,8 @@ mod tests {
                 .expect("set wal mode");
             conn.pragma_update(None, "foreign_keys", "ON")
                 .expect("enable foreign keys");
-            conn.execute_batch(include_str!("schema.sql"))
-                .expect("create schema");
+            conn.execute_batch(LEGACY_V1_SCHEMA)
+                .expect("create legacy schema");
             conn.execute("INSERT INTO roots (path) VALUES (?1)", ["/legacy-root"])
                 .expect("insert legacy root");
             conn.pragma_update(None, "user_version", 0)
@@ -1449,6 +1628,21 @@ mod tests {
         let roots = db.list_roots().expect("list roots after upgrade");
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].path, PathBuf::from("/legacy-root"));
+
+        let unique_indexes: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM pragma_index_list('entries')
+                 WHERE name LIKE 'sqlite_autoindex_entries_%' AND [unique] = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query entries unique indexes");
+        assert_eq!(
+            unique_indexes, 1,
+            "entries should have one unique autoindex"
+        );
 
         let user_version: i64 = db
             .conn
@@ -1602,14 +1796,14 @@ mod tests {
         .expect("insert entry");
 
         let entries_before = db
-            .list_entries_by_parent(Path::new("/data/project1"))
+            .list_entries_by_parent(root_id, Path::new("/data/project1"))
             .expect("list");
         assert_eq!(entries_before.len(), 1);
 
         db.delete_root(root_id).expect("delete root");
 
         let entries_after = db
-            .list_entries_by_parent(Path::new("/data/project1"))
+            .list_entries_by_parent(root_id, Path::new("/data/project1"))
             .expect("list");
         assert_eq!(entries_after.len(), 0, "entries should be cascaded");
     }
@@ -1703,6 +1897,50 @@ mod tests {
         assert!(entry.is_dir);
         assert_eq!(entry.size_bytes, 0);
         assert_eq!(entry.mtime, None);
+    }
+
+    #[test]
+    fn upsert_entry_allows_same_path_in_multiple_roots() {
+        let (_temp, db) = temp_database();
+
+        let parent_root_id = db
+            .insert_root(Path::new("/data"))
+            .expect("insert parent root");
+        let nested_root_id = db
+            .insert_root(Path::new("/data/project"))
+            .expect("insert nested root");
+
+        db.upsert_entry(
+            parent_root_id,
+            Path::new("/data/project/file.txt"),
+            Path::new("/data/project"),
+            false,
+            100,
+            Some(1000),
+        )
+        .expect("insert parent-root entry");
+        db.upsert_entry(
+            nested_root_id,
+            Path::new("/data/project/file.txt"),
+            Path::new("/data/project"),
+            false,
+            100,
+            Some(1000),
+        )
+        .expect("insert nested-root entry");
+
+        let parent_entry = db
+            .get_entry_by_root_and_path(parent_root_id, Path::new("/data/project/file.txt"))
+            .expect("query parent-root entry")
+            .expect("parent-root entry should exist");
+        let nested_entry = db
+            .get_entry_by_root_and_path(nested_root_id, Path::new("/data/project/file.txt"))
+            .expect("query nested-root entry")
+            .expect("nested-root entry should exist");
+
+        assert_eq!(parent_entry.root_id, parent_root_id);
+        assert_eq!(nested_entry.root_id, nested_root_id);
+        assert_ne!(parent_entry.id, nested_entry.id);
     }
 
     #[test]
@@ -1926,7 +2164,9 @@ mod tests {
         )
         .expect("insert");
 
-        let entries = db.list_entries_by_parent(Path::new("/data")).expect("list");
+        let entries = db
+            .list_entries_by_parent(root_id, Path::new("/data"))
+            .expect("list");
 
         assert_eq!(entries.len(), 3, "should return only immediate children");
         assert_eq!(entries[0].path, PathBuf::from("/data/a.txt"));
@@ -1954,8 +2194,53 @@ mod tests {
         db.update_entry_status(entry_id, "removed")
             .expect("update status");
 
-        let entries = db.list_entries_by_parent(Path::new("/data")).expect("list");
+        let entries = db
+            .list_entries_by_parent(root_id, Path::new("/data"))
+            .expect("list");
         assert_eq!(entries.len(), 0, "removed entries should be excluded");
+    }
+
+    #[test]
+    fn list_entries_by_parent_is_root_scoped_for_overlapping_paths() {
+        let (_temp, db) = temp_database();
+
+        let parent_root_id = db
+            .insert_root(Path::new("/data"))
+            .expect("insert parent root");
+        let nested_root_id = db
+            .insert_root(Path::new("/data/project"))
+            .expect("insert nested root");
+
+        db.upsert_entry(
+            parent_root_id,
+            Path::new("/data/project/file.txt"),
+            Path::new("/data/project"),
+            false,
+            100,
+            Some(1000),
+        )
+        .expect("insert parent-root entry");
+        db.upsert_entry(
+            nested_root_id,
+            Path::new("/data/project/file.txt"),
+            Path::new("/data/project"),
+            false,
+            100,
+            Some(1000),
+        )
+        .expect("insert nested-root entry");
+
+        let parent_entries = db
+            .list_entries_by_parent(parent_root_id, Path::new("/data/project"))
+            .expect("list parent entries");
+        let nested_entries = db
+            .list_entries_by_parent(nested_root_id, Path::new("/data/project"))
+            .expect("list nested entries");
+
+        assert_eq!(parent_entries.len(), 1);
+        assert_eq!(nested_entries.len(), 1);
+        assert_eq!(parent_entries[0].root_id, parent_root_id);
+        assert_eq!(nested_entries[0].root_id, nested_root_id);
     }
 
     #[test]
@@ -2186,32 +2471,51 @@ mod tests {
         )
         .expect("insert");
 
+        let other_root_id = db
+            .insert_root(Path::new("/data/archive"))
+            .expect("insert overlapping root");
+        db.upsert_entry(
+            other_root_id,
+            Path::new("/data/archive/old.txt"),
+            Path::new("/data/archive"),
+            false,
+            999,
+            Some(2000),
+        )
+        .expect("insert overlapping entry");
+
         let count = db
-            .update_entries_by_path_prefix(Path::new("/data/archive"), "ignored")
+            .update_entries_by_path_prefix(root_id, Path::new("/data/archive"), "ignored")
             .expect("update");
 
         assert_eq!(count, 3, "should update directory and its children");
 
         let archive = db
-            .get_entry_by_path(Path::new("/data/archive"))
+            .get_entry_by_root_and_path(root_id, Path::new("/data/archive"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(archive.status, "ignored");
 
         let old = db
-            .get_entry_by_path(Path::new("/data/archive/old.txt"))
+            .get_entry_by_root_and_path(root_id, Path::new("/data/archive/old.txt"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(old.status, "ignored");
 
         let keep = db
-            .get_entry_by_path(Path::new("/data/keep.txt"))
+            .get_entry_by_root_and_path(root_id, Path::new("/data/keep.txt"))
             .expect("query")
             .expect("entry should exist");
         assert_eq!(
             keep.status, "tracked",
             "unrelated entry should not be affected"
         );
+
+        let overlapping = db
+            .list_entries_by_parent(other_root_id, Path::new("/data/archive"))
+            .expect("query overlapping root entries");
+        assert_eq!(overlapping.len(), 1);
+        assert_eq!(overlapping[0].status, "tracked");
     }
 
     #[test]

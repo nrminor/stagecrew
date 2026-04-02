@@ -1810,8 +1810,9 @@ mod tests {
         {
             app.root_entries = entries;
         }
-        if !app.current_path.as_os_str().is_empty()
-            && let Ok(entries) = db.list_entries_by_parent(app.current_path())
+        if let Some(root_id) = app.current_root_id
+            && !app.current_path.as_os_str().is_empty()
+            && let Ok(entries) = db.list_entries_by_parent(root_id, app.current_path())
         {
             let mut rows: Vec<_> = entries
                 .into_iter()
@@ -1857,10 +1858,12 @@ mod tests {
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
 
-        db.insert_root(Path::new("/test/downloads"))
+        let root_id = db
+            .insert_root(Path::new("/test/downloads"))
             .expect("Failed to create test root");
 
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/downloads");
         populate_app_from_db(&mut app, &db, &test_config());
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('h')));
@@ -1960,6 +1963,7 @@ mod tests {
         .expect("Failed to create file entry");
 
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/downloads");
         // Sort by name puts directories first, so index 0 should be the subdir
         app.sort_mode = SortMode::Name;
@@ -1994,8 +1998,10 @@ mod tests {
         .expect("Failed to create file entry");
 
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/downloads");
         app.entry_selected_index = 0;
+        populate_app_from_db(&mut app, &db, &test_config());
 
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('l')));
 
@@ -2547,7 +2553,7 @@ mod tests {
 
         // Entry should no longer appear in the active entries list
         let entries = db
-            .list_entries_by_parent(temp_dir.path())
+            .list_entries_by_parent(root_id, temp_dir.path())
             .expect("Failed to list entries");
         assert!(
             !entries.iter().any(|e| e.id == entry_id),
@@ -2594,7 +2600,7 @@ mod tests {
 
         // Entry should still be in tracked status
         let entries = db
-            .list_entries_by_parent(Path::new("/test/dir"))
+            .list_entries_by_parent(dir_id, Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2678,7 +2684,7 @@ mod tests {
 
         // Entry should be marked as deferred
         let entries = db
-            .list_entries_by_parent(Path::new("/test/dir"))
+            .list_entries_by_parent(dir_id, Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2728,7 +2734,7 @@ mod tests {
 
         // Entry should be deferred with calculated timestamp
         let entries = db
-            .list_entries_by_parent(Path::new("/test/dir"))
+            .list_entries_by_parent(dir_id, Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2813,7 +2819,7 @@ mod tests {
 
         // Entry should be marked as ignored
         let entries = db
-            .list_entries_by_parent(Path::new("/test/dir"))
+            .list_entries_by_parent(dir_id, Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2845,7 +2851,7 @@ mod tests {
 
         // Entry should be marked as approved without modal confirmation
         let entries = db
-            .list_entries_by_parent(Path::new("/test/dir"))
+            .list_entries_by_parent(dir_id, Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2880,7 +2886,7 @@ mod tests {
 
         // Entry should be marked as tracked
         let entries = db
-            .list_entries_by_parent(Path::new("/test/dir"))
+            .list_entries_by_parent(dir_id, Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -2934,7 +2940,7 @@ mod tests {
         let root_id = setup_search_files(&db);
 
         let entries = db
-            .list_entries_by_parent(Path::new("/test/search"))
+            .list_entries_by_parent(root_id, Path::new("/test/search"))
             .expect("Failed to list entries");
         let mut entry_rows: Vec<_> = entries
             .into_iter()
@@ -2978,10 +2984,10 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_search_files(&db);
+        let root_id = setup_search_files(&db);
 
         let entries = db
-            .list_entries_by_parent(Path::new("/test/search"))
+            .list_entries_by_parent(root_id, Path::new("/test/search"))
             .expect("Failed to list entries");
         let mut entry_rows: Vec<_> = entries
             .into_iter()
@@ -3012,10 +3018,10 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_search_files(&db);
+        let root_id = setup_search_files(&db);
 
         let entries = db
-            .list_entries_by_parent(Path::new("/test/search"))
+            .list_entries_by_parent(root_id, Path::new("/test/search"))
             .expect("Failed to list entries");
         let mut entry_rows: Vec<_> = entries
             .into_iter()
@@ -3136,9 +3142,10 @@ mod tests {
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
 
-        setup_search_files(&db);
+        let root_id = setup_search_files(&db);
 
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/search");
         app.entry_selected_index = 0;
         populate_app_from_db(&mut app, &db, &test_config());
@@ -3177,9 +3184,10 @@ mod tests {
         let dispatcher = test_dispatcher();
         let _ctx = test_context(&db, &app_config, &dispatcher);
 
-        setup_search_files(&db);
+        let root_id = setup_search_files(&db);
 
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/search");
         populate_app_from_db(&mut app, &db, &test_config());
 
@@ -3228,9 +3236,10 @@ mod tests {
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
 
-        setup_search_files(&db);
+        let root_id = setup_search_files(&db);
 
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/search");
         populate_app_from_db(&mut app, &db, &test_config());
 
@@ -3353,9 +3362,9 @@ mod tests {
     }
 
     /// Helper to get sorted entry IDs for the visual test directory.
-    fn visual_entry_ids(db: &Database) -> Vec<i64> {
+    fn visual_entry_ids(db: &Database, root_id: i64) -> Vec<i64> {
         let entries = db
-            .list_entries_by_parent(Path::new("/test/visual"))
+            .list_entries_by_parent(root_id, Path::new("/test/visual"))
             .expect("should have entries");
         let mut rows: Vec<_> = entries
             .into_iter()
@@ -3376,10 +3385,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         app.entry_selected_index = 2; // charlie
         populate_app_from_db(&mut app, &db, &test_config());
@@ -3391,7 +3401,7 @@ mod tests {
         assert!(app.is_visual_mode());
         assert_eq!(app.visual_anchor, Some(2));
         // The entry at index 2 should be selected
-        let ids = visual_entry_ids(&db);
+        let ids = visual_entry_ids(&db, root_id);
         assert!(app.selected_entries.contains(&ids[2]));
         assert_eq!(app.selected_entries.len(), 1);
     }
@@ -3402,10 +3412,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         app.entry_selected_index = 1;
         populate_app_from_db(&mut app, &db, &test_config());
@@ -3414,7 +3425,7 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
         assert!(app.is_visual_mode());
 
-        let ids = visual_entry_ids(&db);
+        let ids = visual_entry_ids(&db, root_id);
         assert!(app.selected_entries.contains(&ids[1]));
 
         // Exit visual mode with v again
@@ -3430,10 +3441,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 1; // bravo
@@ -3446,7 +3458,7 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
-        let ids = visual_entry_ids(&db);
+        let ids = visual_entry_ids(&db, root_id);
         // Should have indices 1, 2, 3 selected (bravo, charlie, delta)
         assert!(app.selected_entries.contains(&ids[1]));
         assert!(app.selected_entries.contains(&ids[2]));
@@ -3461,10 +3473,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 3; // delta
@@ -3477,7 +3490,7 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('k')));
 
-        let ids = visual_entry_ids(&db);
+        let ids = visual_entry_ids(&db, root_id);
         // Should have indices 1, 2, 3 selected
         assert!(app.selected_entries.contains(&ids[1]));
         assert!(app.selected_entries.contains(&ids[2]));
@@ -3492,16 +3505,17 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 0;
         populate_app_from_db(&mut app, &db, &test_config());
 
-        let ids = visual_entry_ids(&db);
+        let ids = visual_entry_ids(&db, root_id);
 
         // Space-select item 0 (alpha) — Space also advances cursor to 1
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char(' ')));
@@ -3532,10 +3546,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 1; // bravo
@@ -3548,7 +3563,7 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
-        let ids = visual_entry_ids(&db);
+        let ids = visual_entry_ids(&db, root_id);
         assert_eq!(app.selected_entries.len(), 3); // 1, 2, 3
 
         // Now reverse: move back up to index 2
@@ -3569,10 +3584,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 1;
@@ -3582,7 +3598,7 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('v')));
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('j')));
 
-        let ids = visual_entry_ids(&db);
+        let ids = visual_entry_ids(&db, root_id);
         assert_eq!(app.selected_entries.len(), 2);
 
         // Esc exits visual mode
@@ -3599,10 +3615,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 2;
@@ -3623,10 +3640,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual/subdir");
         app.entry_selected_index = 0;
 
@@ -3644,10 +3662,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         app.entry_list_len = 5;
         app.entry_selected_index = 3; // delta
@@ -3659,7 +3678,7 @@ mod tests {
         // g jumps to top
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('g')));
 
-        let ids = visual_entry_ids(&db);
+        let ids = visual_entry_ids(&db, root_id);
         // Range should be [0, 3] inclusive
         assert!(app.selected_entries.contains(&ids[0]));
         assert!(app.selected_entries.contains(&ids[1]));
@@ -3691,10 +3710,11 @@ mod tests {
         let app_config = AppConfig::from_global(test_config());
         let dispatcher = test_dispatcher();
         let ctx = test_context(&db, &app_config, &dispatcher);
-        setup_visual_files(&db);
+        let root_id = setup_visual_files(&db);
 
         let mut app = App::new();
         app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(root_id);
         app.current_path = PathBuf::from("/test/visual");
         populate_app_from_db(&mut app, &db, &test_config());
 
@@ -3702,7 +3722,7 @@ mod tests {
 
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('a')));
 
-        let ids = visual_entry_ids(&db);
+        let ids = visual_entry_ids(&db, root_id);
         assert_eq!(app.selected_entries.len(), ids.len());
         for id in &ids {
             assert!(app.selected_entries.contains(id));
@@ -3885,7 +3905,7 @@ mod tests {
 
         // Previously approved entry should be back to tracked
         let entries = db
-            .list_entries_by_parent(std::path::Path::new("/test/dir"))
+            .list_entries_by_parent(root_id, std::path::Path::new("/test/dir"))
             .expect("Failed to list entries");
         let entry = entries
             .iter()
@@ -3950,7 +3970,7 @@ mod tests {
         // Approve an entry
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
         let entry = db
-            .list_entries_by_parent(std::path::Path::new("/test/dir"))
+            .list_entries_by_parent(root_id, std::path::Path::new("/test/dir"))
             .expect("should list entries")
             .into_iter()
             .find(|e| e.id == file_ids[0])
@@ -3961,7 +3981,7 @@ mod tests {
         // Undo
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('u')));
         let entry = db
-            .list_entries_by_parent(std::path::Path::new("/test/dir"))
+            .list_entries_by_parent(root_id, std::path::Path::new("/test/dir"))
             .expect("should list entries")
             .into_iter()
             .find(|e| e.id == file_ids[0])
@@ -4010,7 +4030,7 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('I')));
 
         let entry = db
-            .list_entries_by_parent(std::path::Path::new("/test/dir"))
+            .list_entries_by_parent(root_id, std::path::Path::new("/test/dir"))
             .expect("should list entries")
             .into_iter()
             .find(|e| e.id == file_ids[0])

@@ -2255,7 +2255,13 @@ mod tests {
 
         // Verify files were persisted as entries
         let entries = db
-            .list_entries_by_parent(&project_dir)
+            .list_entries_by_parent(
+                db.get_root_by_path(&project_dir)
+                    .expect("failed to query root for project directory")
+                    .expect("project directory should be a tracked root")
+                    .id,
+                &project_dir,
+            )
             .expect("failed to list entries from database - connection may be lost");
         assert_eq!(entries.len(), 2, "Expected 2 file entries");
 

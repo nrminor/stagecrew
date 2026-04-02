@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS roots (
 CREATE TABLE IF NOT EXISTS entries (
     id INTEGER PRIMARY KEY,
     root_id INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
-    path TEXT NOT NULL UNIQUE,
+    path TEXT NOT NULL,
     parent_path TEXT NOT NULL,
     is_dir INTEGER NOT NULL DEFAULT 0,
     size_bytes INTEGER NOT NULL DEFAULT 0,
@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS entries (
         CHECK (status IN ('tracked', 'pending', 'approved', 'deferred', 'ignored', 'removed', 'blocked')),
     deferred_until INTEGER,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    UNIQUE(root_id, path)
 );
 
 -- Audit trail for all actions
@@ -51,9 +52,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_entries_root_id ON entries(root_id);
-CREATE INDEX IF NOT EXISTS idx_entries_parent_path ON entries(parent_path);
-CREATE INDEX IF NOT EXISTS idx_entries_status ON entries(status);
+CREATE INDEX IF NOT EXISTS idx_entries_root_parent_path ON entries(root_id, parent_path);
+CREATE INDEX IF NOT EXISTS idx_entries_root_status ON entries(root_id, status);
+CREATE INDEX IF NOT EXISTS idx_entries_root_is_dir_status ON entries(root_id, is_dir, status);
 CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
+CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
 
