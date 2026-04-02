@@ -103,8 +103,31 @@ pub enum Command {
     #[command(subcommand)]
     Config(ConfigCommand),
 
-    /// Initialize or update configuration
-    Init,
+    /// Initialize Stagecrew for first-time use.
+    ///
+    /// By default this launches an interactive setup flow that creates a new
+    /// `config.toml`, choosing sensible defaults for retention policy, daemon
+    /// interval, and the anchored `scan_start_time`. If a config file already
+    /// exists, Stagecrew warns before overwriting it with a freshly generated
+    /// configuration instead of merging with the existing settings.
+    ///
+    /// The config file location defaults to the XDG config path on the current
+    /// system, typically `~/.config/stagecrew/config.toml`, and can be overridden
+    /// with the `STAGECREW_CONFIG_PATH` environment variable. Use
+    /// `stagecrew config path` to see the exact resolved location on this machine.
+    ///
+    /// Use `--non-interactive` to skip prompts and write defaults, or `--dry-run`
+    /// to print the exact TOML that would be created to stdout without writing any
+    /// files or initializing the database.
+    Init {
+        /// Skip prompts and use existing config or built-in defaults.
+        #[arg(long)]
+        non_interactive: bool,
+
+        /// Print the TOML that would be written to stdout without modifying files.
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// Add a tracked path to the configuration
     ///

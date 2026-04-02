@@ -245,9 +245,7 @@ impl Config {
         self.validate()?;
 
         let config_path = paths.config_file()?;
-        let toml_body = toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;
-
-        let contents = format!("{}\n{toml_body}", schema_comment());
+        let contents = self.to_file_contents()?;
 
         std::fs::write(&config_path, contents).map_err(|e| Error::Filesystem {
             path: config_path,
@@ -255,6 +253,18 @@ impl Config {
         })?;
 
         Ok(())
+    }
+
+    /// Render the exact TOML file contents that Stagecrew writes to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config fails validation or cannot be serialized.
+    pub fn to_file_contents(&self) -> Result<String> {
+        self.validate()?;
+
+        let toml_body = toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;
+        Ok(format!("{}\n{toml_body}", schema_comment()))
     }
 
     /// Validate configuration invariants that cannot be expressed through serde alone.
