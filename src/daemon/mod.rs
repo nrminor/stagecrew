@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use jiff::Timestamp;
 use tokio::time::sleep;
 
 use crate::config::{AppConfig, AppPaths};
@@ -77,9 +78,14 @@ impl Daemon {
             .opts
             .interval_hours
             .unwrap_or(config.scan_interval_hours);
+        let next_scheduled_scan = next_anchored_scan_from_config(
+            config.scan_start_time.as_deref(),
+            interval_hours,
+            Timestamp::now(),
+        )?;
 
         // Startup banner
-        self.print_startup_banner(&db_path, interval_hours);
+        self.print_startup_banner(&db_path, interval_hours, config, next_scheduled_scan);
 
         if self.opts.dry_run {
             tracing::info!("Dry-run mode: no files will be modified");
@@ -115,6 +121,48 @@ impl Daemon {
                 }
             };
 
+            let cycle_interval_hours = self
+                .opts
+                .interval_hours
+                .unwrap_or(app_config.global.scan_interval_hours);
+
+            if let Some(next_scan) = next_anchored_scan_from_config(
+                app_config.global.scan_start_time.as_deref(),
+                cycle_interval_hours,
+                Timestamp::now(),
+            )? {
+                let sleep_duration = duration_until(next_scan, Timestamp::now())?;
+
+                tracing::info!(
+                    configured_start = %app_config.global.scan_start_time.as_deref().unwrap_or_default(),
+                    next_scan = %next_scan,
+                    ?sleep_duration,
+                    "Waiting for next anchored scan slot"
+                );
+
+                #[cfg(unix)]
+                tokio::select! {
+                    _ = sigint.recv() => {
+                        tracing::info!("Received SIGINT before anchored scan, exiting gracefully");
+                        break;
+                    }
+                    _ = sigterm.recv() => {
+                        tracing::info!("Received SIGTERM before anchored scan, exiting gracefully");
+                        break;
+                    }
+                    () = sleep(sleep_duration) => {}
+                }
+
+                #[cfg(not(unix))]
+                tokio::select! {
+                    _ = &mut shutdown => {
+                        tracing::info!("Received shutdown signal before anchored scan, exiting gracefully");
+                        break;
+                    }
+                    () = sleep(sleep_duration) => {}
+                }
+            }
+
             // Check for shutdown signal
             #[cfg(unix)]
             tokio::select! {
@@ -138,8 +186,13 @@ impl Daemon {
                 () = Self::run_cycle_inner(&app_config, &db, &scanner, self.opts.scan_only) => {}
             }
 
-            // Sleep for configured interval
-            let sleep_duration = Duration::from_secs(u64::from(interval_hours) * 3600);
+            if app_config.global.scan_start_time.is_some() {
+                continue;
+            }
+
+            // No configured anchor: preserve legacy immediate-start behavior and
+            // sleep for the full interval after each completed cycle.
+            let sleep_duration = Duration::from_secs(u64::from(cycle_interval_hours) * 3600);
 
             tracing::info!(
                 ?sleep_duration,
@@ -172,8 +225,13 @@ impl Daemon {
         Ok(())
     }
 
-    fn print_startup_banner(&self, db_path: &std::path::Path, interval_hours: u32) {
-        let config = &self.app_config.global;
+    fn print_startup_banner(
+        &self,
+        db_path: &std::path::Path,
+        interval_hours: u32,
+        config: &crate::config::Config,
+        next_scheduled_scan: Option<Timestamp>,
+    ) {
         let mode = if self.opts.dry_run {
             "dry-run"
         } else if self.opts.once {
@@ -189,6 +247,14 @@ impl Daemon {
         eprintln!("  mode:            {mode}");
         eprintln!("  database:        {}", db_path.display());
         eprintln!("  scan interval:   {interval_hours}h");
+        if let Some(scan_start_time) = &config.scan_start_time {
+            eprintln!("  scan start:      {scan_start_time}");
+            if let Some(next_scan) = next_scheduled_scan {
+                eprintln!("  next scan:       {next_scan}");
+            }
+        } else {
+            eprintln!("  scan start:      immediate on launch");
+        }
         eprintln!("  expiration:      {} days", config.expiration_days);
         eprintln!("  warning window:  {} days", config.warning_days);
         eprintln!("  auto-remove:     {}", config.auto_remove);
@@ -201,6 +267,8 @@ impl Daemon {
         tracing::info!(
             mode,
             scan_interval_hours = interval_hours,
+            scan_start_time = ?config.scan_start_time,
+            next_scheduled_scan = ?next_scheduled_scan,
             expiration_days = config.expiration_days,
             warning_days = config.warning_days,
             auto_remove = config.auto_remove,
@@ -434,4 +502,112 @@ fn acquire_pid_lock(path: &std::path::Path) -> Result<PidLock> {
 
 fn is_process_running(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn next_anchored_scan_from_config(
+    scan_start_time: Option<&str>,
+    interval_hours: u32,
+    now: Timestamp,
+) -> Result<Option<Timestamp>> {
+    let Some(scan_start_time) = scan_start_time else {
+        return Ok(None);
+    };
+
+    let anchor = scan_start_time.parse::<Timestamp>().map_err(|e| {
+        crate::error::Error::Config(format!(
+            "scan_start_time must be a valid RFC 3339 timestamp: {e}"
+        ))
+    })?;
+
+    Ok(Some(next_anchored_scan(anchor, interval_hours, now)))
+}
+
+fn next_anchored_scan(anchor: Timestamp, interval_hours: u32, now: Timestamp) -> Timestamp {
+    let anchor_seconds = anchor.as_second();
+    let now_seconds = now.as_second();
+    if now_seconds <= anchor_seconds {
+        return anchor;
+    }
+
+    let interval_seconds = i64::from(interval_hours) * 3600;
+    let elapsed = now_seconds - anchor_seconds;
+    if elapsed % interval_seconds == 0 {
+        return now;
+    }
+    let periods_elapsed = elapsed / interval_seconds;
+    let next_seconds = anchor_seconds + ((periods_elapsed + 1) * interval_seconds);
+    Timestamp::from_second(next_seconds).expect("computed next scan timestamp should be valid")
+}
+
+fn duration_until(target: Timestamp, now: Timestamp) -> Result<Duration> {
+    let delta_seconds = target.as_second() - now.as_second();
+    let seconds = u64::try_from(delta_seconds.max(0))
+        .map_err(|_| crate::error::Error::Config("sleep duration overflow".to_string()))?;
+    Ok(Duration::from_secs(seconds))
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::Timestamp;
+
+    use super::{next_anchored_scan, next_anchored_scan_from_config};
+
+    #[test]
+    fn anchored_schedule_returns_none_when_unset() {
+        let now = "2026-04-03T08:30:00Z"
+            .parse::<Timestamp>()
+            .expect("parse now");
+        let next = next_anchored_scan_from_config(None, 24, now).expect("compute schedule");
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn anchored_schedule_uses_future_anchor_directly() {
+        let anchor = "2026-04-04T08:00:00Z"
+            .parse::<Timestamp>()
+            .expect("parse anchor");
+        let now = "2026-04-03T08:30:00Z"
+            .parse::<Timestamp>()
+            .expect("parse now");
+        assert_eq!(next_anchored_scan(anchor, 24, now), anchor);
+    }
+
+    #[test]
+    fn anchored_schedule_snaps_to_next_interval_slot() {
+        let anchor = "2026-04-03T08:00:00Z"
+            .parse::<Timestamp>()
+            .expect("parse anchor");
+        let now = "2026-04-03T10:30:00Z"
+            .parse::<Timestamp>()
+            .expect("parse now");
+        let expected = "2026-04-04T08:00:00Z"
+            .parse::<Timestamp>()
+            .expect("parse expected");
+        assert_eq!(next_anchored_scan(anchor, 24, now), expected);
+    }
+
+    #[test]
+    fn anchored_schedule_honors_exact_slot_without_drift() {
+        let anchor = "2026-04-03T08:00:00Z"
+            .parse::<Timestamp>()
+            .expect("parse anchor");
+        let now = "2026-04-04T08:00:00Z"
+            .parse::<Timestamp>()
+            .expect("parse now");
+        assert_eq!(next_anchored_scan(anchor, 24, now), now);
+    }
+
+    #[test]
+    fn anchored_schedule_supports_shorter_intervals() {
+        let anchor = "2026-04-03T08:00:00Z"
+            .parse::<Timestamp>()
+            .expect("parse anchor");
+        let now = "2026-04-03T13:01:00Z"
+            .parse::<Timestamp>()
+            .expect("parse now");
+        let expected = "2026-04-03T14:00:00Z"
+            .parse::<Timestamp>()
+            .expect("parse expected");
+        assert_eq!(next_anchored_scan(anchor, 6, now), expected);
+    }
 }
