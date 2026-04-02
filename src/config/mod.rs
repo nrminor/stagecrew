@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use xdg::BaseDirectories;
 
@@ -158,6 +160,12 @@ pub struct Config {
     /// Scan interval in hours for the daemon.
     pub scan_interval_hours: u32,
 
+    /// Anchor instant for interval-based daemon scheduling.
+    ///
+    /// This should be stored as an RFC 3339 timestamp in UTC, for example
+    /// `2026-04-03T08:00:00Z`.
+    pub scan_start_time: Option<String>,
+
     /// Optional explicit path to the `SQLite` database.
     ///
     /// If not set, the database path is derived from the first tracked path's
@@ -174,6 +182,7 @@ impl Default for Config {
             warning_days: 14,
             auto_remove: false,
             scan_interval_hours: 24,
+            scan_start_time: None,
             database_path: None,
         }
     }
@@ -222,6 +231,8 @@ impl Config {
             config.database_path = Some(PathBuf::from(expanded.as_ref()));
         }
 
+        config.validate()?;
+
         Ok(config)
     }
 
@@ -231,6 +242,8 @@ impl Config {
     ///
     /// Returns an error if the config cannot be serialized or written to disk.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
+        self.validate()?;
+
         let config_path = paths.config_file()?;
         let toml_body = toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;
 
@@ -240,6 +253,23 @@ impl Config {
             path: config_path,
             source: e,
         })?;
+
+        Ok(())
+    }
+
+    /// Validate configuration invariants that cannot be expressed through serde alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scan_start_time` is present but is not a valid RFC 3339 timestamp.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(scan_start_time) = &self.scan_start_time {
+            Timestamp::from_str(scan_start_time).map_err(|e| {
+                Error::Config(format!(
+                    "scan_start_time must be a valid RFC 3339 timestamp: {e}"
+                ))
+            })?;
+        }
 
         Ok(())
     }
@@ -264,10 +294,10 @@ pub const LOCAL_CONFIG_FILENAME: &str = "stagecrew.toml";
 
 /// Per-root configuration overrides parsed from local `stagecrew.toml` files.
 ///
-/// This struct intentionally excludes `tracked_paths` and `database_path` since
-/// those settings only make sense at the global level (there's one database for
-/// all roots). The `deny_unknown_fields` attribute ensures users get a clear
-/// error if they try to set unsupported fields.
+/// This struct intentionally excludes `tracked_paths`, `scan_start_time`, and
+/// `database_path` since those settings only make sense at the global level.
+/// The `deny_unknown_fields` attribute ensures users get a clear error if they
+/// try to set unsupported fields.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct LocalConfig {
@@ -308,6 +338,7 @@ impl LocalConfig {
             warning_days: self.warning_days.unwrap_or(base.warning_days),
             auto_remove: self.auto_remove.unwrap_or(base.auto_remove),
             scan_interval_hours: self.scan_interval_hours.unwrap_or(base.scan_interval_hours),
+            scan_start_time: base.scan_start_time.clone(),
             database_path: base.database_path.clone(),
         }
     }
@@ -408,6 +439,7 @@ mod tests {
         assert_eq!(config.warning_days, 14);
         assert!(!config.auto_remove);
         assert_eq!(config.scan_interval_hours, 24);
+        assert!(config.scan_start_time.is_none());
         assert!(config.database_path.is_none());
     }
 
@@ -419,6 +451,7 @@ mod tests {
             warning_days: 7,
             auto_remove: true,
             scan_interval_hours: 12,
+            scan_start_time: Some("2026-04-03T08:00:00Z".to_string()),
             database_path: Some(PathBuf::from("/shared/.stagecrew/db.sqlite")),
         };
 
@@ -431,6 +464,7 @@ mod tests {
         assert!(toml_str.contains("warning_days = 7"));
         assert!(toml_str.contains("auto_remove = true"));
         assert!(toml_str.contains("scan_interval_hours = 12"));
+        assert!(toml_str.contains("scan_start_time = \"2026-04-03T08:00:00Z\""));
         assert!(toml_str.contains("database_path"));
     }
 
@@ -442,6 +476,7 @@ mod tests {
             warning_days = 5
             auto_remove = false
             scan_interval_hours = 6
+            scan_start_time = "2026-04-03T08:00:00Z"
             database_path = "/custom/path/db.sqlite"
         "#;
 
@@ -454,6 +489,10 @@ mod tests {
         assert_eq!(config.warning_days, 5);
         assert!(!config.auto_remove);
         assert_eq!(config.scan_interval_hours, 6);
+        assert_eq!(
+            config.scan_start_time.as_deref(),
+            Some("2026-04-03T08:00:00Z")
+        );
         assert_eq!(
             config.database_path,
             Some(PathBuf::from("/custom/path/db.sqlite"))
@@ -474,7 +513,43 @@ mod tests {
         assert_eq!(config.warning_days, 14);
         assert!(!config.auto_remove);
         assert_eq!(config.scan_interval_hours, 24);
+        assert!(config.scan_start_time.is_none());
         assert!(config.database_path.is_none());
+    }
+
+    #[test]
+    fn config_rejects_invalid_scan_start_time() {
+        let toml_str = r#"
+            tracked_paths = ["/data/staging"]
+            scan_start_time = "not-a-timestamp"
+        "#;
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, toml_str).expect("write config file");
+
+        let paths = AppPaths::with_overrides(Some(config_path), None);
+        let err = Config::load(&paths).expect_err("invalid scan_start_time should fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("scan_start_time must be a valid RFC 3339 timestamp"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_schema_includes_scan_start_time() {
+        let schema = schemars::schema_for!(Config);
+        let json = serde_json::to_value(&schema).expect("serialize schema");
+        let properties = json
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema should contain properties object");
+
+        assert!(
+            properties.contains_key("scan_start_time"),
+            "config schema should expose scan_start_time"
+        );
     }
 
     #[test]
@@ -903,6 +978,7 @@ expiration_days = 90
             warning_days: 14,
             auto_remove: false,
             scan_interval_hours: 24,
+            scan_start_time: Some("2026-04-03T08:00:00Z".to_string()),
             database_path: Some(PathBuf::from("/global.db")),
         };
 
@@ -920,6 +996,10 @@ expiration_days = 90
         assert_eq!(merged.warning_days, 14);
         assert!(merged.auto_remove);
         assert_eq!(merged.scan_interval_hours, 24);
+        assert_eq!(
+            merged.scan_start_time.as_deref(),
+            Some("2026-04-03T08:00:00Z")
+        );
         // database_path is global-only, so it's always preserved from base
         assert_eq!(merged.database_path, Some(PathBuf::from("/global.db")));
     }
@@ -932,6 +1012,7 @@ expiration_days = 90
             warning_days: 14,
             auto_remove: false,
             scan_interval_hours: 24,
+            scan_start_time: Some("2026-04-03T08:00:00Z".to_string()),
             database_path: Some(PathBuf::from("/global.db")),
         };
 
@@ -943,6 +1024,10 @@ expiration_days = 90
         assert_eq!(merged.warning_days, 14);
         assert!(!merged.auto_remove);
         assert_eq!(merged.scan_interval_hours, 24);
+        assert_eq!(
+            merged.scan_start_time.as_deref(),
+            Some("2026-04-03T08:00:00Z")
+        );
         assert_eq!(merged.database_path, Some(PathBuf::from("/global.db")));
     }
 
