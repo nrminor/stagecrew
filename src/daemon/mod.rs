@@ -236,12 +236,24 @@ impl Daemon {
         match refresh(db, scanner, &app_config).await {
             Ok(summary) => {
                 eprintln!("Scan complete:");
-                eprintln!(
-                    "  {} directories, {} files, {} bytes",
-                    summary.scan.total_directories,
-                    summary.scan.total_files,
-                    summary.scan.total_size_bytes
-                );
+                if summary.scan.total_files == summary.scan.unique_files
+                    && summary.scan.total_size_bytes == summary.scan.unique_size_bytes
+                {
+                    eprintln!(
+                        "  {} directories, {} files, {} bytes",
+                        summary.scan.total_directories,
+                        summary.scan.total_files,
+                        summary.scan.total_size_bytes
+                    );
+                } else {
+                    eprintln!(
+                        "  {} directories, {} tracked files ({} bytes across roots, {} bytes unique)",
+                        summary.scan.total_directories,
+                        summary.scan.total_files,
+                        summary.scan.total_size_bytes,
+                        summary.scan.unique_size_bytes
+                    );
+                }
                 if summary.transitions.expired_to_pending > 0
                     || summary.transitions.expired_to_approved > 0
                     || summary.transitions.deferred_reset > 0

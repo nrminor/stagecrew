@@ -374,10 +374,18 @@ pub async fn scan_and_persist(
         total_size_bytes,
     )?;
 
+    let deduped_stats = db.get_stats()?;
+    let unique_files = u64::try_from(deduped_stats.total_files.max(0))
+        .map_err(|_| Error::Config("global stats file count overflow".to_string()))?;
+    let unique_size_bytes = u64::try_from(deduped_stats.total_size_bytes.max(0))
+        .map_err(|_| Error::Config("global stats byte count overflow".to_string()))?;
+
     tracing::info!(
         total_directories,
         total_files,
         total_size_bytes,
+        unique_files,
+        unique_size_bytes,
         "Scan complete"
     );
 
@@ -385,6 +393,8 @@ pub async fn scan_and_persist(
         total_directories,
         total_files,
         total_size_bytes,
+        unique_files,
+        unique_size_bytes,
     })
 }
 
@@ -666,6 +676,8 @@ pub struct ScanSummary {
     pub total_directories: u64,
     pub total_files: u64,
     pub total_size_bytes: u64,
+    pub unique_files: u64,
+    pub unique_size_bytes: u64,
 }
 
 /// Scanner for walking filesystem trees and collecting metadata.

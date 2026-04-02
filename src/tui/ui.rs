@@ -457,7 +457,7 @@ fn build_context_lines(
     let total_bytes = stats.total_size_bytes.max(0) as u64;
     lines.push(Line::from(Span::styled(
         format!(
-            "tracking {} files ({})",
+            "tracking {} unique files ({})",
             stats.total_files,
             format_bytes(total_bytes)
         ),
@@ -501,7 +501,7 @@ fn build_idle_display(stats: &crate::db::Stats, is_debug_build: bool) -> Vec<Lin
             )),
             Line::from(Span::styled(
                 format!(
-                    "tracking {} files ({})",
+                    "tracking {} unique files ({})",
                     stats.total_files,
                     format_bytes(total_bytes)
                 ),

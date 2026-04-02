@@ -265,10 +265,14 @@ async fn handle_add(
             .context("Failed to refresh tracked paths")?;
 
         println!(
-            "Refresh complete: {} directories, {} files, {}",
-            summary.scan.total_directories,
-            summary.scan.total_files,
-            format_bytes(summary.scan.total_size_bytes)
+            "{}",
+            format_refresh_summary(
+                summary.scan.total_directories,
+                summary.scan.total_files,
+                summary.scan.total_size_bytes,
+                summary.scan.unique_files,
+                summary.scan.unique_size_bytes,
+            )
         );
         if summary.transitions.expired_to_pending > 0 {
             println!(
@@ -341,10 +345,14 @@ async fn handle_scan(app_config: &AppConfig, db: &Database, path: Option<PathBuf
 
     // Print summary
     println!(
-        "Refresh complete: {} directories, {} files, {}",
-        summary.scan.total_directories,
-        summary.scan.total_files,
-        format_bytes(summary.scan.total_size_bytes)
+        "{}",
+        format_refresh_summary(
+            summary.scan.total_directories,
+            summary.scan.total_files,
+            summary.scan.total_size_bytes,
+            summary.scan.unique_files,
+            summary.scan.unique_size_bytes,
+        )
     );
     if summary.transitions.expired_to_pending > 0 {
         println!(
@@ -397,6 +405,27 @@ fn handle_status(db: &Database) -> Result<()> {
 
     println!("{}", format_status_output(&stats));
     Ok(())
+}
+
+fn format_refresh_summary(
+    total_directories: u64,
+    tracked_files: u64,
+    tracked_size_bytes: u64,
+    unique_files: u64,
+    unique_size_bytes: u64,
+) -> String {
+    if tracked_files == unique_files && tracked_size_bytes == unique_size_bytes {
+        format!(
+            "Refresh complete: {total_directories} directories, {tracked_files} files, {}",
+            format_bytes(tracked_size_bytes)
+        )
+    } else {
+        format!(
+            "Refresh complete: {total_directories} directories, {tracked_files} tracked files ({} across roots, {} unique across disk)",
+            format_bytes(tracked_size_bytes),
+            format_bytes(unique_size_bytes)
+        )
+    }
 }
 
 /// Format status output based on urgency metrics.
@@ -526,6 +555,22 @@ mod tests {
         assert!(!result.is_empty());
         // Should show in PB since that's our largest unit
         assert!(result.contains("PB"));
+    }
+
+    #[test]
+    fn format_refresh_summary_uses_simple_output_without_overlap() {
+        assert_eq!(
+            format_refresh_summary(12, 34, 1_000_000, 34, 1_000_000),
+            "Refresh complete: 12 directories, 34 files, 1.0 MB"
+        );
+    }
+
+    #[test]
+    fn format_refresh_summary_explains_overlap_when_totals_differ() {
+        assert_eq!(
+            format_refresh_summary(12, 50, 90_000_000_000_000, 30, 60_000_000_000_000),
+            "Refresh complete: 12 directories, 50 tracked files (90.0 TB across roots, 60.0 TB unique across disk)"
+        );
     }
 
     // === Status Output Formatting Tests ===
