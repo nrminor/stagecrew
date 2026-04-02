@@ -7,6 +7,9 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 use crate::removal::RemovalMethod;
 
+/// Current SQLite schema version managed via `PRAGMA user_version`.
+const SCHEMA_VERSION: i64 = 1;
+
 /// A user-configured tracked root path.
 ///
 /// Roots are the top-level directories that users add to stagecrew for monitoring.
@@ -155,13 +158,44 @@ impl Database {
         // Enable foreign key constraint enforcement.
         self.conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        // Migrate existing tables before applying the current schema, so that
-        // CREATE TABLE IF NOT EXISTS does not silently skip column additions.
-        self.migrate_audit_log_if_needed()?;
-
         // Run schema creation (idempotent with IF NOT EXISTS).
         self.conn.execute_batch(include_str!("schema.sql"))?;
 
+        self.migrate_schema()?;
+
+        Ok(())
+    }
+
+    /// Apply ordered schema migrations until the database reaches the current version.
+    fn migrate_schema(&self) -> Result<()> {
+        let version = self.user_version()?;
+
+        match version {
+            0 => {
+                self.migrate_v0_to_v1()?;
+                self.set_user_version(SCHEMA_VERSION)?;
+                Ok(())
+            }
+            SCHEMA_VERSION => Ok(()),
+            other => Err(Error::Config(format!(
+                "Unsupported database schema version {other}; expected {SCHEMA_VERSION}"
+            ))),
+        }
+    }
+
+    /// Migrate legacy unversioned databases into the versioned schema flow.
+    fn migrate_v0_to_v1(&self) -> Result<()> {
+        self.migrate_audit_log_if_needed()
+    }
+
+    fn user_version(&self) -> Result<i64> {
+        self.conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    fn set_user_version(&self, version: i64) -> Result<()> {
+        self.conn.pragma_update(None, "user_version", version)?;
         Ok(())
     }
 
@@ -1311,6 +1345,18 @@ mod tests {
     }
 
     #[test]
+    fn database_sets_schema_user_version() {
+        let (_temp, db) = temp_database();
+
+        let user_version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("failed to query user_version");
+
+        assert_eq!(user_version, SCHEMA_VERSION);
+    }
+
+    #[test]
     fn database_schema_is_idempotent() {
         let temp_file = NamedTempFile::new().expect("failed to create temp file");
 
@@ -1347,6 +1393,68 @@ mod tests {
             stats_count, 1,
             "stats table should still have exactly one row"
         );
+
+        let user_version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("failed to query user_version after reopen");
+        assert_eq!(user_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn database_open_rejects_future_schema_version() {
+        let temp_file = NamedTempFile::new().expect("failed to create temp file");
+
+        {
+            let conn = Connection::open(temp_file.path()).expect("open raw sqlite db");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("set wal mode");
+            conn.pragma_update(None, "foreign_keys", "ON")
+                .expect("enable foreign keys");
+            conn.execute_batch(include_str!("schema.sql"))
+                .expect("create schema");
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .expect("set future user_version");
+        }
+
+        let err = Database::open(temp_file.path())
+            .err()
+            .expect("future schema version should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unsupported database schema version"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn database_open_upgrades_legacy_unversioned_schema() {
+        let temp_file = NamedTempFile::new().expect("failed to create temp file");
+
+        {
+            let conn = Connection::open(temp_file.path()).expect("open raw sqlite db");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("set wal mode");
+            conn.pragma_update(None, "foreign_keys", "ON")
+                .expect("enable foreign keys");
+            conn.execute_batch(include_str!("schema.sql"))
+                .expect("create schema");
+            conn.execute("INSERT INTO roots (path) VALUES (?1)", ["/legacy-root"])
+                .expect("insert legacy root");
+            conn.pragma_update(None, "user_version", 0)
+                .expect("clear user_version");
+        }
+
+        let db = Database::open(temp_file.path()).expect("open should upgrade legacy schema");
+        let roots = db.list_roots().expect("list roots after upgrade");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, PathBuf::from("/legacy-root"));
+
+        let user_version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("failed to query upgraded user_version");
+        assert_eq!(user_version, SCHEMA_VERSION);
     }
 
     #[test]
