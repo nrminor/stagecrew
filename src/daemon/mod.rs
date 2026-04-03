@@ -1,5 +1,6 @@
 //! Background daemon for scanning and scheduled removals.
 
+use std::path::Path;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -89,12 +90,13 @@ impl Daemon {
 
         if self.opts.dry_run {
             tracing::info!("Dry-run mode: no files will be modified");
-            self.run_dry_run_cycle(&db, &scanner).await;
+            self.run_dry_run_cycle_interruptible(&db, &scanner).await?;
             return Ok(());
         }
 
         if self.opts.once {
-            self.run_single_cycle(&db, &scanner).await;
+            self.run_single_cycle_interruptible(&db, &db_path, &scanner)
+                .await?;
             return Ok(());
         }
 
@@ -174,7 +176,7 @@ impl Daemon {
                     tracing::info!("Received SIGTERM, exiting gracefully");
                     break;
                 }
-                () = Self::run_cycle_inner(&app_config, &db, &scanner, self.opts.scan_only) => {}
+                () = Self::run_cycle_inner(&app_config, &db, &db_path, &scanner, self.opts.scan_only) => {}
             }
 
             #[cfg(not(unix))]
@@ -183,7 +185,7 @@ impl Daemon {
                     tracing::info!("Received shutdown signal, exiting gracefully");
                     break;
                 }
-                () = Self::run_cycle_inner(&app_config, &db, &scanner, self.opts.scan_only) => {}
+                () = Self::run_cycle_inner(&app_config, &db, &db_path, &scanner, self.opts.scan_only) => {}
             }
 
             if app_config.global.scan_start_time.is_some() {
@@ -278,7 +280,12 @@ impl Daemon {
         );
     }
 
-    async fn run_single_cycle(&self, db: &Database, scanner: &Scanner) {
+    async fn run_single_cycle_interruptible(
+        &self,
+        db: &Database,
+        db_path: &Path,
+        scanner: &Scanner,
+    ) -> Result<()> {
         let db_roots: Vec<_> = db
             .list_roots()
             .unwrap_or_default()
@@ -287,10 +294,41 @@ impl Daemon {
             .collect();
         let app_config =
             AppConfig::load(&self.paths, &db_roots).unwrap_or_else(|_| self.app_config.clone());
-        Self::run_cycle_inner(&app_config, db, scanner, self.opts.scan_only).await;
+
+        #[cfg(unix)]
+        {
+            let mut sigint = signal(SignalKind::interrupt())?;
+            let mut sigterm = signal(SignalKind::terminate())?;
+            tokio::select! {
+                _ = sigint.recv() => {
+                    tracing::info!("Received SIGINT during single-cycle run, exiting gracefully");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM during single-cycle run, exiting gracefully");
+                }
+                () = Self::run_cycle_inner(&app_config, db, db_path, scanner, self.opts.scan_only) => {}
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut shutdown = Box::pin(signal::ctrl_c());
+            tokio::select! {
+                _ = &mut shutdown => {
+                    tracing::info!("Received shutdown signal during single-cycle run, exiting gracefully");
+                }
+                () = Self::run_cycle_inner(&app_config, db, db_path, scanner, self.opts.scan_only) => {}
+            }
+        }
+
+        Ok(())
     }
 
-    async fn run_dry_run_cycle(&self, db: &Database, scanner: &Scanner) {
+    async fn run_dry_run_cycle_interruptible(
+        &self,
+        db: &Database,
+        scanner: &Scanner,
+    ) -> Result<()> {
         let db_roots: Vec<_> = db
             .list_roots()
             .unwrap_or_default()
@@ -300,8 +338,46 @@ impl Daemon {
         let app_config =
             AppConfig::load(&self.paths, &db_roots).unwrap_or_else(|_| self.app_config.clone());
 
+        #[cfg(unix)]
+        {
+            let mut sigint = signal(SignalKind::interrupt())?;
+            let mut sigterm = signal(SignalKind::terminate())?;
+            tokio::select! {
+                _ = sigint.recv() => {
+                    tracing::info!("Received SIGINT during dry-run cycle, exiting gracefully");
+                    return Ok(());
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM during dry-run cycle, exiting gracefully");
+                    return Ok(());
+                }
+                () = self.run_dry_run_cycle_inner(db, scanner, &app_config) => {}
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut shutdown = Box::pin(signal::ctrl_c());
+            tokio::select! {
+                _ = &mut shutdown => {
+                    tracing::info!("Received shutdown signal during dry-run cycle, exiting gracefully");
+                    return Ok(());
+                }
+                () = self.run_dry_run_cycle_inner(db, scanner, &app_config) => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_dry_run_cycle_inner(
+        &self,
+        db: &Database,
+        scanner: &Scanner,
+        app_config: &AppConfig,
+    ) {
         tracing::info!("Starting dry-run scan");
-        match refresh(db, scanner, &app_config).await {
+        match refresh(db, scanner, app_config).await {
             Ok(summary) => {
                 eprintln!("Scan complete:");
                 if summary.scan.total_files == summary.scan.unique_files
@@ -380,6 +456,7 @@ impl Daemon {
     async fn run_cycle_inner(
         app_config: &AppConfig,
         db: &Database,
+        db_path: &Path,
         scanner: &Scanner,
         scan_only: bool,
     ) {
@@ -414,17 +491,29 @@ impl Daemon {
             }
         }
 
+        tokio::task::yield_now().await;
+
         // Step 2: Remove approved paths
         if !scan_only {
-            match remove_approved(db) {
-                Ok(summary) => {
+            let db_path = db_path.to_path_buf();
+            match tokio::task::spawn_blocking(move || {
+                let removal_db = Database::open(&db_path)?;
+                remove_approved(&removal_db)
+            })
+            .await
+            {
+                Ok(Ok(summary)) => {
                     removed_count = summary.removed_count();
                     blocked_count = summary.blocked_count();
                     bytes_freed = summary.total_bytes_freed();
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     removal_outcome = "failed";
                     tracing::warn!(error = ?e, "Removal failed");
+                }
+                Err(e) => {
+                    removal_outcome = "failed";
+                    tracing::warn!(error = ?e, "Removal task was cancelled or panicked");
                 }
             }
         }
