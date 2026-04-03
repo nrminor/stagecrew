@@ -3696,7 +3696,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
 
-        assert!(rendered.contains("Total: 10 files, 1000 B"));
+        assert!(rendered.contains("Total: 10 files, 1.0 KB"));
         assert!(rendered.contains("ignored: 2 files, 200 B"));
     }
 

@@ -91,6 +91,15 @@ impl Daemon {
             .opts
             .interval_hours
             .unwrap_or(config.scan_interval_hours);
+        let mode = if self.opts.dry_run {
+            "dry-run"
+        } else if self.opts.once {
+            "single cycle"
+        } else if self.opts.scan_only {
+            "scan-only (no removals)"
+        } else {
+            "continuous"
+        };
         let next_scheduled_scan = next_anchored_scan_from_config(
             config.scan_start_time.as_deref(),
             interval_hours,
@@ -101,7 +110,11 @@ impl Daemon {
         self.print_startup_banner(&db_path, interval_hours, config, next_scheduled_scan);
 
         if self.opts.dry_run {
-            tracing::info!("Dry-run mode: no files will be modified");
+            tracing::info!(
+                target: "stagecrew::daemon",
+                mode = "dry-run",
+                "daemon_mode_selected"
+            );
             self.run_dry_run_cycle_interruptible(&db, &scanner).await?;
             return Ok(());
         }
@@ -157,11 +170,11 @@ impl Daemon {
                 #[cfg(unix)]
                 tokio::select! {
                     _ = sigint.recv() => {
-                        tracing::info!("Received SIGINT before anchored scan, exiting gracefully");
+                        log_shutdown_event(mode, "waiting_for_anchor", "sigint");
                         break;
                     }
                     _ = sigterm.recv() => {
-                        tracing::info!("Received SIGTERM before anchored scan, exiting gracefully");
+                        log_shutdown_event(mode, "waiting_for_anchor", "sigterm");
                         break;
                     }
                     () = sleep(sleep_duration) => {}
@@ -170,7 +183,7 @@ impl Daemon {
                 #[cfg(not(unix))]
                 tokio::select! {
                     _ = &mut shutdown => {
-                        tracing::info!("Received shutdown signal before anchored scan, exiting gracefully");
+                        log_shutdown_event(mode, "waiting_for_anchor", "ctrl_c");
                         break;
                     }
                     () = sleep(sleep_duration) => {}
@@ -181,11 +194,11 @@ impl Daemon {
             #[cfg(unix)]
             tokio::select! {
                 _ = sigint.recv() => {
-                    tracing::info!("Received SIGINT, exiting gracefully");
+                    log_shutdown_event(mode, "idle", "sigint");
                     break;
                 }
                 _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM, exiting gracefully");
+                    log_shutdown_event(mode, "idle", "sigterm");
                     break;
                 }
                 () = Self::run_cycle_inner(&app_config, &db, &db_path, &scanner, self.opts.scan_only) => {}
@@ -194,7 +207,7 @@ impl Daemon {
             #[cfg(not(unix))]
             tokio::select! {
                 _ = &mut shutdown => {
-                    tracing::info!("Received shutdown signal, exiting gracefully");
+                    log_shutdown_event(mode, "idle", "ctrl_c");
                     break;
                 }
                 () = Self::run_cycle_inner(&app_config, &db, &db_path, &scanner, self.opts.scan_only) => {}
@@ -216,11 +229,11 @@ impl Daemon {
             #[cfg(unix)]
             tokio::select! {
                 _ = sigint.recv() => {
-                    tracing::info!("Received SIGINT during sleep, exiting gracefully");
+                    log_shutdown_event(mode, "sleeping", "sigint");
                     break;
                 }
                 _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM during sleep, exiting gracefully");
+                    log_shutdown_event(mode, "sleeping", "sigterm");
                     break;
                 }
                 () = sleep(sleep_duration) => {}
@@ -229,7 +242,7 @@ impl Daemon {
             #[cfg(not(unix))]
             tokio::select! {
                 _ = &mut shutdown => {
-                    tracing::info!("Received shutdown signal during sleep, exiting gracefully");
+                    log_shutdown_event(mode, "sleeping", "ctrl_c");
                     break;
                 }
                 () = sleep(sleep_duration) => {}
@@ -306,6 +319,7 @@ impl Daemon {
         db_path: &Path,
         scanner: &Scanner,
     ) -> Result<()> {
+        let mode = "single-cycle";
         let db_roots: Vec<_> = db
             .list_roots()
             .unwrap_or_default()
@@ -321,10 +335,10 @@ impl Daemon {
             let mut sigterm = signal(SignalKind::terminate())?;
             tokio::select! {
                 _ = sigint.recv() => {
-                    tracing::info!("Received SIGINT during single-cycle run, exiting gracefully");
+                    log_shutdown_event(mode, "active_cycle", "sigint");
                 }
                 _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM during single-cycle run, exiting gracefully");
+                    log_shutdown_event(mode, "active_cycle", "sigterm");
                 }
                 () = Self::run_cycle_inner(&app_config, db, db_path, scanner, self.opts.scan_only) => {}
             }
@@ -335,7 +349,7 @@ impl Daemon {
             let mut shutdown = Box::pin(signal::ctrl_c());
             tokio::select! {
                 _ = &mut shutdown => {
-                    tracing::info!("Received shutdown signal during single-cycle run, exiting gracefully");
+                    log_shutdown_event(mode, "active_cycle", "ctrl_c");
                 }
                 () = Self::run_cycle_inner(&app_config, db, db_path, scanner, self.opts.scan_only) => {}
             }
@@ -349,6 +363,7 @@ impl Daemon {
         db: &Database,
         scanner: &Scanner,
     ) -> Result<()> {
+        let mode = "dry-run";
         let db_roots: Vec<_> = db
             .list_roots()
             .unwrap_or_default()
@@ -364,11 +379,11 @@ impl Daemon {
             let mut sigterm = signal(SignalKind::terminate())?;
             tokio::select! {
                 _ = sigint.recv() => {
-                    tracing::info!("Received SIGINT during dry-run cycle, exiting gracefully");
+                    log_shutdown_event(mode, "active_cycle", "sigint");
                     return Ok(());
                 }
                 _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM during dry-run cycle, exiting gracefully");
+                    log_shutdown_event(mode, "active_cycle", "sigterm");
                     return Ok(());
                 }
                 () = self.run_dry_run_cycle_inner(db, scanner, &app_config) => {}
@@ -380,7 +395,7 @@ impl Daemon {
             let mut shutdown = Box::pin(signal::ctrl_c());
             tokio::select! {
                 _ = &mut shutdown => {
-                    tracing::info!("Received shutdown signal during dry-run cycle, exiting gracefully");
+                    log_shutdown_event(mode, "active_cycle", "ctrl_c");
                     return Ok(());
                 }
                 () = self.run_dry_run_cycle_inner(db, scanner, &app_config) => {}
@@ -396,46 +411,42 @@ impl Daemon {
         scanner: &Scanner,
         app_config: &AppConfig,
     ) {
-        tracing::info!("Starting dry-run scan");
+        tracing::info!(
+            target: "stagecrew::daemon",
+            mode = "dry-run",
+            tracked_path_count = app_config.global.tracked_paths.len(),
+            "daemon_dry_run_started"
+        );
+        let mut scan_outcome = "success";
+        let mut scan_directories = 0u64;
+        let mut scan_files = 0u64;
+        let mut scan_bytes = 0u64;
+        let mut unique_files = 0u64;
+        let mut unique_bytes = 0u64;
+        let mut expired_to_pending = 0u64;
+        let mut expired_to_approved = 0u64;
+        let mut deferred_reset = 0u64;
         match refresh(db, scanner, app_config).await {
             Ok(summary) => {
-                eprintln!("Scan complete:");
-                if summary.scan.total_files == summary.scan.unique_files
-                    && summary.scan.total_size_bytes == summary.scan.unique_size_bytes
-                {
-                    eprintln!(
-                        "  {} directories, {} files, {} bytes",
-                        summary.scan.total_directories,
-                        summary.scan.total_files,
-                        summary.scan.total_size_bytes
-                    );
-                } else {
-                    eprintln!(
-                        "  {} directories, {} tracked files ({} bytes across roots, {} bytes unique)",
-                        summary.scan.total_directories,
-                        summary.scan.total_files,
-                        summary.scan.total_size_bytes,
-                        summary.scan.unique_size_bytes
-                    );
-                }
-                if summary.transitions.expired_to_pending > 0
-                    || summary.transitions.expired_to_approved > 0
-                    || summary.transitions.deferred_reset > 0
-                {
-                    eprintln!("Transitions:");
-                    eprintln!(
-                        "  {} expired → pending",
-                        summary.transitions.expired_to_pending
-                    );
-                    eprintln!(
-                        "  {} expired → approved",
-                        summary.transitions.expired_to_approved
-                    );
-                    eprintln!("  {} deferred reset", summary.transitions.deferred_reset);
-                }
+                scan_directories = summary.scan.total_directories;
+                scan_files = summary.scan.total_files;
+                scan_bytes = summary.scan.total_size_bytes;
+                unique_files = summary.scan.unique_files;
+                unique_bytes = summary.scan.unique_size_bytes;
+                expired_to_pending = summary.transitions.expired_to_pending;
+                expired_to_approved = summary.transitions.expired_to_approved;
+                deferred_reset = summary.transitions.deferred_reset;
+                print_dry_run_scan_report(&summary);
             }
             Err(e) => {
+                scan_outcome = "failed";
                 eprintln!("Scan failed: {e}");
+                tracing::warn!(
+                    target: "stagecrew::daemon",
+                    mode = "dry-run",
+                    error = ?e,
+                    "daemon_dry_run_scan_failed"
+                );
             }
         }
 
@@ -463,6 +474,20 @@ impl Daemon {
         }
         eprintln!();
         eprintln!("Dry run summary: {total_removable} removable, {total_blocked} would fail");
+
+        log_dry_run_cycle_event(
+            scan_outcome,
+            scan_directories,
+            scan_files,
+            scan_bytes,
+            unique_files,
+            unique_bytes,
+            expired_to_pending,
+            expired_to_approved,
+            deferred_reset,
+            total_removable,
+            total_blocked,
+        );
     }
 
     /// Execute one complete refresh/removal cycle.
@@ -653,6 +678,84 @@ fn duration_until(target: Timestamp, now: Timestamp) -> Result<Duration> {
     let seconds = u64::try_from(delta_seconds.max(0))
         .map_err(|_| crate::error::Error::Config("sleep duration overflow".to_string()))?;
     Ok(Duration::from_secs(seconds))
+}
+
+fn log_shutdown_event(mode: &str, phase: &str, signal_name: &str) {
+    tracing::info!(
+        target: "stagecrew::daemon",
+        mode,
+        phase,
+        signal = signal_name,
+        outcome = "graceful_shutdown",
+        "daemon_shutdown"
+    );
+}
+
+fn print_dry_run_scan_report(summary: &crate::scanner::RefreshSummary) {
+    eprintln!("Scan complete:");
+    if summary.scan.total_files == summary.scan.unique_files
+        && summary.scan.total_size_bytes == summary.scan.unique_size_bytes
+    {
+        eprintln!(
+            "  {} directories, {} files, {} bytes",
+            summary.scan.total_directories, summary.scan.total_files, summary.scan.total_size_bytes
+        );
+    } else {
+        eprintln!(
+            "  {} directories, {} tracked files ({} bytes across roots, {} bytes unique)",
+            summary.scan.total_directories,
+            summary.scan.total_files,
+            summary.scan.total_size_bytes,
+            summary.scan.unique_size_bytes
+        );
+    }
+    if summary.transitions.expired_to_pending > 0
+        || summary.transitions.expired_to_approved > 0
+        || summary.transitions.deferred_reset > 0
+    {
+        eprintln!("Transitions:");
+        eprintln!(
+            "  {} expired → pending",
+            summary.transitions.expired_to_pending
+        );
+        eprintln!(
+            "  {} expired → approved",
+            summary.transitions.expired_to_approved
+        );
+        eprintln!("  {} deferred reset", summary.transitions.deferred_reset);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_dry_run_cycle_event(
+    scan_outcome: &str,
+    scan_directories: u64,
+    scan_files: u64,
+    scan_bytes: u64,
+    unique_files: u64,
+    unique_bytes: u64,
+    expired_to_pending: u64,
+    expired_to_approved: u64,
+    deferred_reset: u64,
+    total_removable: usize,
+    total_blocked: usize,
+) {
+    tracing::info!(
+        target: "stagecrew::daemon",
+        mode = "dry-run",
+        scan.outcome = scan_outcome,
+        scan.directories = scan_directories,
+        scan.files = scan_files,
+        scan.bytes = scan_bytes,
+        scan.unique_files = unique_files,
+        scan.unique_bytes = unique_bytes,
+        transitions.expired_to_pending = expired_to_pending,
+        transitions.expired_to_approved = expired_to_approved,
+        transitions.deferred_reset = deferred_reset,
+        removal.removable = total_removable,
+        removal.blocked = total_blocked,
+        "daemon_dry_run_cycle"
+    );
 }
 
 #[cfg(test)]
