@@ -695,6 +695,7 @@ struct LifecycleView {
     healthy: LifecycleTally,
     warning: LifecycleTally,
     overdue: LifecycleTally,
+    ignored: LifecycleTally,
 }
 
 impl From<&crate::db::Stats> for LifecycleView {
@@ -720,6 +721,10 @@ impl From<&crate::db::Stats> for LifecycleView {
                 files: clamp(stats.files_overdue) + clamp(stats.files_pending_approval),
                 bytes: clamp(stats.bytes_overdue) + clamp(stats.bytes_pending_approval),
             },
+            ignored: LifecycleTally {
+                files: clamp(stats.files_ignored),
+                bytes: clamp(stats.bytes_ignored),
+            },
         }
     }
 }
@@ -732,19 +737,28 @@ impl LifecycleView {
     /// - Warning: tracked entries within the warning period
     /// - Overdue: entries past expiration
     ///
-    /// Directories and ignored/removed entries are excluded from the tally.
+    /// Directories and removed entries are excluded from the tally.
+    /// Ignored entries contribute to the top-line total but are excluded from the
+    /// actionable lifecycle bars.
     fn from_entries(entries: &[crate::db::Entry], config: &Config) -> Self {
         let mut healthy = LifecycleTally { files: 0, bytes: 0 };
         let mut warning = LifecycleTally { files: 0, bytes: 0 };
         let mut overdue = LifecycleTally { files: 0, bytes: 0 };
+        let mut ignored = LifecycleTally { files: 0, bytes: 0 };
 
         for entry in entries
             .iter()
-            .filter(|e| !e.is_dir && e.status != "removed" && e.status != "ignored")
+            .filter(|e| !e.is_dir && e.status != "removed")
         {
             // Clamp size to non-negative for safe casting
             #[allow(clippy::cast_sign_loss)]
             let size = entry.size_bytes.max(0) as u64;
+
+            if entry.status == "ignored" {
+                ignored.files += 1;
+                ignored.bytes += size;
+                continue;
+            }
 
             // Calculate days remaining from the active countdown timestamp.
             let days_remaining = if entry.status == "deferred" {
@@ -784,11 +798,12 @@ impl LifecycleView {
         }
 
         Self {
-            total_files: healthy.files + warning.files + overdue.files,
-            total_bytes: healthy.bytes + warning.bytes + overdue.bytes,
+            total_files: healthy.files + warning.files + overdue.files + ignored.files,
+            total_bytes: healthy.bytes + warning.bytes + overdue.bytes + ignored.bytes,
             healthy,
             warning,
             overdue,
+            ignored,
         }
     }
 }
@@ -1388,7 +1403,8 @@ fn render_quota_widget(app: &App, config: &Config, frame: &mut Frame, area: rata
         clamp_i64(view.overdue.bytes),
     );
 
-    let used_bytes = healthy_bytes + warning_bytes + overdue_bytes;
+    let ignored_bytes = clamp_i64(view.ignored.bytes);
+    let used_bytes = healthy_bytes + warning_bytes + overdue_bytes + ignored_bytes;
 
     // Calculate values for display. Precision loss is acceptable since we only
     // display integer percentages.
@@ -1470,7 +1486,8 @@ fn render_quota_widget(app: &App, config: &Config, frame: &mut Frame, area: rata
             tui_piechart::PieSlice::new("", 0.01, palette::RED),
         ]
     } else {
-        // Under quota: show healthy (green), warning (yellow), overdue (red), remaining (gray)
+        // Under quota: show healthy (green), warning (yellow), overdue (red),
+        // ignored (gray), and remaining headroom (dark gray).
         let remaining_bytes = (target_bytes - used_bytes).max(0);
 
         #[allow(clippy::cast_precision_loss)]
@@ -1479,6 +1496,8 @@ fn render_quota_widget(app: &App, config: &Config, frame: &mut Frame, area: rata
         let warning_pct = warning_bytes.max(0) as f64 / target_f64 * 100.0;
         #[allow(clippy::cast_precision_loss)]
         let overdue_pct = overdue_bytes.max(0) as f64 / target_f64 * 100.0;
+        #[allow(clippy::cast_precision_loss)]
+        let ignored_pct = ignored_bytes.max(0) as f64 / target_f64 * 100.0;
         #[allow(clippy::cast_precision_loss)]
         let remaining_pct = remaining_bytes as f64 / target_f64 * 100.0;
 
@@ -1495,6 +1514,9 @@ fn render_quota_widget(app: &App, config: &Config, frame: &mut Frame, area: rata
         }
         if overdue_pct > 0.0 {
             slices.push(tui_piechart::PieSlice::new("", overdue_pct, palette::RED));
+        }
+        if ignored_pct > 0.0 {
+            slices.push(tui_piechart::PieSlice::new("", ignored_pct, Color::Gray));
         }
         if remaining_pct > 0.0 {
             slices.push(tui_piechart::PieSlice::new(
@@ -1535,6 +1557,18 @@ fn build_summary_line<'a>(view: &LifecycleView, status_message: Option<&str>) ->
         spans.push(Span::styled(
             status.to_owned(),
             Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+
+    if view.ignored.files > 0 || view.ignored.bytes > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!(
+                "ignored: {} files, {}",
+                view.ignored.files,
+                format_bytes(view.ignored.bytes)
+            ),
+            Style::default().fg(Color::DarkGray),
         ));
     }
 
@@ -3600,6 +3634,101 @@ mod tests {
             PathBuf::from("/a.txt"),
             "Oldest (1000) should be last"
         );
+    }
+
+    #[test]
+    fn lifecycle_view_includes_ignored_in_totals_only() {
+        let now = jiff::Timestamp::now().as_second();
+        let config = Config::default();
+
+        let mut healthy = test_entry("/healthy.txt", 100, Some(now));
+        healthy.countdown_start = Some(now);
+        healthy.status = "tracked".to_string();
+
+        let mut ignored = test_entry("/ignored.txt", 200, Some(now));
+        ignored.status = "ignored".to_string();
+
+        let view = LifecycleView::from_entries(&[healthy, ignored], &config);
+
+        assert_eq!(view.healthy.files, 1);
+        assert_eq!(view.healthy.bytes, 100);
+        assert_eq!(view.warning.files, 0);
+        assert_eq!(view.overdue.files, 0);
+        assert_eq!(view.ignored.files, 1);
+        assert_eq!(view.ignored.bytes, 200);
+        assert_eq!(
+            view.total_files, 2,
+            "ignored files should contribute to total"
+        );
+        assert_eq!(
+            view.total_bytes, 300,
+            "ignored bytes should contribute to total"
+        );
+    }
+
+    #[test]
+    fn build_summary_line_shows_ignored_callout_when_present() {
+        let view = LifecycleView {
+            total_files: 10,
+            total_bytes: 1_000,
+            healthy: LifecycleTally {
+                files: 4,
+                bytes: 400,
+            },
+            warning: LifecycleTally {
+                files: 3,
+                bytes: 300,
+            },
+            overdue: LifecycleTally {
+                files: 1,
+                bytes: 100,
+            },
+            ignored: LifecycleTally {
+                files: 2,
+                bytes: 200,
+            },
+        };
+
+        let line = build_summary_line(&view, None);
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(rendered.contains("Total: 10 files, 1000 B"));
+        assert!(rendered.contains("ignored: 2 files, 200 B"));
+    }
+
+    #[test]
+    fn build_summary_line_omits_ignored_callout_when_zero() {
+        let view = LifecycleView {
+            total_files: 8,
+            total_bytes: 800,
+            healthy: LifecycleTally {
+                files: 4,
+                bytes: 400,
+            },
+            warning: LifecycleTally {
+                files: 3,
+                bytes: 300,
+            },
+            overdue: LifecycleTally {
+                files: 1,
+                bytes: 100,
+            },
+            ignored: LifecycleTally { files: 0, bytes: 0 },
+        };
+
+        let line = build_summary_line(&view, None);
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(rendered.contains("Total: 8 files, 800 B"));
+        assert!(!rendered.contains("ignored:"));
     }
 
     // Tests for format_timestamp
