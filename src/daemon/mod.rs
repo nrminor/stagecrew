@@ -35,15 +35,27 @@ pub struct Daemon {
     app_config: AppConfig,
     paths: AppPaths,
     opts: DaemonOptions,
+    log_path: std::path::PathBuf,
+    log_filter: String,
+    log_filter_source: &'static str,
 }
 
 impl Daemon {
     /// Create a new daemon with the given configuration and runtime options.
-    pub fn new(app_config: AppConfig, opts: DaemonOptions) -> Self {
+    pub fn new(
+        app_config: AppConfig,
+        opts: DaemonOptions,
+        log_path: std::path::PathBuf,
+        log_filter: String,
+        log_filter_source: &'static str,
+    ) -> Self {
         Self {
             app_config,
             paths: AppPaths::new(),
             opts,
+            log_path,
+            log_filter,
+            log_filter_source,
         }
     }
 
@@ -248,6 +260,11 @@ impl Daemon {
         eprintln!();
         eprintln!("  mode:            {mode}");
         eprintln!("  database:        {}", db_path.display());
+        eprintln!("  logs:            {}", self.log_path.display());
+        eprintln!(
+            "  log filter:      {} ({})",
+            self.log_filter, self.log_filter_source
+        );
         eprintln!("  scan interval:   {interval_hours}h");
         if let Some(scan_start_time) = &config.scan_start_time {
             eprintln!("  scan start:      {scan_start_time}");
@@ -276,6 +293,9 @@ impl Daemon {
             auto_remove = config.auto_remove,
             tracked_path_count = config.tracked_paths.len(),
             db_path = %db_path.display(),
+            log_path = %self.log_path.display(),
+            log_filter = %self.log_filter,
+            log_filter_source = self.log_filter_source,
             "Daemon started"
         );
     }

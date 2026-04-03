@@ -48,11 +48,17 @@ async fn main() -> Result<()> {
         .open(&log_path)
         .context("Failed to open log file")?;
 
-    let env_filter = if std::env::var("RUST_LOG").is_ok() {
-        EnvFilter::from_default_env()
+    let (env_filter, log_filter_display, log_filter_source) = if std::env::var("RUST_LOG").is_ok() {
+        let rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+        (EnvFilter::from_default_env(), rust_log, "RUST_LOG")
     } else {
         let level = cli.verbose.tracing_level().unwrap_or(tracing::Level::WARN);
-        EnvFilter::new(level.to_string())
+        let level_str = level.to_string();
+        (
+            EnvFilter::new(level_str.clone()),
+            level_str,
+            "verbosity flag",
+        )
     };
 
     tracing_subscriber::fmt()
@@ -108,7 +114,13 @@ async fn main() -> Result<()> {
                 scan_only: scan_only || dry_run,
                 dry_run,
             };
-            let daemon = daemon::Daemon::new(app_config, opts);
+            let daemon = daemon::Daemon::new(
+                app_config,
+                opts,
+                log_path.clone(),
+                log_filter_display.clone(),
+                log_filter_source,
+            );
             daemon.run().await?;
         }
 
