@@ -1636,15 +1636,14 @@ impl InputHandler {
     /// Initiate quota target edit for the selected root.
     ///
     /// When called from the sidebar, uses the selected root. When called from
-    /// the entries panel, finds the root containing the current path.
+    /// the entries panel, uses the selected root identity from `current_root_id`
+    /// so nested tracked roots do not accidentally resolve to a parent by path prefix.
     fn initiate_quota_target(app: &mut App) {
         // Determine which root to use based on context
         let root = if app.focus_panel == FocusPanel::Sidebar {
             app.roots.get(app.sidebar_selected_index)
-        } else if !app.current_path.as_os_str().is_empty() {
-            app.roots
-                .iter()
-                .find(|r| app.current_path.starts_with(&r.path))
+        } else if let Some(root_id) = app.current_root_id {
+            app.roots.iter().find(|r| r.id == root_id)
         } else {
             None
         };
@@ -3931,6 +3930,174 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('T')));
 
         assert_eq!(app.status_message.as_deref(), Some("No root selected"));
+    }
+
+    #[test]
+    fn initiate_quota_target_uses_current_root_id_for_nested_roots() {
+        let (db, _db_path, _dir) = temp_database();
+        let mut app = App::new();
+
+        let parent_root_id = db
+            .insert_root(Path::new("/staging"))
+            .expect("insert parent root");
+        let child_root_id = db
+            .insert_root(Path::new("/staging/projectA"))
+            .expect("insert child root");
+        db.set_root_target_bytes(parent_root_id, Some(80_000_000_000_000))
+            .expect("set parent quota");
+        db.set_root_target_bytes(child_root_id, Some(30_000_000_000_000))
+            .expect("set child quota");
+
+        app.roots = db.list_roots().expect("list roots");
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(child_root_id);
+        app.current_path = PathBuf::from("/staging/projectA");
+
+        InputHandler::initiate_quota_target(&mut app);
+
+        let target = app
+            .pending_quota_target
+            .as_ref()
+            .expect("quota target modal should open");
+        assert_eq!(target.root_id, child_root_id);
+        assert_eq!(target.root_path, PathBuf::from("/staging/projectA"));
+        assert_eq!(target.current_target, Some(30_000_000_000_000));
+    }
+
+    #[test]
+    fn initiate_quota_target_sidebar_still_uses_sidebar_selection() {
+        let (db, _db_path, _dir) = temp_database();
+        let mut app = App::new();
+
+        let parent_root_id = db
+            .insert_root(Path::new("/staging"))
+            .expect("insert parent root");
+        let child_root_id = db
+            .insert_root(Path::new("/staging/projectA"))
+            .expect("insert child root");
+        db.set_root_target_bytes(parent_root_id, Some(80_000_000_000_000))
+            .expect("set parent quota");
+        db.set_root_target_bytes(child_root_id, Some(30_000_000_000_000))
+            .expect("set child quota");
+
+        app.roots = db.list_roots().expect("list roots");
+        app.focus_panel = FocusPanel::Sidebar;
+        app.sidebar_selected_index = app
+            .roots
+            .iter()
+            .position(|root| root.id == parent_root_id)
+            .expect("parent root should be in sidebar");
+        app.current_root_id = Some(child_root_id);
+        app.current_path = PathBuf::from("/staging/projectA");
+
+        InputHandler::initiate_quota_target(&mut app);
+
+        let target = app
+            .pending_quota_target
+            .as_ref()
+            .expect("quota target modal should open");
+        assert_eq!(target.root_id, parent_root_id);
+        assert_eq!(target.root_path, PathBuf::from("/staging"));
+        assert_eq!(target.current_target, Some(80_000_000_000_000));
+    }
+
+    #[test]
+    fn confirm_quota_target_updates_only_selected_child_root() {
+        let (db, db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_sync_dispatcher(&db_path);
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        let parent_root_id = db
+            .insert_root(Path::new("/staging"))
+            .expect("insert parent root");
+        let child_root_id = db
+            .insert_root(Path::new("/staging/projectA"))
+            .expect("insert child root");
+        db.set_root_target_bytes(parent_root_id, Some(80_000_000_000_000))
+            .expect("set parent quota");
+        db.set_root_target_bytes(child_root_id, Some(30_000_000_000_000))
+            .expect("set child quota");
+
+        app.roots = db.list_roots().expect("list roots");
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(child_root_id);
+        app.current_path = PathBuf::from("/staging/projectA/subdir");
+
+        InputHandler::initiate_quota_target(&mut app);
+        {
+            let target = app
+                .pending_quota_target
+                .as_mut()
+                .expect("quota target modal should open");
+            target.input = "45".to_string();
+            target.unit = crate::tui::ByteUnit::TB;
+        }
+
+        InputHandler::confirm_quota_target(&mut app, &ctx);
+
+        let roots = db.list_roots().expect("list roots after update");
+        let parent = roots
+            .iter()
+            .find(|root| root.id == parent_root_id)
+            .expect("parent root should exist");
+        let child = roots
+            .iter()
+            .find(|root| root.id == child_root_id)
+            .expect("child root should exist");
+
+        assert_eq!(parent.target_bytes, Some(80_000_000_000_000));
+        assert_eq!(child.target_bytes, Some(45_000_000_000_000));
+    }
+
+    #[test]
+    fn confirm_quota_target_clears_only_selected_child_root() {
+        let (db, db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_sync_dispatcher(&db_path);
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        let parent_root_id = db
+            .insert_root(Path::new("/staging"))
+            .expect("insert parent root");
+        let child_root_id = db
+            .insert_root(Path::new("/staging/projectA"))
+            .expect("insert child root");
+        db.set_root_target_bytes(parent_root_id, Some(80_000_000_000_000))
+            .expect("set parent quota");
+        db.set_root_target_bytes(child_root_id, Some(30_000_000_000_000))
+            .expect("set child quota");
+
+        app.roots = db.list_roots().expect("list roots");
+        app.focus_panel = FocusPanel::MainPanel;
+        app.current_root_id = Some(child_root_id);
+        app.current_path = PathBuf::from("/staging/projectA/subdir");
+
+        InputHandler::initiate_quota_target(&mut app);
+        {
+            let target = app
+                .pending_quota_target
+                .as_mut()
+                .expect("quota target modal should open");
+            target.input.clear();
+        }
+
+        InputHandler::confirm_quota_target(&mut app, &ctx);
+
+        let roots = db.list_roots().expect("list roots after clear");
+        let parent = roots
+            .iter()
+            .find(|root| root.id == parent_root_id)
+            .expect("parent root should exist");
+        let child = roots
+            .iter()
+            .find(|root| root.id == child_root_id)
+            .expect("child root should exist");
+
+        assert_eq!(parent.target_bytes, Some(80_000_000_000_000));
+        assert_eq!(child.target_bytes, None);
     }
 
     #[test]
