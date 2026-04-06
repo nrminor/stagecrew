@@ -1020,8 +1020,8 @@ impl InputHandler {
             undo_entries.push(UndoEntry {
                 entry_id: entry.id,
                 status_before: current_status.clone(),
-                deferred_until_before: None,
-                countdown_start_before: None,
+                deferred_until_before: entry.deferred_until,
+                countdown_start_before: entry.countdown_start,
             });
             let write_entry = super::dispatcher::WriteEntry {
                 id: entry.id,
@@ -1091,35 +1091,19 @@ impl InputHandler {
     fn entries_for_approval_toggle(
         app: &App,
         entry_rows: &[(crate::db::Entry, i64)],
-    ) -> Option<Vec<(super::PendingEntry, String)>> {
+    ) -> Option<Vec<(crate::db::Entry, String)>> {
         if app.selected_entries.is_empty() {
             // No selection - use currently focused entry
-            entry_rows.get(app.entry_selected_index).map(|(entry, _)| {
-                vec![(
-                    super::PendingEntry {
-                        id: entry.id,
-                        path: entry.path.clone(),
-                        is_dir: entry.is_dir,
-                    },
-                    entry.status.clone(),
-                )]
-            })
+            entry_rows
+                .get(app.entry_selected_index)
+                .map(|(entry, _)| vec![(entry.clone(), entry.status.clone())])
         } else {
             // Use selected entries (selection is by ID, so sorting doesn't matter here)
             Some(
                 entry_rows
                     .iter()
                     .filter(|(e, _)| app.selected_entries.contains(&e.id))
-                    .map(|(e, _)| {
-                        (
-                            super::PendingEntry {
-                                id: e.id,
-                                path: e.path.clone(),
-                                is_dir: e.is_dir,
-                            },
-                            e.status.clone(),
-                        )
-                    })
+                    .map(|(e, _)| (e.clone(), e.status.clone()))
                     .collect(),
             )
         }
@@ -4340,6 +4324,15 @@ mod tests {
         app.entry_selected_index = 0;
         populate_app_from_db(&mut app, &db, &test_config());
 
+        let original_entry = db
+            .list_entries_by_parent(root_id, std::path::Path::new("/test/dir"))
+            .expect("should list entries before approval")
+            .into_iter()
+            .find(|e| e.id == file_ids[0])
+            .expect("entry should exist before approval");
+        let original_countdown_start = original_entry.countdown_start;
+        let original_deferred_until = original_entry.deferred_until;
+
         // Approve an entry
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('x')));
         let entry = db
@@ -4362,6 +4355,17 @@ mod tests {
         assert_eq!(
             entry.status, "tracked",
             "Undo should restore tracked status"
+        );
+        assert_eq!(entry.countdown_start, original_countdown_start);
+        assert_eq!(entry.deferred_until, original_deferred_until);
+
+        let days_remaining = entry.countdown_start.map_or(i64::MAX, |cs| {
+            crate::scanner::calculate_expiration(cs, ctx.app_config.global.expiration_days)
+        });
+        assert_ne!(
+            days_remaining,
+            i64::MAX,
+            "Undo should restore a real countdown_start so due date stays sane"
         );
         assert!(app.undo_stack.is_empty());
     }

@@ -3093,7 +3093,7 @@ fn render_entry_delete_modal(frame: &mut Frame, path: &str, is_dir: bool, method
             Line::from(path.to_string()),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "[y] confirm   [n] cancel",
+                "[N] cancel   [y] confirm",
                 Style::default().fg(palette::MODAL_MUTED),
             )]),
         ],
