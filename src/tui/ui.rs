@@ -2994,7 +2994,7 @@ fn render_confirmation_modal(frame: &mut Frame, path: &str) {
             Line::from(path.to_string()),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "[y] confirm   [n] cancel",
+                "[N] cancel   [y] confirm",
                 Style::default().fg(palette::MODAL_MUTED),
             )]),
         ],
@@ -3125,7 +3125,7 @@ fn render_entry_delete_modal_multi(frame: &mut Frame, count: usize, method: Remo
             Line::from(message),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "[y] confirm   [n] cancel",
+                "[N] cancel   [y] confirm",
                 Style::default().fg(palette::MODAL_MUTED),
             )]),
         ],
@@ -3152,7 +3152,7 @@ fn render_ignore_modal(frame: &mut Frame, path: &str) {
             Line::from(path.to_string()),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "[y] confirm   [n] cancel",
+                "[Y] confirm   [n] cancel",
                 Style::default().fg(palette::MODAL_MUTED),
             )]),
         ],
@@ -3170,7 +3170,7 @@ fn render_ignore_modal_multi(frame: &mut Frame, count: usize) {
             Line::from(format!("Permanently ignore {count} files?")),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "[y] confirm   [n] cancel",
+                "[Y] confirm   [n] cancel",
                 Style::default().fg(palette::MODAL_MUTED),
             )]),
         ],
@@ -3188,7 +3188,7 @@ fn render_confirmation_modal_multi(frame: &mut Frame, count: usize) {
             Line::from(format!("Approve {count} files for removal?")),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "[y] confirm   [n] cancel",
+                "[Y] confirm   [n] cancel",
                 Style::default().fg(palette::MODAL_MUTED),
             )]),
         ],
@@ -3250,7 +3250,7 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
             Line::from(path.to_string()),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "[y] confirm   [n] cancel",
+                "[N] cancel   [y] confirm",
                 Style::default().fg(palette::MODAL_MUTED),
             )]),
         ],

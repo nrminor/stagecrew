@@ -704,7 +704,7 @@ impl InputHandler {
                 app.clear_selection();
                 app.dispatch_refresh(ctx.db_dispatcher, ctx);
             }
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            KeyCode::Enter | KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel deletion
                 app.pending_entry_delete = None;
             }
@@ -915,7 +915,7 @@ impl InputHandler {
     /// Handle entry ignore confirmation (y/n/Esc).
     fn handle_entry_ignore_confirmation(app: &mut App, ctx: &TuiContext, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('y' | 'Y') => {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
                 if let Some(entries) = app.pending_entry_ignore.take() {
                     let write_entries: Vec<_> = entries
                         .iter()
@@ -1632,7 +1632,7 @@ impl InputHandler {
                 }
                 app.pending_remove_path = None;
             }
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            KeyCode::Enter | KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 // Cancel removal
                 app.pending_remove_path = None;
             }
@@ -2636,6 +2636,39 @@ mod tests {
     }
 
     #[test]
+    fn file_delete_confirmation_enter_cancels_by_default() {
+        let (db, _db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        let (dir_id, file_ids) = setup_with_files(&db);
+        app.current_root_id = Some(dir_id);
+
+        app.pending_entry_delete = Some(PendingDeletion {
+            entries: vec![PendingEntry {
+                id: file_ids[0],
+                path: PathBuf::from("/test/dir/file1.txt"),
+                is_dir: false,
+            }],
+            method: RemovalMethod::Trash,
+        });
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
+
+        assert!(app.pending_entry_delete.is_none());
+        let entries = db
+            .list_entries_by_parent(dir_id, Path::new("/test/dir"))
+            .expect("Failed to list entries");
+        let entry = entries
+            .iter()
+            .find(|e| e.id == file_ids[0])
+            .expect("Entry should exist");
+        assert_eq!(entry.status, "tracked");
+    }
+
+    #[test]
     fn r_key_initiates_file_deferral() {
         let (db, _db_path, _dir) = temp_database();
         let mut app = App::new();
@@ -2849,6 +2882,36 @@ mod tests {
             .find(|e| e.id == file_ids[0])
             .expect("Entry should exist");
         assert_eq!(entry.status, "ignored", "Entry status should be 'ignored'");
+    }
+
+    #[test]
+    fn file_ignore_confirmation_enter_confirms_by_default() {
+        let (db, db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_sync_dispatcher(&db_path);
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        let (dir_id, file_ids) = setup_with_files(&db);
+        app.current_root_id = Some(dir_id);
+
+        app.pending_entry_ignore = Some(vec![PendingEntry {
+            id: file_ids[0],
+            path: PathBuf::from("/test/dir/file1.txt"),
+            is_dir: false,
+        }]);
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
+
+        assert!(app.pending_entry_ignore.is_none());
+        let entries = db
+            .list_entries_by_parent(dir_id, Path::new("/test/dir"))
+            .expect("Failed to list entries");
+        let entry = entries
+            .iter()
+            .find(|e| e.id == file_ids[0])
+            .expect("Entry should exist");
+        assert_eq!(entry.status, "ignored");
     }
 
     #[test]
@@ -4213,6 +4276,34 @@ mod tests {
 
         assert_eq!(parent.target_bytes, Some(80_000_000_000_000));
         assert_eq!(child.target_bytes, None);
+    }
+
+    #[test]
+    fn remove_path_confirmation_enter_cancels_by_default() {
+        let (db, _db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        let root_id = db
+            .insert_root(Path::new("/data/to-remove"))
+            .expect("insert root");
+        app.roots = db.list_roots().expect("list roots");
+        app.sidebar_selected_index = app
+            .roots
+            .iter()
+            .position(|root| root.id == root_id)
+            .expect("root should be present in sidebar");
+
+        InputHandler::initiate_remove_path(&mut app, &ctx);
+        assert!(app.pending_remove_path.is_some());
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
+
+        assert!(app.pending_remove_path.is_none());
+        let roots = db.list_roots().expect("list roots after cancel");
+        assert!(roots.iter().any(|root| root.id == root_id));
     }
 
     #[test]
