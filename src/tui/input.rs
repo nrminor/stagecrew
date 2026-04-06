@@ -103,6 +103,10 @@ impl InputHandler {
             Self::handle_quota_target_input(app, ctx, key);
             return;
         }
+        if app.pending_full_rescan_confirmation() {
+            Self::handle_full_rescan_confirmation(app, key);
+            return;
+        }
         if app.pending_dry_run.is_some() {
             // Any key dismisses the dry run results modal.
             app.pending_dry_run = None;
@@ -247,6 +251,11 @@ impl InputHandler {
             KeyCode::Char('D') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::initiate_entry_delete(app, RemovalMethod::PermanentDelete);
             }
+            KeyCode::Char('r')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !app.scan_in_progress =>
+            {
+                app.pending_full_rescan_confirmation = true;
+            }
             KeyCode::Char('r') if app.focus_panel == FocusPanel::MainPanel => {
                 Self::initiate_entry_defer(app, config.expiration_days);
             }
@@ -290,11 +299,11 @@ impl InputHandler {
             KeyCode::Char('2') => app.view = View::AuditLog,
             KeyCode::Char('3' | '?') => app.view = View::Help,
 
-            // Refresh tracked paths (scan filesystem + transition expired files)
+            // Refresh cached TUI data from the database only.
             KeyCode::Char('R') => {
-                if !app.scan_in_progress {
-                    app.scan_requested = true;
-                }
+                app.dispatch_refresh(ctx.db_dispatcher, ctx);
+                app.status_message = Some("Refreshed".to_string());
+                app.status_message_time = Some(std::time::Instant::now());
             }
 
             // Dry run preflight check on approved entries for the current root
@@ -1740,6 +1749,21 @@ impl InputHandler {
         };
         app.status_message = Some(msg);
         app.status_message_time = Some(std::time::Instant::now());
+    }
+
+    fn handle_full_rescan_confirmation(app: &mut App, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                app.pending_full_rescan_confirmation = false;
+                app.scan_requested = true;
+                app.status_message = Some("Starting full filesystem rescan...".to_string());
+                app.status_message_time = Some(std::time::Instant::now());
+            }
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                app.pending_full_rescan_confirmation = false;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -3930,6 +3954,97 @@ mod tests {
         InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('T')));
 
         assert_eq!(app.status_message.as_deref(), Some("No root selected"));
+    }
+
+    #[test]
+    fn capital_r_refreshes_from_database_without_requesting_scan() {
+        let (db, _db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        app.focus_panel = FocusPanel::MainPanel;
+        app.scan_requested = false;
+        app.scan_in_progress = false;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('R')));
+
+        assert!(
+            !app.scan_requested,
+            "database refresh should not request a filesystem scan"
+        );
+        assert_eq!(app.status_message.as_deref(), Some("Refreshed"));
+    }
+
+    #[test]
+    fn ctrl_r_opens_full_rescan_confirmation_modal() {
+        let (db, _db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        InputHandler::handle(
+            &mut app,
+            &ctx,
+            make_key_event_with_mods(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+
+        assert!(app.pending_full_rescan_confirmation());
+        assert!(!app.scan_requested);
+    }
+
+    #[test]
+    fn full_rescan_confirmation_y_requests_scan() {
+        let (db, _db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        app.pending_full_rescan_confirmation = true;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Char('y')));
+
+        assert!(!app.pending_full_rescan_confirmation());
+        assert!(app.scan_requested);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Starting full filesystem rescan...")
+        );
+    }
+
+    #[test]
+    fn full_rescan_confirmation_enter_cancels_by_default() {
+        let (db, _db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        app.pending_full_rescan_confirmation = true;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Enter));
+
+        assert!(!app.pending_full_rescan_confirmation());
+        assert!(!app.scan_requested);
+    }
+
+    #[test]
+    fn full_rescan_confirmation_escape_cancels() {
+        let (db, _db_path, _dir) = temp_database();
+        let mut app = App::new();
+        let app_config = AppConfig::from_global(test_config());
+        let dispatcher = test_dispatcher();
+        let ctx = test_context(&db, &app_config, &dispatcher);
+
+        app.pending_full_rescan_confirmation = true;
+
+        InputHandler::handle(&mut app, &ctx, make_key_event(KeyCode::Esc));
+
+        assert!(!app.pending_full_rescan_confirmation());
+        assert!(!app.scan_requested);
     }
 
     #[test]

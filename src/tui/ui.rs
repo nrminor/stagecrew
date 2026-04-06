@@ -258,6 +258,11 @@ pub(crate) fn render(app: &mut App, ctx: &TuiContext, frame: &mut Frame) {
         render_audit_export_modal(frame, export);
     }
 
+    // Render full filesystem rescan confirmation modal if pending.
+    if app.pending_full_rescan_confirmation() {
+        render_full_rescan_modal(frame);
+    }
+
     // Render dry run results modal if pending
     if let Some(result) = app.pending_dry_run() {
         render_dry_run_modal(frame, result);
@@ -2588,7 +2593,8 @@ Sorting:
 Other:
   E           Export audit log (from Audit Log view)
   F           Execute approved removals for current root
-  R           Refresh tracked paths (rescan filesystem)
+  R           Refresh UI
+  Ctrl+r      Run full filesystem rescan
   T           Reset countdown timer for current root
   Y           Dry run: check if approved entries can be removed
   q           Quit application (or return from audit log)
@@ -3247,6 +3253,28 @@ fn render_remove_path_modal(frame: &mut Frame, path: &str) {
                 "[y] confirm   [n] cancel",
                 Style::default().fg(palette::MODAL_MUTED),
             )]),
+        ],
+    );
+}
+
+/// Render full filesystem rescan confirmation modal.
+fn render_full_rescan_modal(frame: &mut Frame) {
+    let inner = render_modal_shell(frame, "Full Filesystem Rescan", palette::YELLOW, 68, 11);
+    render_modal_body(
+        frame,
+        inner,
+        vec![
+            Line::from("Run full filesystem rescan?"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "This may take a long time depending on the size and depth of tracked directories.",
+                Style::default().fg(palette::MODAL_MUTED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "[N] cancel   [y] run rescan",
+                Style::default().fg(palette::MODAL_MUTED),
+            )),
         ],
     );
 }

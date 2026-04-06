@@ -341,6 +341,9 @@ pub struct App {
     /// Pending audit export modal state.
     pub(crate) pending_audit_export: Option<PendingAuditExport>,
 
+    /// Pending confirmation for a full filesystem rescan.
+    pub(crate) pending_full_rescan_confirmation: bool,
+
     /// Dry run preflight check result for display in a modal.
     pub(crate) pending_dry_run: Option<DryRunResult>,
 
@@ -502,6 +505,11 @@ impl App {
     /// Get the pending audit export state.
     pub fn pending_audit_export(&self) -> Option<&PendingAuditExport> {
         self.pending_audit_export.as_ref()
+    }
+
+    /// Whether the full-rescan confirmation modal is open.
+    pub fn pending_full_rescan_confirmation(&self) -> bool {
+        self.pending_full_rescan_confirmation
     }
 
     /// Get the dry run result for modal display.
@@ -788,6 +796,7 @@ impl App {
             pending_remove_path: None,
             pending_quota_target: None,
             pending_audit_export: None,
+            pending_full_rescan_confirmation: false,
             pending_dry_run: None,
             sidebar_visible: true,
             scan_requested: false,
